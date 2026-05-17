@@ -6,11 +6,11 @@
 
 ```bash
 # 一次性运行（无需安装，npm 缓存后离线可用）
-npx openclaw-diag-cli list
+npx openclaw-diag-cli
 
 # 装到 PATH
 npm install -g openclaw-diag-cli
-openclaw-diag list
+openclaw-diag
 ```
 
 依赖：Node 18+ 和 Python 3.8+。
@@ -18,11 +18,11 @@ openclaw-diag list
 ## 五分钟上手
 
 ```bash
-# 1. 检查环境是否就绪
-openclaw-diag doctor
+# 1. 看看能做什么（直接列出所有模块 + 常用命令）
+openclaw-diag
 
-# 2. 列出所有诊断模块
-openclaw-diag list
+# 2. 检查环境是否就绪
+openclaw-diag doctor
 
 # 3. 跑单个模块
 openclaw-diag run gateway

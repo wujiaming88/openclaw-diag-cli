@@ -34,8 +34,6 @@ def cmd_list() -> int:
     print("Available modules:")
     for mid, label, _ in MODULES:
         print(f"  [x] {mid:<16s} {label}")
-    print()
-    print("Usage: ocdiag run <id> | ocdiag run all [--skip id1,id2] [--json]")
     return 0
 
 

@@ -238,15 +238,19 @@ function main() {
   const argv = process.argv.slice(2);
 
   if (argv.length === 0) {
+    const py = findPython();
+    if (!py) pythonNotFound();
     console.log(`openclaw-diag v${PKG.version} — OpenClaw / ArkClaw 诊断 CLI`);
     console.log('');
-    console.log('  npx openclaw-diag-cli list           列出所有诊断模块');
-    console.log('  npx openclaw-diag-cli run <id>       运行单个模块（或 all）');
-    console.log('  npx openclaw-diag-cli doctor         检查环境是否就绪');
-    console.log('  npx openclaw-diag-cli --help         查看完整帮助');
+    const dispatcher = path.join(REPO_ROOT, 'bin', 'ocdiag');
+    spawnSync(py.cmd, [dispatcher, 'list'], { stdio: 'inherit' });
     console.log('');
-    runDispatcher(['list']);
-    return;
+    console.log('常用命令：');
+    console.log('  openclaw-diag run gateway       跑单个模块');
+    console.log('  openclaw-diag run all           全部模块');
+    console.log('  openclaw-diag doctor            检查环境');
+    console.log('  openclaw-diag --help            完整帮助');
+    process.exit(0);
   }
 
   const head = argv[0];

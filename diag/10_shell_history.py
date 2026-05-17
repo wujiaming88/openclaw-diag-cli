@@ -89,13 +89,13 @@ def main() -> int:
         oc_cmds = oc_all[-30:]
         if oc_total:
             out.item(
-                f"  ArkClaw 相关命令: 全文 {oc_total} 条，最近 30 条采样 {len(oc_cmds)} 条 — "
+                f"  OpenClaw 相关命令: 全文 {oc_total} 条，最近 30 条采样 {len(oc_cmds)} 条 — "
                 "用户手动执行的 openclaw 命令"
             )
             ev = "\n".join(f"{n}: {ln}" for n, ln in oc_cmds)
             out.evidence(f"{hfile} (openclaw)", ev)
         else:
-            out.item("  ArkClaw 相关命令: 0 条")
+            out.item("  OpenClaw 相关命令: 0 条")
 
         recent = lines[-20:]
         if recent:

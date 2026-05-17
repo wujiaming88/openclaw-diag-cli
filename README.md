@@ -1,6 +1,6 @@
-# openclaw-diag-cli
+# OpenClaw 诊断工具箱
 
-> OpenClaw / ArkClaw 故障诊断 CLI。零依赖、只读、人和机器都能用。
+> 排查 OpenClaw 故障的只读 CLI。一组诊断、一个入口、零依赖。
 
 ## 安装
 
@@ -18,25 +18,29 @@ openclaw-diag
 ## 五分钟上手
 
 ```bash
-# 1. 看看能做什么（直接列出所有模块 + 常用命令）
+# 1. 看看能做什么
 openclaw-diag
 
 # 2. 检查环境是否就绪
 openclaw-diag doctor
 
-# 3. 跑单个模块
-openclaw-diag run gateway
+# 3. 跑某个诊断
+openclaw-diag gateway
 
-# 4. 全部跑一遍（任一模块崩了不影响其他）
-openclaw-diag run all
+# 4. 全部 state collectors 跑一遍（任一崩了不影响其他）
+openclaw-diag all
 
 # 5. 输出结构化 JSON
-openclaw-diag run gateway --json
+openclaw-diag gateway --json
 ```
 
-## 诊断模块（10 个）
+## 诊断列表
 
-| 模块 | 看什么 |
+诊断按"是否需要参数"分两类。
+
+### State collectors（无需参数，扫一遍系统当前状态）
+
+| 诊断 | 看什么 |
 |---|---|
 | `sys_health` | DNS / 网络 / CPU / 内存 / 磁盘 / IO / 进程 / 时间同步 |
 | `environment` | OpenClaw 版本一致性、Gateway 进程环境变量 |
@@ -49,33 +53,45 @@ openclaw-diag run gateway --json
 | `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook 异常、Channel、外部依赖 DNS |
 | `shell_history` | 高危命令、openclaw 命令、最近操作 |
 
-## 单点工具（2 个）
+### Object inspectors（需要 session uuid，深挖一个具体对象）
 
-```bash
-# 跟踪一条用户消息从进入到响应的完整时间轴
-openclaw-diag trace <session-uuid> --msg-index 0
+| 诊断 | 看什么 |
+|---|---|
+| `trace <uuid>` | 追踪一条用户消息从进入到响应的完整时间轴 |
+| `extract <uuid>` | 导出 session.jsonl 为可读格式（reset / bak / deleted 全状态） |
 
-# 导出 session 为可读格式（支持 reset / bak / deleted 全状态）
-openclaw-diag extract <session-uuid> --summary
-```
+### Meta
+
+| 命令 | 作用 |
+|---|---|
+| `openclaw-diag all` | 跑全部 state collectors |
+| `openclaw-diag list` | 列出所有诊断 |
+| `openclaw-diag doctor` | 检查 Node / Python / ocdiag / OpenClaw 环境 |
+| `openclaw-diag bundle <id>` | 打成 self-contained 单文件 .py |
 
 ## 常见配方
 
 ```bash
 # 找出哪个 cron 任务在连续失败
-openclaw-diag run cron_jobs --json | jq '.data.jobs[] | select(.status!="ok")'
+openclaw-diag cron_jobs --json | jq '.data.jobs[] | select(.status!="ok")'
 
 # 看哪个模型的 P95 延迟最高
-openclaw-diag run performance | grep -A1 "P95"
+openclaw-diag performance | grep -A1 "P95"
 
 # 哪些插件今天有 ERROR
-openclaw-diag run plugin_diag --json | jq '.data.plugin_errors | to_entries[] | select(.value.error_count > 0)'
+openclaw-diag plugin_diag --json | jq '.data.plugin_errors | to_entries[] | select(.value.error_count > 0)'
 
 # 把所有诊断聚合成单个 JSON 报告
-openclaw-diag run all --json 2>/dev/null | jq -s '.' > report.json
+openclaw-diag all --json 2>/dev/null | jq -s '.' > report.json
 
 # 找出有 stuck session 的事件
-openclaw-diag run sessions --json | jq '.data.stuck_sessions'
+openclaw-diag sessions --json | jq '.data.stuck_sessions'
+
+# 追踪用户消息时间轴
+openclaw-diag trace <session-uuid> --msg-index 0
+
+# 导出 session 为可读格式
+openclaw-diag extract <session-uuid> --summary
 ```
 
 ## 离线机器：bundle 出单文件
@@ -108,9 +124,9 @@ ssh prod-server "python3 /tmp/standalone-gateway.py --json"
 
 | rc | 含义 |
 |---|---|
-| 0 | 模块成功 |
-| 1 | 模块运行成功但报告 `status: "error"`（数据源缺失等） |
-| 2 | 模块崩溃（已隔离，不影响其他模块） |
+| 0 | 诊断成功 |
+| 1 | 诊断运行成功但报告 `status: "error"`（数据源缺失等） |
+| 2 | 诊断崩溃（已隔离，不影响 `all`） |
 
 ## 设计原则
 
@@ -118,7 +134,7 @@ ssh prod-server "python3 /tmp/standalone-gateway.py --json"
 |---|---|
 | **只读** | 永远不修改文件、不重启服务 |
 | **零依赖** | 仅 Python 3.8+ 标准库 |
-| **故障隔离** | 单模块崩溃不带崩 `run all` |
+| **故障隔离** | 单诊断崩溃不带崩 `all` |
 | **数据可靠** | 每个字段都能溯源 |
 | **可组合** | 文本 + JSON 双输出，stderr 与 stdout 分流 |
 

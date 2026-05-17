@@ -118,9 +118,9 @@ def main() -> int:
 
     oc_version = detect_oc_version()
     if oc_version:
-        out.item(f"ArkClaw 版本: {oc_version}")
+        out.item(f"OpenClaw 版本: {oc_version}")
     else:
-        out.item("ArkClaw 版本: 无法确定")
+        out.item("OpenClaw 版本: 无法确定")
         out.evidence("openclaw --version", "命令未找到或无输出")
     out.set_data("oc_version", oc_version)
 

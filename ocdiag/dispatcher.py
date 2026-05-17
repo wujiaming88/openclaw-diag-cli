@@ -1,8 +1,15 @@
-"""Dispatcher: list / run <name> / run all."""
+"""Dispatcher: every diagnostic is a top-level subcommand.
+
+Layout:
+  ocdiag <state-collector>      runs that collector (e.g. `ocdiag gateway`)
+  ocdiag <object-inspector> ARG runs that inspector  (e.g. `ocdiag trace UUID`)
+  ocdiag all [--skip a,b]       runs every state collector
+  ocdiag list                   prints the catalogue grouped by parameter mode
+  ocdiag run <id> [args...]     legacy alias retained for 0.1.x users
+"""
 
 from __future__ import annotations
 
-import argparse
 import os
 import runpy
 import sys
@@ -13,27 +20,47 @@ from typing import List
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Module ID -> (label, script filename relative to REPO_ROOT)
-MODULES = [
-    ("sys_health",     "系统健康检查",     "diag/01_sys_health.py"),
-    ("environment",    "采集基础环境",     "diag/02_environment.py"),
-    ("configuration",  "采集配置",         "diag/03_configuration.py"),
-    ("gateway",        "采集 Gateway 状态", "diag/04_gateway.py"),
-    ("recent_errors",  "采集近期日志",     "diag/05_recent_errors.py"),
-    ("cron_jobs",      "采集定时任务",     "diag/06_cron_jobs.py"),
-    ("performance",    "采集模型与性能数据", "diag/07_performance.py"),
-    ("sessions",       "采集 Session 数据", "diag/08_sessions.py"),
-    ("plugin_diag",    "采集插件诊断",     "diag/09_plugin_diag.py"),
-    ("shell_history",  "采集命令执行历史",  "diag/10_shell_history.py"),
+# State collectors: zero required args, parameter-free observation of system state.
+STATE_COLLECTORS = [
+    ("sys_health",     "系统健康检查",          "diag/01_sys_health.py"),
+    ("environment",    "OpenClaw 基础环境",     "diag/02_environment.py"),
+    ("configuration",  "配置展平（脱敏）",      "diag/03_configuration.py"),
+    ("gateway",        "Gateway 状态",          "diag/04_gateway.py"),
+    ("recent_errors",  "近期错误聚合",          "diag/05_recent_errors.py"),
+    ("cron_jobs",      "定时任务状态",          "diag/06_cron_jobs.py"),
+    ("performance",    "模型/工具性能",         "diag/07_performance.py"),
+    ("sessions",       "Session 数据",          "diag/08_sessions.py"),
+    ("plugin_diag",    "插件诊断",              "diag/09_plugin_diag.py"),
+    ("shell_history",  "Shell 历史",            "diag/10_shell_history.py"),
 ]
 
-MODULE_BY_ID = {mid: (label, script) for mid, label, script in MODULES}
+# Object inspectors: take a session uuid (or other identifier) and inspect it.
+OBJECT_INSPECTORS = [
+    ("trace",   "追踪用户消息时间轴",  "tools/oc_session_trace.py"),
+    ("extract", "导出 session 为可读格式", "tools/oc_session_extract.py"),
+]
+
+STATE_BY_ID = {mid: (label, script) for mid, label, script in STATE_COLLECTORS}
+OBJECT_BY_ID = {mid: (label, script) for mid, label, script in OBJECT_INSPECTORS}
+MODULE_BY_ID = {**STATE_BY_ID, **OBJECT_BY_ID}
+MODULE_IDS = set(MODULE_BY_ID.keys())
 
 
 def cmd_list() -> int:
-    print("Available modules:")
-    for mid, label, _ in MODULES:
-        print(f"  [x] {mid:<16s} {label}")
+    print("Available diagnostics:")
+    print()
+    print("  State collectors (no args needed):")
+    for mid, label, _ in STATE_COLLECTORS:
+        print(f"    {mid:<16s} {label}")
+    print()
+    print("  Object inspectors (require session uuid):")
+    for mid, label, _ in OBJECT_INSPECTORS:
+        print(f"    {mid:<16s} {label}")
+    print()
+    print("  Meta:")
+    print("    all              跑全部 state collectors")
+    print("    doctor           检查 Node/Python/OpenClaw 环境")
+    print("    bundle <id>      打包成 self-contained 单文件")
     return 0
 
 
@@ -62,88 +89,98 @@ def run_script(script_rel: str, extra_args: List[str]) -> int:
         sys.argv = saved_argv
 
 
-def cmd_trace(extra_args: List[str]) -> int:
-    return run_script("tools/oc_session_trace.py", extra_args)
-
-
-def cmd_extract(extra_args: List[str]) -> int:
-    return run_script("tools/oc_session_extract.py", extra_args)
-
-
-def cmd_run(target: str, extra_args: List[str], skip_ids: List[str]) -> int:
+def cmd_all(extra_args: List[str], skip_ids: List[str]) -> int:
     json_mode = "--json" in extra_args
     progress_stream = sys.stderr if json_mode else sys.stdout
-    if target == "all":
-        rc_overall = 0
-        total = sum(1 for mid, _, _ in MODULES if mid not in skip_ids)
-        n = 0
-        for mid, label, script in MODULES:
-            if mid in skip_ids:
-                continue
-            n += 1
-            print(f"\n[{n}/{total}] {label} ({mid})...", flush=True, file=progress_stream)
-            t0 = time.time()
-            rc = run_script(script, extra_args)
-            elapsed = time.time() - t0
-            print(f"[{n}/{total}] {label} ({mid}) ... done ({elapsed:.1f}s)", flush=True, file=progress_stream)
-            if rc != 0:
-                rc_overall = rc
-        return rc_overall
-    if target not in MODULE_BY_ID:
-        print(f"Error: unknown module '{target}'. Use `ocdiag list`.", file=sys.stderr)
-        return 2
-    _, script = MODULE_BY_ID[target]
-    return run_script(script, extra_args)
+    rc_overall = 0
+    total = sum(1 for mid, _, _ in STATE_COLLECTORS if mid not in skip_ids)
+    n = 0
+    for mid, label, script in STATE_COLLECTORS:
+        if mid in skip_ids:
+            continue
+        n += 1
+        print(f"\n[{n}/{total}] {label} ({mid})...", flush=True, file=progress_stream)
+        t0 = time.time()
+        rc = run_script(script, extra_args)
+        elapsed = time.time() - t0
+        print(f"[{n}/{total}] {label} ({mid}) ... done ({elapsed:.1f}s)",
+              flush=True, file=progress_stream)
+        if rc != 0:
+            rc_overall = rc
+    return rc_overall
+
+
+def _split_skip(rest: List[str]) -> (List[str], List[str]):
+    """Pull out --skip a,b out of an argv tail; return (skip_ids, passthrough)."""
+    skip_ids: List[str] = []
+    passthrough: List[str] = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a == "--skip" and i + 1 < len(rest):
+            skip_ids.extend(s.strip() for s in rest[i + 1].split(",") if s.strip())
+            i += 2
+            continue
+        passthrough.append(a)
+        i += 1
+    return skip_ids, passthrough
+
+
+def print_help() -> None:
+    print("ocdiag — OpenClaw 诊断工具箱")
+    print()
+    print("Usage:")
+    print("  ocdiag <id> [args...]            跑单个诊断（state collector 或 object inspector）")
+    print("  ocdiag all [--skip a,b]          跑全部 state collectors")
+    print("  ocdiag list                      列出所有诊断")
+    print("  ocdiag run <id> [args...]        旧用法别名（0.1.x 兼容）")
+    print()
+    print("State collectors:")
+    print("  " + "  ".join(mid for mid, _, _ in STATE_COLLECTORS))
+    print("Object inspectors:")
+    print("  " + "  ".join(mid for mid, _, _ in OBJECT_INSPECTORS))
+    print()
+    print("--skip 后接逗号分隔 id 列表（仅对 all 有意义）。")
+    print("其它参数（--config / --log-dir / --json / --no-color）原样传递给脚本。")
 
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
 
     if not argv or argv[0] in ("-h", "--help"):
-        print("ocdiag — OpenClaw 诊断 CLI dispatcher")
-        print()
-        print("Usage:")
-        print("  ocdiag list                      列出所有诊断模块")
-        print("  ocdiag run <id>                  运行单个模块（id 或 all）")
-        print("  ocdiag run all [--skip ids]      运行全部模块，可跳过若干")
-        print("  ocdiag trace <uuid>              跟踪 session 中一条用户消息的时间轴")
-        print("  ocdiag extract <uuid>            导出 session.jsonl 为可读格式")
-        print()
-        print("--skip 后接逗号分隔的 module id 列表（如 performance,sessions）。")
-        print("其它参数（--config / --log-dir / --json / --no-color）原样传递。")
+        print_help()
         return 0
 
-    cmd, rest = argv[0], argv[1:]
+    head, rest = argv[0], argv[1:]
 
-    if cmd == "list":
+    if head == "list":
         return cmd_list()
 
-    if cmd == "trace":
-        return cmd_trace(rest)
+    if head == "all":
+        skip_ids, passthrough = _split_skip(rest)
+        return cmd_all(passthrough, skip_ids)
 
-    if cmd == "extract":
-        return cmd_extract(rest)
-
-    if cmd == "run":
+    # Backward-compat alias: `ocdiag run <id> [args...]` still works.
+    if head == "run":
         if not rest:
             print("Error: run requires a target (module id or 'all').", file=sys.stderr)
             return 2
-        target = rest[0]
-        sub = rest[1:]
-        skip_ids: List[str] = []
-        passthrough: List[str] = []
-        i = 0
-        while i < len(sub):
-            a = sub[i]
-            if a == "--skip" and i + 1 < len(sub):
-                skip_ids.extend(s.strip() for s in sub[i + 1].split(",") if s.strip())
-                i += 2
-                continue
-            passthrough.append(a)
-            i += 1
-        return cmd_run(target, passthrough, skip_ids)
+        target, sub = rest[0], rest[1:]
+        if target == "all":
+            skip_ids, passthrough = _split_skip(sub)
+            return cmd_all(passthrough, skip_ids)
+        if target in MODULE_BY_ID:
+            _, script = MODULE_BY_ID[target]
+            return run_script(script, sub)
+        print(f"Error: unknown diagnostic '{target}'. Use `ocdiag list`.", file=sys.stderr)
+        return 2
 
-    print(f"Error: unknown command '{cmd}'", file=sys.stderr)
+    if head in MODULE_BY_ID:
+        _, script = MODULE_BY_ID[head]
+        return run_script(script, rest)
+
+    print(f"Error: unknown command '{head}'. Use `ocdiag list` to see available diagnostics.",
+          file=sys.stderr)
     return 2
 
 

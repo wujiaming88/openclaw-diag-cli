@@ -17,6 +17,22 @@ const PYTHON_CANDIDATES = process.platform === 'win32'
   ? ['python3', 'python', 'py']
   : ['python3', 'python'];
 
+// Keep these in sync with ocdiag/dispatcher.py.
+const STATE_COLLECTORS = [
+  'sys_health', 'environment', 'configuration', 'gateway', 'recent_errors',
+  'cron_jobs', 'performance', 'sessions', 'plugin_diag', 'shell_history',
+];
+const OBJECT_INSPECTORS = ['trace', 'extract'];
+const MODULE_IDS = new Set([...STATE_COLLECTORS, ...OBJECT_INSPECTORS]);
+
+const STATE_SCRIPTS = [
+  '01_sys_health.py', '02_environment.py', '03_configuration.py',
+  '04_gateway.py', '05_recent_errors.py', '06_cron_jobs.py',
+  '07_performance.py', '08_sessions.py', '09_plugin_diag.py',
+  '10_shell_history.py',
+];
+const OBJECT_SCRIPTS = ['oc_session_trace.py', 'oc_session_extract.py'];
+
 function findPython() {
   for (const cmd of PYTHON_CANDIDATES) {
     try {
@@ -51,25 +67,26 @@ function printVersion() {
 
 function printHelp() {
   const lines = [
-    'openclaw-diag — OpenClaw / ArkClaw read-only diagnostic CLI',
+    'openclaw-diag — OpenClaw 诊断工具箱',
     '',
     'Usage:',
-    '  openclaw-diag                          Show banner + module list',
-    '  openclaw-diag list                     List all diagnostic modules',
-    '  openclaw-diag run <id>                 Run a single module (or "all")',
-    '  openclaw-diag run all [--skip a,b]     Run all modules (skip optional)',
-    '  openclaw-diag run <id> --json          Emit JSON (NDJSON for "all")',
-    '  openclaw-diag bundle <id>              Print self-contained single-file .py to stdout',
-    '  openclaw-diag trace <uuid>             Trace one user message timeline in a session',
-    '  openclaw-diag extract <uuid>           Extract session.jsonl into readable form',
-    '  openclaw-diag doctor [--json]          Check Node / Python / ocdiag / OpenClaw env',
-    '  openclaw-diag --version                Print package version',
-    '  openclaw-diag --help                   Print this help',
+    '  openclaw-diag                          打印 banner + 诊断目录',
+    '  openclaw-diag list                     列出全部诊断（按类型分组）',
+    '  openclaw-diag <id> [args...]           跑单个诊断',
+    '  openclaw-diag all [--skip a,b]         跑全部 state collectors',
+    '  openclaw-diag all [--json]             NDJSON 聚合输出',
+    '  openclaw-diag bundle <id>              打成 self-contained 单文件 .py',
+    '  openclaw-diag doctor [--json]          检查 Node / Python / ocdiag / OpenClaw env',
+    '  openclaw-diag --version                打印版本号',
+    '  openclaw-diag --help                   本帮助',
     '',
-    'Module ids: sys_health environment configuration gateway recent_errors',
-    '            cron_jobs performance sessions plugin_diag shell_history',
+    'State collectors (无需参数):',
+    '  ' + STATE_COLLECTORS.join('  '),
     '',
-    'Pass-through flags (forwarded to Python): --config --log-dir --json --no-color',
+    'Object inspectors (需要 session uuid):',
+    '  ' + OBJECT_INSPECTORS.join('  '),
+    '',
+    '透传给诊断脚本: --config --log-dir --json --no-color',
   ];
   console.log(lines.join('\n'));
 }
@@ -119,13 +136,6 @@ function runBundle(args) {
 
 // ── doctor ──
 
-const DIAG_SCRIPTS = [
-  '01_sys_health.py', '02_environment.py', '03_configuration.py',
-  '04_gateway.py', '05_recent_errors.py', '06_cron_jobs.py',
-  '07_performance.py', '08_sessions.py', '09_plugin_diag.py',
-  '10_shell_history.py',
-];
-
 function nodeVersionOk() {
   const m = process.versions.node.match(/^(\d+)\./);
   return m && parseInt(m[1], 10) >= 18;
@@ -148,17 +158,20 @@ function checkOcdiagImport(pyCmd) {
 
 function checkDiagScripts(pyCmd) {
   const failed = [];
-  for (const name of DIAG_SCRIPTS) {
-    const p = path.join(REPO_ROOT, 'diag', name);
-    const r = spawnSync(pyCmd, [p, '--help'], {
+  const all = [
+    ...STATE_SCRIPTS.map((n) => ({ name: n, path: path.join(REPO_ROOT, 'diag', n) })),
+    ...OBJECT_SCRIPTS.map((n) => ({ name: n, path: path.join(REPO_ROOT, 'tools', n) })),
+  ];
+  for (const item of all) {
+    const r = spawnSync(pyCmd, [item.path, '--help'], {
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 10000,
     });
     if (r.status !== 0) {
-      failed.push({ script: name, status: r.status, stderr: ((r.stderr || '').toString().trim()).slice(0, 200) });
+      failed.push({ script: item.name, status: r.status, stderr: ((r.stderr || '').toString().trim()).slice(0, 200) });
     }
   }
-  return failed;
+  return { failed, total: all.length };
 }
 
 function checkOpenclawConfig() {
@@ -195,10 +208,10 @@ function runDoctor(args) {
   const ocdiag = checkOcdiagImport(py.cmd);
   result.ocdiag = ocdiag;
 
-  const failed = checkDiagScripts(py.cmd);
+  const { failed, total } = checkDiagScripts(py.cmd);
   result.diag_scripts = {
     ok: failed.length === 0,
-    total: DIAG_SCRIPTS.length,
+    total,
     failed,
   };
 
@@ -219,9 +232,9 @@ function runDoctor(args) {
       }
     }
     if (failed.length === 0) {
-      console.log(`✓ All ${DIAG_SCRIPTS.length} diag modules respond to --help`);
+      console.log(`✓ All ${total} diagnostics respond to --help`);
     } else {
-      console.log(`✗ ${failed.length}/${DIAG_SCRIPTS.length} diag modules failed --help:`);
+      console.log(`✗ ${failed.length}/${total} diagnostics failed --help:`);
       for (const f of failed) {
         console.log(`    ${f.script} (rc=${f.status})`);
       }
@@ -245,14 +258,15 @@ function main() {
   if (argv.length === 0) {
     const py = findPython();
     if (!py) pythonNotFound();
-    console.log(`openclaw-diag v${PKG.version} — OpenClaw / ArkClaw 诊断 CLI`);
+    console.log(`openclaw-diag v${PKG.version} — OpenClaw 诊断工具箱`);
     console.log('');
     const dispatcher = path.join(REPO_ROOT, 'bin', 'ocdiag');
     spawnSync(py.cmd, [dispatcher, 'list'], { stdio: 'inherit' });
     console.log('');
     console.log('常用命令：');
-    console.log('  openclaw-diag run gateway       跑单个模块');
-    console.log('  openclaw-diag run all           全部模块');
+    console.log('  openclaw-diag gateway           跑单个 state collector');
+    console.log('  openclaw-diag all               全部 state collectors');
+    console.log('  openclaw-diag trace <uuid>      追踪一条用户消息');
     console.log('  openclaw-diag doctor            检查环境');
     console.log('  openclaw-diag --help            完整帮助');
     process.exit(0);
@@ -276,16 +290,8 @@ function main() {
     runBundle(argv.slice(1));
     return;
   }
-  if (head === 'trace') {
-    runScript(path.join(REPO_ROOT, 'tools', 'oc_session_trace.py'), argv.slice(1));
-    return;
-  }
-  if (head === 'extract') {
-    runScript(path.join(REPO_ROOT, 'tools', 'oc_session_extract.py'), argv.slice(1));
-    return;
-  }
 
-  // Pass through everything else to the Python dispatcher.
+  // Pass through everything else (flat ids, `all`, `list`, `run` alias, unknown) to dispatcher.
   runDispatcher(argv);
 }
 

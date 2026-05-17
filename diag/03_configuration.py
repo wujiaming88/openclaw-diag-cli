@@ -45,8 +45,10 @@ def emit_config(out: output.Output, data: list, obj, prefix: str = "") -> None:
                         cw = md.get("contextWindow", "?")
                         mt = md.get("maxTokens", "?")
                         r_str = "true" if md.get("reasoning", False) else "false"
-                        pn = new_key.split(".")[2] if new_key.count(".") >= 2 else "?"
-                        data.append(f"{pn}/{mid} (contextWindow={cw}, maxTokens={mt}, reasoning={r_str})")
+                        data.append(
+                            f"{new_key}.{mid} = (contextWindow={cw}, "
+                            f"maxTokens={mt}, reasoning={r_str})"
+                        )
                 continue
             emit_config(out, data, v, new_key)
     elif isinstance(obj, list):

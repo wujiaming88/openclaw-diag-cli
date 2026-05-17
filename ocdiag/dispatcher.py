@@ -54,6 +54,12 @@ def run_script(script_rel: str, extra_args: List[str]) -> int:
             return int(e.code) if e.code is not None else 0
         except (TypeError, ValueError):
             return 1
+    except Exception as e:
+        print(f"  ERROR: {script_path.name} crashed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        return 2
     finally:
         sys.argv = saved_argv
 

@@ -52,7 +52,7 @@ def section_process_port(out: output.Output, args, port: int) -> None:
     out.set_data("pids", pid_list)
 
     rc, ss_out, _ = run(["ss", "-tlnp", f"sport = :{port}"])
-    listening = port in [int(p) for p in re.findall(rf":{port}\b", ss_out)]
+    listening = bool(re.search(rf":{port}\b", ss_out))
     rc, http_out, _ = run([
         "curl", "-s", "-m5", "-o", "/dev/null", "-w", "%{http_code}",
         f"http://127.0.0.1:{port}/",

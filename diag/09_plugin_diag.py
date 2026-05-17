@@ -241,6 +241,8 @@ def section_state(out, scan, configured, extensions):
     config_enabled = set(k for k, v in configured.items() if v)
     config_disabled = set(k for k, v in configured.items() if not v)
 
+    missing: set = set()
+    extra: set = set()
     if loaded_set:
         missing = config_enabled - loaded_set
         extra = loaded_set - config_enabled - config_disabled
@@ -263,6 +265,14 @@ def section_state(out, scan, configured, extensions):
     if extensions:
         out.item(f"外部扩展: {', '.join(f'{n} ({v})' for n, v in extensions)}")
 
+    out.set_data("state", {
+        "loaded": sorted(loaded_set),
+        "missing": sorted(missing),
+        "extra": sorted(extra),
+        "disabled": sorted(config_disabled),
+        "extensions": [{"name": n, "version": v} for n, v in extensions],
+    })
+
 
 def section_errors(out, scan, configured):
     out.subsection("9.2 插件错误/警告")
@@ -273,7 +283,10 @@ def section_errors(out, scan, configured):
     all_plugins = sorted(set(configured.keys()) | set(plugin_level_counts.keys()))
     if not all_plugins and not plugin_diag_messages:
         out.item("（今日无插件日志数据）")
+        out.set_data("plugin_errors", {})
         return
+
+    errors_payload = {}
 
     def rank(p):
         c = plugin_level_counts.get(p, Counter())
@@ -296,11 +309,20 @@ def section_errors(out, scan, configured):
             note = " [auto/extension]"
         out.item(f"{p}: {err} ERROR, {warn} WARN, {total} total{note}")
         samples = plugin_error_samples.get(p, [])
+        sample_payload = []
         if samples:
             for ts, lvl, text in dedup_messages(samples, max_unique=999):
                 tag = {"ERROR": "E", "FATAL": "F", "WARN": "W"}.get(lvl, "?")
                 snippet = text.replace("\n", " ")
                 out.item(f"  [{tag}] {fmt_hms(ts)}: {snippet}")
+                sample_payload.append({"ts": ts, "level": lvl, "msg": text[:300]})
+        if err > 0 or warn > 0 or sample_payload:
+            errors_payload[p] = {
+                "error_count": err,
+                "warn_count": warn,
+                "total": total,
+                "samples": sample_payload,
+            }
 
     pm_errors = [(ts, lvl, text) for ts, lvl, text in plugin_diag_messages if lvl in ("ERROR", "FATAL")]
     pm_warns = [(ts, lvl, text) for ts, lvl, text in plugin_diag_messages if lvl == "WARN"]
@@ -318,12 +340,15 @@ def section_errors(out, scan, configured):
     if not has_issues:
         out.item("所有插件 ERROR=0 且 WARN<=20")
 
+    out.set_data("plugin_errors", errors_payload)
+
 
 def section_hooks(out, scan):
     out.subsection("9.3 Hook 执行状态")
     hook_errors = scan["hook_errors"]
     if not hook_errors:
         out.item("今日无 Hook 执行异常")
+        out.set_data("hook_errors", {"total": 0, "by_plugin": {}})
         return
 
     by_plugin = defaultdict(list)
@@ -332,17 +357,32 @@ def section_hooks(out, scan):
 
     out.item(f"共 {len(hook_errors)} 次 Hook 执行异常:")
     out.line("")
+    by_plugin_payload = {}
     for plugin_id in sorted(by_plugin, key=lambda p: -len(by_plugin[p])):
         entries = by_plugin[plugin_id]
         by_hook = defaultdict(list)
         for ts, hook_name, err in entries:
             by_hook[hook_name].append((ts, err))
         out.item(f"  {plugin_id}: {len(entries)} 次")
+        hooks_payload = {}
         for hook_name in sorted(by_hook, key=lambda h: -len(by_hook[h])):
             hook_entries = by_hook[hook_name]
             out.item(f"    hook={hook_name}: {len(hook_entries)} 次")
             last = hook_entries[-1]
             out.item(f"      最近: {fmt_hms(last[0])} {last[1][:100]}")
+            hooks_payload[hook_name] = {
+                "count": len(hook_entries),
+                "last_ts": last[0],
+                "last_msg": last[1][:300],
+            }
+        by_plugin_payload[plugin_id] = {
+            "count": len(entries),
+            "hooks": hooks_payload,
+        }
+    out.set_data("hook_errors", {
+        "total": len(hook_errors),
+        "by_plugin": by_plugin_payload,
+    })
 
 
 def section_channels(out, scan):
@@ -351,12 +391,14 @@ def section_channels(out, scan):
     subsystem_error_samples = scan["subsystem_error_samples"]
     if not subsystem_level_counts:
         out.item("（今日无 Channel 子系统日志）")
+        out.set_data("channels", {})
         return
 
     channel_groups = defaultdict(list)
     for sub in subsystem_level_counts:
         channel_groups[sub.split("/")[0]].append(sub)
 
+    channels_payload = {}
     for prefix in sorted(channel_groups):
         subs = channel_groups[prefix]
         total_err = sum(
@@ -378,6 +420,13 @@ def section_channels(out, scan):
                     if samples:
                         for ts, _lvl, text in dedup_messages(samples, max_unique=2):
                             out.item(f"    [{fmt_hms(ts)}] {text.replace(chr(10),' ')}")
+        channels_payload[prefix] = {
+            "error_count": total_err,
+            "warn_count": total_warn,
+            "total": total_all,
+            "subsystems": sorted(subs),
+        }
+    out.set_data("channels", channels_payload)
 
 
 _URL_IN_VAL_RE = re.compile(r"https?://([A-Za-z0-9][A-Za-z0-9.\-]*)(?::\d+)?")
@@ -400,6 +449,7 @@ def section_deps(out, config_path):
     plugin_deps = {}
     if not (config_path and os.path.isfile(config_path)):
         out.item("未发现已启用插件的外部依赖配置")
+        out.set_data("plugin_deps", {})
         return
     try:
         with open(config_path) as f:
@@ -419,16 +469,20 @@ def section_deps(out, config_path):
 
     if not plugin_deps:
         out.item("未发现已启用插件的外部依赖配置")
+        out.set_data("plugin_deps", {})
         return
 
     out.item(f"扫描: {len(plugin_deps)} 个已启用插件的配置")
+    deps_payload: dict = {}
     found_any = False
     no_dep = []
     dep_lines = []
     for pid in sorted(plugin_deps):
         hosts = plugin_deps[pid]
+        host_results = []
         if not hosts:
             no_dep.append(pid)
+            deps_payload[pid] = {"hosts": []}
             continue
         found_any = True
         for host in sorted(hosts):
@@ -438,14 +492,18 @@ def section_deps(out, config_path):
                 socket.gethostbyname(host)
                 elapsed = (datetime.now() - start).total_seconds() * 1000
                 dep_lines.append(f"  {pid} → {host}: 可达 ({elapsed:.0f}ms)")
+                host_results.append({"host": host, "reachable": True, "elapsed_ms": round(elapsed, 1)})
             except Exception:
                 dep_lines.append(f"  {pid} → {host}: FAILED (DNS 解析失败)")
+                host_results.append({"host": host, "reachable": False, "elapsed_ms": None})
+        deps_payload[pid] = {"hosts": host_results}
     if found_any:
         out.item("发现外部端点:")
         for ln in dep_lines:
             out.item(ln)
     if no_dep:
         out.item(f"无外部依赖的插件: {', '.join(no_dep)}")
+    out.set_data("plugin_deps", deps_payload)
 
 
 def main() -> int:

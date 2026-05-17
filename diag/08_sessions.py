@@ -251,6 +251,13 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
         f"Session 总览: {total_files} 个文件, 总大小 {human_size(total_size)}, "
         f"活跃(7天内) {active_count} 个"
     )
+    out.set_data("disk_summary", {
+        "total_files": total_files,
+        "total_size_bytes": total_size,
+        "active_count": active_count,
+    })
+
+    agents_data: dict = {}
 
     by_agent = defaultdict(list)
     for agent_dir, fname, fpath, size, mtime in active_files:
@@ -264,6 +271,8 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
 
         out.line("")
         out.item(f"Agent: {agent_name} ({len(files)} 个 session)")
+
+        agent_sessions = []
 
         for fname, fpath, fsize, _mtime in files:
             sess_id = fname.split(".jsonl")[0]
@@ -279,6 +288,12 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
                     out.line(f"      sessionKey={sess_key} | size={human_size(fsize)} | <解析失败>")
                 else:
                     out.line(f"      size={human_size(fsize)} | <解析失败>")
+                agent_sessions.append({
+                    "id": sess_id,
+                    "key": sess_key,
+                    "size_bytes": fsize,
+                    "parse_failed": True,
+                })
                 continue
 
             if a["first_ts"] and a["last_ts"]:
@@ -287,7 +302,20 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
                 start_str = a["first_ts"].strftime("%Y-%m-%d %H:%M:%S")
                 end_str = a["last_ts"].strftime("%Y-%m-%d %H:%M:%S")
             else:
+                dur_total = None
                 duration_str = start_str = end_str = "?"
+
+            agent_sessions.append({
+                "id": sess_id,
+                "key": sess_key,
+                "size_bytes": fsize,
+                "duration_s": dur_total,
+                "model_calls": a["model_calls"],
+                "tool_calls": a["tool_calls_total"],
+                "tool_errors": a["tool_errors"],
+                "anomaly_count": len(a["anomalies"]),
+                "is_reset": is_reset,
+            })
 
             out.line(f"    {sess_id}{tag}")
             sk_part = f"sessionKey={sess_key} | " if sess_key else ""
@@ -355,6 +383,13 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
                 if n > 10:
                     out.line(f"        ... 省略 {n - 10} 条 ...")
 
+        agents_data[agent_name] = {
+            "session_count": len(agent_sessions),
+            "sessions": agent_sessions,
+        }
+
+    out.set_data("agents", agents_data)
+
 
 _STUCK_RE = re.compile(
     r"stuck session:\s*"
@@ -391,6 +426,8 @@ def stuck_dimension(out: output.Output, log_dir: str) -> None:
                        reverse=True)
     if not log_files:
         out.item("未找到任何日志文件")
+        out.set_data("stuck_sessions", [])
+        out.set_data("scanned_logs", [])
         return
 
     all_entries = []
@@ -416,9 +453,11 @@ def stuck_dimension(out: output.Output, log_dir: str) -> None:
             continue
 
     all_entries.sort(key=lambda x: x[0])
+    out.set_data("scanned_logs", files_read)
     if not all_entries:
         out.item(f"扫描: {', '.join(files_read)}")
         out.item("日志中未出现 stuck session 记录")
+        out.set_data("stuck_sessions", [])
         return
 
     sessions = defaultdict(lambda: {
@@ -441,10 +480,23 @@ def stuck_dimension(out: output.Output, log_dir: str) -> None:
     out.item(f"扫描: {', '.join(files_read)}")
     out.item(f"最新条目: {all_entries[-1][0]} [来自 {latest_logfile}]")
     out.item(f"检测到 {len(sessions)} 个 stuck session（按最后出现时间排序）：")
+    stuck_payload = []
     for sid, s in sorted(sessions.items(), key=lambda x: x[1]["last_ts"], reverse=True):
         out.item(f"  {s['sessionKey']} (sessionId={sid}) [{s['logfile']}]")
         out.item(f"    state={s['state']}  age={s['age']}  queueDepth={s['queueDepth']}")
         out.item(f"    首次: {s['first_ts']}  最后: {s['last_ts']}  共 {s['count']} 条")
+        stuck_payload.append({
+            "sessionId": sid,
+            "sessionKey": s["sessionKey"],
+            "state": s["state"],
+            "age": s["age"],
+            "queueDepth": s["queueDepth"],
+            "first_ts": s["first_ts"],
+            "last_ts": s["last_ts"],
+            "count": s["count"],
+            "logfile": s["logfile"],
+        })
+    out.set_data("stuck_sessions", stuck_payload)
 
 
 def main() -> int:

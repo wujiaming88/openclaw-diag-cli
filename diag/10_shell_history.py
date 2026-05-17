@@ -84,9 +84,14 @@ def main() -> int:
         else:
             out.item("  高危命令: 0 条")
 
-        oc_cmds = [(n, ln) for n, ln in lines if OC_RE.search(ln)][-30:]
-        if oc_cmds:
-            out.item(f"  ArkClaw 相关命令: {len(oc_cmds)} 条 — 用户手动执行的 openclaw 命令")
+        oc_all = [(n, ln) for n, ln in lines if OC_RE.search(ln)]
+        oc_total = len(oc_all)
+        oc_cmds = oc_all[-30:]
+        if oc_total:
+            out.item(
+                f"  ArkClaw 相关命令: 全文 {oc_total} 条，最近 30 条采样 {len(oc_cmds)} 条 — "
+                "用户手动执行的 openclaw 命令"
+            )
             ev = "\n".join(f"{n}: {ln}" for n, ln in oc_cmds)
             out.evidence(f"{hfile} (openclaw)", ev)
         else:
@@ -100,9 +105,11 @@ def main() -> int:
 
         files_data.append({
             "path": hfile,
-            "total": total,
+            "total_lines": total,
+            "dangerous_count": len(dangerous),
             "dangerous": [{"line": n, "cmd": ln} for n, ln in dangerous],
-            "openclaw_count": len(oc_cmds),
+            "openclaw_count_total": oc_total,
+            "openclaw_count_sample_30": len(oc_cmds),
             "recent_count": len(recent),
         })
 

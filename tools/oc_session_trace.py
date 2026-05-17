@@ -147,23 +147,41 @@ def find_user_messages(records: List[Dict]) -> List[Tuple[int, Dict]]:
     return result
 
 
+def find_first_message(records: List[Dict]) -> List[Tuple[int, Dict]]:
+    """Fall back: any record whose type=='message' (regardless of role)."""
+    result = []
+    for i, r in enumerate(records):
+        if r.get("type") == "message" and isinstance(r.get("message"), dict):
+            result.append((i, r))
+    return result
+
+
 def select_user_message(records, msg_index=None, msg_id=None, msg_match=None):
     user_msgs = find_user_messages(records)
     if not user_msgs:
-        print("Error: no user messages found in session", file=sys.stderr)
-        sys.exit(1)
+        # No user messages — fall back to scanning all message records so trace
+        # still works for assistant-only streams (e.g. cron delivery sessions).
+        user_msgs = find_first_message(records)
+        if not user_msgs:
+            print("Error: no message records found in session", file=sys.stderr)
+            sys.exit(1)
+        print(
+            f"Note: no user-role messages; tracing from first message record "
+            f"({len(user_msgs)} message(s) total)",
+            file=sys.stderr,
+        )
     if msg_id is not None:
         for idx, r in user_msgs:
             if r.get("id") == msg_id:
                 return idx, r
-        print(f"Error: no user message with id '{msg_id}'", file=sys.stderr)
+        print(f"Error: no message with id '{msg_id}'", file=sys.stderr)
         sys.exit(1)
     if msg_match is not None:
         for idx, r in user_msgs:
             text = extract_text(r.get("message", {}).get("content", ""))
             if msg_match in text:
                 return idx, r
-        print(f"Error: no user message matching '{msg_match}'", file=sys.stderr)
+        print(f"Error: no message matching '{msg_match}'", file=sys.stderr)
         sys.exit(1)
     if msg_index is not None:
         if msg_index < 0 or msg_index >= len(user_msgs):
@@ -643,9 +661,12 @@ def main():
         print(f"Error: session file is empty: {session_file}", file=sys.stderr)
         sys.exit(1)
 
-    user_msgs = find_user_messages(records)
+    user_msgs = find_user_messages(records) or find_first_message(records)
     rec_idx, user_rec = select_user_message(records, args.msg_index, args.msg_id, args.msg_match)
-    user_msg_ordinal = next(i for i, (ri, _) in enumerate(user_msgs) if ri == rec_idx)
+    try:
+        user_msg_ordinal = next(i for i, (ri, _) in enumerate(user_msgs) if ri == rec_idx)
+    except StopIteration:
+        user_msg_ordinal = 0
     user_msg_id = user_rec.get("id", "?")
 
     trace = extract_trace_records(records, rec_idx)

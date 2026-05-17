@@ -316,10 +316,42 @@ def section_jobs(out: output.Output, jobs_file: str, state_file: str, runs_dir: 
     out.item(f"  共 {total} 个任务（{enabled_count} 启用, {disabled_count} 禁用）")
     out.line("")
 
+    out.set_data("total_jobs", total)
+    out.set_data("enabled_count", enabled_count)
+    out.set_data("disabled_count", disabled_count)
+
     ok_list = [a for a in analyses if a[2]["status"] == "ok"]
     warn_list = [a for a in analyses if a[2]["status"] == "warn"]
     silent_list = [a for a in analyses if a[2]["status"] == "silent"]
     disabled_list = [a for a in analyses if a[2]["status"] == "disabled"]
+
+    def _job_name(j):
+        return j.get("name") or j.get("id", "?")
+
+    out.set_data("status_overview", {
+        "ok": [_job_name(j) for j, _, _ in ok_list],
+        "warn": [_job_name(j) for j, _, _ in warn_list],
+        "silent": [_job_name(j) for j, _, _ in silent_list],
+        "disabled": [_job_name(j) for j, _, _ in disabled_list],
+    })
+
+    jobs_payload = []
+    for j, runs, a in analyses:
+        state = j.get("state", {}) or {}
+        jobs_payload.append({
+            "id": j.get("id"),
+            "name": j.get("name") or j.get("id"),
+            "status": a["status"],
+            "schedule": j.get("schedule", {}),
+            "success_rate": a["success_rate"],
+            "p50_ms": a["p50"],
+            "p95_ms": a["p95"],
+            "last_run_ts": state.get("lastRunAtMs"),
+            "next_run_ts": state.get("nextRunAtMs"),
+            "consecutive_errors": state.get("consecutiveErrors", 0) or 0,
+            "flags": [{"kind": k, "msg": m} for k, m in a["flags"]],
+        })
+    out.set_data("jobs", jobs_payload)
 
     out.item("  ── 状态概览 ──")
     if ok_list:
@@ -529,6 +561,7 @@ def section_heartbeat(out: output.Output, args) -> None:
         except Exception:
             hb_every = "读取失败"
     out.item(f"  配置: agents.defaults.heartbeat.every = {hb_every}")
+    hb_data = {"config_every": hb_every, "agents": {}}
 
     sessions_base = args.sessions_base
     if os.path.isdir(sessions_base):
@@ -554,11 +587,14 @@ def section_heartbeat(out: output.Output, args) -> None:
                     lines = []
                 if not lines:
                     out.item(f"  {agent_id}: HEARTBEAT.md 存在但为空（不会触发 heartbeat）")
+                    hb_data["agents"][agent_id] = {"heartbeat_md": "empty"}
                 else:
                     out.item(f"  {agent_id}: HEARTBEAT.md 有内容（会触发 heartbeat）")
                     out.evidence(hb_file, "\n".join(lines))
+                    hb_data["agents"][agent_id] = {"heartbeat_md": "active"}
             else:
                 out.item(f"  {agent_id}: HEARTBEAT.md 不存在")
+                hb_data["agents"][agent_id] = {"heartbeat_md": "missing"}
 
     log_pattern = os.path.join(args.log_dir, "openclaw-*.log")
     interesting = []
@@ -594,11 +630,20 @@ def section_heartbeat(out: output.Output, args) -> None:
     if interesting:
         out.item(f"  heartbeat 有效事件 {len(interesting)} 条（另有 {len(started)} 条启动记录）")
         out.evidence("应用日志 (heartbeat)", "\n".join(interesting[:50]))
+        hb_data["events"] = len(interesting)
+        hb_data["started_count"] = len(started)
     elif started:
         intervals = sorted({s[3] for s in started if s[3]})
         out.item(f"  heartbeat 调度器: {len(started)} 次启动记录，间隔 {'、'.join(intervals)}")
+        hb_data["events"] = 0
+        hb_data["started_count"] = len(started)
+        hb_data["intervals"] = list(intervals)
     else:
         out.item("  heartbeat 日志: 0 条 — 未发现 heartbeat 相关记录")
+        hb_data["events"] = 0
+        hb_data["started_count"] = 0
+
+    out.set_data("heartbeat", hb_data)
 
 
 def section_system_crontab(out: output.Output) -> None:
@@ -612,6 +657,7 @@ def section_system_crontab(out: output.Output) -> None:
         text = ""
     if not text or "no crontab" in text.lower():
         out.item("  无（未配置系统定时任务）")
+        out.set_data("system_crontab", [])
         return
     entries = [ln for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
     if entries:
@@ -619,6 +665,7 @@ def section_system_crontab(out: output.Output) -> None:
         out.evidence("crontab -l", "\n".join(entries))
     else:
         out.item("  无有效条目（仅注释）")
+    out.set_data("system_crontab", entries)
 
 
 def main() -> int:

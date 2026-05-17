@@ -10,67 +10,16 @@ import re
 import sys
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import cli, output
+from ocdiag.timeutil import fmt_duration, parse_msg_ts, parse_obj_ts
+from ocdiag.tokens import fmt_tokens, human_size, pct
 
 
 NORMAL_STOPS = {"stop", "end_turn", "toolUse", "tool_calls", ""}
-
-
-def parse_obj_ts(ts_str):
-    if not ts_str:
-        return None
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def parse_msg_ts(ms):
-    if ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-    except Exception:
-        return None
-
-
-def human_size(b):
-    if b < 1024:
-        return f"{b}B"
-    if b < 1048576:
-        return f"{b/1024:.1f}KB"
-    if b < 1073741824:
-        return f"{b/1048576:.1f}MB"
-    return f"{b/1073741824:.1f}GB"
-
-
-def fmt_tokens(n):
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.1f}K"
-    return str(n)
-
-
-def fmt_duration(sec):
-    if sec < 60:
-        return f"{sec:.0f}s"
-    if sec < 3600:
-        return f"{sec/60:.1f}m"
-    return f"{sec/3600:.1f}h"
-
-
-def pct(sorted_vals, p):
-    if not sorted_vals:
-        return 0.0
-    n = len(sorted_vals)
-    idx = min(n - 1, int(n * p))
-    return sorted_vals[idx]
 
 
 def build_id_to_key_map(agent_dir):
@@ -502,7 +451,6 @@ def stuck_dimension(out: output.Output, log_dir: str) -> None:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 8：Session 数据采集 + Stuck 探测",
-        prog="08_sessions",
     )
     args = parser.parse_args()
     out = output.init("sessions", json_mode=args.json, no_color=args.no_color)

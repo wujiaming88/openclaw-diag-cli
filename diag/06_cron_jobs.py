@@ -13,26 +13,18 @@ import sys
 import time
 from collections import Counter, deque
 from pathlib import Path
-from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output, paths
+from ocdiag import cli, output
+from ocdiag.timeutil import fmt_age, fmt_ts
+from ocdiag.tokens import fmt_tokens, percentile
 
 try:
     from croniter import croniter  # type: ignore
     HAS_CRONITER = True
 except ImportError:
     HAS_CRONITER = False
-
-
-def fmt_ts(ms):
-    if not ms:
-        return "?"
-    try:
-        return datetime.datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return str(ms)
 
 
 def fmt_duration(ms):
@@ -44,24 +36,6 @@ def fmt_duration(ms):
     if s < 3600:
         return f"{s/60:.1f}min"
     return f"{s/3600:.1f}h"
-
-
-def fmt_age(ms_delta):
-    s = abs(ms_delta) / 1000
-    if s < 60:
-        return f"{s:.0f}秒"
-    if s < 3600:
-        return f"{s/60:.0f}分钟"
-    if s < 86400:
-        return f"{s/3600:.1f}小时"
-    return f"{s/86400:.1f}天"
-
-
-def percentile(sorted_list, p):
-    if not sorted_list:
-        return None
-    k = max(0, min(len(sorted_list) - 1, int(len(sorted_list) * p)))
-    return sorted_list[k]
 
 
 def format_schedule(sched):
@@ -119,16 +93,6 @@ def load_runs(runs_dir, jid):
         except Exception:
             pass
     return out
-
-
-def fmt_k(n):
-    if n is None:
-        return "?"
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1000:
-        return f"{n/1000:.1f}K"
-    return str(n)
 
 
 def extract_usage(r):
@@ -463,7 +427,7 @@ def section_jobs(out: output.Output, jobs_file: str, state_file: str, runs_dir: 
                 cost_sum += cost
                 has_cost = True
         if has_usage:
-            line = f"      tokens(最近{len(recent)}次): in={fmt_k(input_sum)} out={fmt_k(output_sum)}"
+            line = f"      tokens(最近{len(recent)}次): in={fmt_tokens(input_sum)} out={fmt_tokens(output_sum)}"
             if has_cost:
                 line += f" | cost=${cost_sum:.4f}"
             out.item(line)
@@ -671,7 +635,6 @@ def section_system_crontab(out: output.Output) -> None:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 6：定时任务采集",
-        prog="06_cron_jobs",
     )
     args = parser.parse_args()
 

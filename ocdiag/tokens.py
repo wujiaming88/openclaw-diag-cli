@@ -16,10 +16,6 @@ def fmt_tokens(n) -> str:
     return str(n)
 
 
-def fmt_k(n) -> str:
-    return fmt_tokens(n)
-
-
 def percentile(sorted_list: List[float], p: float) -> Optional[float]:
     if not sorted_list:
         return None

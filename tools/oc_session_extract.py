@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Iterator, List, Optional, TextIO, Tuple
+from typing import List, Optional, TextIO, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -39,6 +39,29 @@ def classify_state(filename: str) -> str:
     if ".jsonl.bak-" in filename:
         return "backup"
     return "unknown"
+
+
+def _recent_session_ids(base_dir, limit=5):
+    """Return the most-recently-modified active session UUIDs."""
+    found: List[Tuple[float, str]] = []
+    for ad in glob.glob(os.path.join(base_dir, "*")):
+        sd = os.path.join(ad, "sessions")
+        if not os.path.isdir(sd):
+            continue
+        for entry in os.listdir(sd):
+            if not entry.endswith(".jsonl"):
+                continue
+            if ".trajectory" in entry or ".jsonl.reset." in entry:
+                continue
+            path = os.path.join(sd, entry)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            sid = entry[:-len(".jsonl")]
+            found.append((mtime, sid))
+    found.sort(reverse=True)
+    return [sid for _, sid in found[:limit]]
 
 
 def find_session_files(session_id, base_dir=DEFAULT_BASE_DIR, agent=None):
@@ -213,6 +236,7 @@ def select_files(files, extract_all, _out):
 
 def main() -> int:
     p = argparse.ArgumentParser(
+        prog=os.environ.get("OPENCLAW_DIAG_PROG") or None,
         description="Extract OpenClaw session JSONL files into human-readable format.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -235,10 +259,16 @@ def main() -> int:
     files = find_session_files(args.session_id, args.base_dir, args.agent)
     if not files:
         sys.stderr.write(
-            f"Error: no files found for session ID '{args.session_id}' under {args.base_dir}"
-            + (f" (agent={args.agent})" if args.agent else "")
+            f"Error: 找不到 session '{args.session_id}'（在 {args.base_dir} 下）"
+            + (f" agent={args.agent}" if args.agent else "")
             + "\n"
         )
+        suggestions = _recent_session_ids(args.base_dir, limit=5)
+        if suggestions:
+            sys.stderr.write("  最近的 5 个 session：\n")
+            for sid in suggestions:
+                sys.stderr.write(f"    {sid}\n")
+            sys.stderr.write("  提示：完整 UUID 或前缀（至少 8 位）都可。\n")
         return 1
 
     if args.list:

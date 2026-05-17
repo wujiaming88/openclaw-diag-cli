@@ -11,7 +11,6 @@ import sys
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -632,7 +631,6 @@ def section_gateway_errors(out: output.Output, app_log: str) -> None:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 4：Gateway 状态采集",
-        prog="04_gateway",
     )
     args = parser.parse_args()
 

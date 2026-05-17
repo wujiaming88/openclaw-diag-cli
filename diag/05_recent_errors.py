@@ -171,7 +171,6 @@ def tool_errors_from_session(session_path: str):
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 5：采集近期错误日志",
-        prog="05_recent_errors",
     )
     args = parser.parse_args()
 

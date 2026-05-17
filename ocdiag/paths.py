@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 
 def _env_path(name: str, default: str) -> str:

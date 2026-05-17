@@ -85,7 +85,6 @@ def emit_config(out: output.Output, data: list, obj, prefix: str = "") -> None:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 3：采集 OpenClaw 配置（含敏感字段脱敏）",
-        prog="03_configuration",
     )
     args = parser.parse_args()
 
@@ -95,6 +94,10 @@ def main() -> int:
     config_path = args.config
     if not os.path.isfile(config_path):
         out.item(f"配置文件未找到: {config_path}")
+        out.line("  下一步：")
+        out.line("    1) 确认 OpenClaw 已经初始化（运行过 `openclaw` 即会生成配置）")
+        out.line("    2) 用 OPENCLAW_CONFIG=/path/to/openclaw.json 或 --config 指向正确路径")
+        out.line("    3) 在容器/远端诊断时，用 OPENCLAW_HOME=/path 整体覆盖")
         out.evidence(config_path, "<文件缺失>")
         out.set_data("config_path", config_path)
         out.set_data("found", False)

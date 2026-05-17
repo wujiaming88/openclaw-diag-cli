@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -110,7 +109,6 @@ def parse_proc_environ(pid: str) -> Optional[list]:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 2：采集 OpenClaw 基础环境",
-        prog="02_environment",
     )
     args = parser.parse_args()
     out = output.init("environment", json_mode=args.json, no_color=args.no_color)

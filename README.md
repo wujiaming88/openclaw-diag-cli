@@ -1,50 +1,89 @@
-# OpenClaw 诊断工具箱
+# openclaw-diag
 
-> 排查 OpenClaw 故障的 observer-only CLI。一组诊断、一个入口、零依赖。
-> **Observer-only**：不改变被诊断系统的状态；可发只读探测请求、可写诊断输出。
-
-## 安装
+OpenClaw 出问题时，**先跑这条命令再开 ticket**：
 
 ```bash
-# 一次性运行（无需安装，npm 缓存后离线可用）
+npx openclaw-diag-cli all
+```
+
+零安装、零依赖、observer-only — 只读探测，绝不改你的状态。
+
+## 这是什么
+
+一个排查 [OpenClaw](https://github.com/openclaw/openclaw) 运行问题的命令行工具箱。
+
+把日常排障要做的事情切成 12 个原子诊断：每个回答一个具体问题（"Gateway 起来了吗？"、"哪个 cron 连续失败？"、"P95 延迟最高的模型是哪个？"），可以单独跑、可以一键全跑、也可以拼成 jq 管道喂给监控。
+
+**适合谁用**
+
+- 用 OpenClaw 的运维 / SRE — 想知道线上某个组件在不在状态
+- 应急响应工程师 — 用户报障时要 5 分钟摸清"哪挂了、什么时候挂的、谁动过它"
+- 自动化平台 — 想把 OpenClaw 健康指标接到自家监控
+
+**不是什么**
+
+- 不是修复工具 — 它告诉你出了什么问题，但不会去改任何东西
+- 不是替代 `openclaw doctor` 的内置检查 — 它做的是更深一层的事故诊断
+- 不是性能压测工具 — 它读真实运行数据，不主动施压
+
+## 安装与上手
+
+需要 Node 18+ 和 Python 3.8+。
+
+```bash
+# 一次性运行（首次会下载到 npm cache，之后离线可用）
 npx openclaw-diag-cli
 
-# 装到 PATH
+# 或装到 PATH
 npm install -g openclaw-diag-cli
-openclaw-diag
 ```
-
-依赖：Node 18+ 和 Python 3.8+。
-
-## 五分钟上手
 
 ```bash
-# 1. 看看能做什么
-openclaw-diag
-
-# 2. 检查环境是否就绪
+# 检查工具自身环境
 openclaw-diag doctor
 
-# 3. 跑某个诊断
+# 跑某个具体诊断（看 Gateway 状态）
 openclaw-diag gateway
 
-# 4. 全部 state collectors 跑一遍（任一崩了不影响其他）
+# 一次跑完所有 state collectors（任一崩了不影响其他）
 openclaw-diag all
 
-# 5. 输出结构化 JSON
+# 输出结构化 JSON（适合喂给 jq / 监控）
 openclaw-diag gateway --json
+
+# 追踪一条用户消息从进入到响应的完整时间轴
+openclaw-diag trace <session-uuid>
 ```
+
+输出大致长这样（截取 `openclaw-diag gateway`）：
+
+```
+── 模块 4：Gateway 状态 ──
+
+  • 进程 / 端口
+    PID 12847 (uptime 3d 2h)，监听 :8080，HTTP /healthz → 200
+  • 24h 重启
+    无重启事件
+  • Model API
+    amazon-bedrock 可达（DNS+HTTP+认证均通）
+  • WS 生命周期
+    最近 1h 内 134 次连接，平均存活 47s，无异常关闭
+```
+
+加 `--json` 后输出严格结构化（同字段、同值），方便管道处理。
 
 ## 诊断列表
 
-诊断按"是否需要参数"分两类。
+```bash
+openclaw-diag list   # 看完整列表
+```
 
-### State collectors（无需参数，扫一遍系统当前状态）
+**扫描类（无需参数，扫一遍系统当前状态）**
 
 | 诊断 | 看什么 |
 |---|---|
 | `sys_health` | DNS / 网络 / CPU / 内存 / 磁盘 / IO / 进程 / 时间同步 |
-| `environment` | OpenClaw 版本一致性、Gateway 进程环境变量 |
+| `environment` | OpenClaw 版本一致性、Gateway 进程的环境变量 |
 | `configuration` | `openclaw.json` 展平（敏感字段已脱敏） |
 | `gateway` | Gateway 进程、端口、24h 启停、WS 生命周期、错误码 |
 | `recent_errors` | 应用日志 / journalctl / session 工具调用错误聚合 |
@@ -54,77 +93,62 @@ openclaw-diag gateway --json
 | `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook 异常、Channel、外部依赖 DNS |
 | `shell_history` | 高危命令、openclaw 命令、最近操作 |
 
-### Object inspectors（需要 session uuid，深挖一个具体对象）
+**对象类（需要 session uuid）**
 
 | 诊断 | 看什么 |
 |---|---|
-| `trace <uuid>` | 追踪一条用户消息从进入到响应的完整时间轴 |
-| `extract <uuid>` | 导出 session.jsonl 为可读格式（reset / bak / deleted 全状态） |
+| `trace <uuid>` | 一条用户消息从进入到响应的完整时间轴 |
+| `extract <uuid>` | session.jsonl 导出为可读格式（active / reset / deleted / backup 全状态） |
 
-### Meta
+**其它命令**
 
 | 命令 | 作用 |
 |---|---|
 | `openclaw-diag all` | 跑全部 state collectors |
-| `openclaw-diag list` | 列出所有诊断 |
-| `openclaw-diag doctor` | 检查 Node / Python / ocdiag / OpenClaw 环境 |
-| `openclaw-diag bundle <id>` | 打成 self-contained 单文件 .py |
+| `openclaw-diag doctor` | 检查 Node / Python / openclaw-diag / OpenClaw 环境 |
+| `openclaw-diag bundle <id>` | 打成单文件 .py，离线机器零依赖运行 |
 
-## 常见配方
+## 配方（jq 管道）
 
 ```bash
-# 找出哪个 cron 任务在连续失败
+# 哪些 cron 任务出问题了
 openclaw-diag cron_jobs --json | jq '.data.jobs[] | select(.status!="ok")'
 
-# 看哪个模型的 P95 延迟最高
+# P95 延迟 top 3 的模型
 openclaw-diag performance --json | jq '.data.models | to_entries | sort_by(-.value.p95_s) | .[0:3]'
 
-# 哪些插件今天有 ERROR
-openclaw-diag plugin_diag --json | jq '.data.plugin_errors | to_entries[] | select(.value.error_count > 0)'
-
-# 把所有诊断聚合成单个 JSON 报告（含错误行 — 公理 #4）
-openclaw-diag all --json 2>/dev/null | jq -s '.' > report.json
-
-# 找出有 stuck session 的事件
+# 找出有 stuck session 的 agent
 openclaw-diag sessions --json | jq '.data.stuck_sessions'
 
-# 追踪用户消息时间轴
-openclaw-diag trace <session-uuid> --msg-index 0
-
-# 导出 session 为可读格式（默认脱敏 — 公理 #7）
-openclaw-diag extract <session-uuid> --summary
-
-# 同上但保留原文（含潜在 secret）
-openclaw-diag extract <session-uuid> --unmask
+# 把所有诊断聚合成 NDJSON 报告（崩溃模块也有错误行，不会丢）
+openclaw-diag all --json 2>/dev/null > report.ndjson
 ```
 
-## 离线机器：bundle 出单文件
+## 离线机器与配置覆盖
+
+如果目标机器没法装 npm，先在有网的机器上 `bundle` 出单文件：
 
 ```bash
-# 在有网的机器
+# 在有网的机器上
 openclaw-diag bundle gateway > standalone-gateway.py
 
-# scp 到目标机器（只需要 Python 3.8+，无需安装任何东西）
+# 拷到目标机器（只需 Python 3.8+，无需安装任何东西）
 scp standalone-gateway.py prod-server:/tmp/
 ssh prod-server "python3 /tmp/standalone-gateway.py --json"
 ```
 
-`bundle` 会把脚本和它依赖的共享代码合并成一个 self-contained `.py`，零依赖。
-
-## 配置覆盖
-
-诊断别人机器或容器时，无需改代码：
+诊断他人机器或容器时，无需改代码，用环境变量或 flag 覆盖默认路径：
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `OPENCLAW_HOME` | `~/.openclaw` | OpenClaw 主目录 |
 | `OPENCLAW_CONFIG` | `$OPENCLAW_HOME/openclaw.json` | 配置文件 |
 | `OPENCLAW_LOG_DIR` | `/tmp/openclaw` | 日志目录 |
-| `OPENCLAW_SESSIONS` | `$OPENCLAW_HOME/agents` | Session 根 |
+| `OPENCLAW_SESSIONS` | `$OPENCLAW_HOME/agents` | Session 根目录 |
 
-也可以用 `--config /path/to/file --log-dir /path/to/logs` 覆盖单次。
+或单次运行时用 flag：`--config /path/to/file --log-dir /path/to/logs`。
 
-## 退出码
+## 退出码与设计
 
 | rc | 含义 |
 |---|---|
@@ -132,25 +156,8 @@ ssh prod-server "python3 /tmp/standalone-gateway.py --json"
 | 1 | 诊断运行成功但报告 `status: "error"`（数据源缺失等） |
 | 2 | 诊断崩溃（已隔离，不影响 `all`） |
 
-## 设计原则（7 条公理）
-
-| | |
-|---|---|
-| **#1 Observer-only** | 不改变被诊断系统状态；允许只读探测（HTTP GET / DNS / TCP connect）和写诊断输出 |
-| **#2 零运行时依赖** | 仅 Python 3.8+ 标准库；系统工具（curl/dig/free/df/ss/journalctl）属于诊断装备，不算依赖 |
-| **#3 仓库内独立** | 每个 diag 能 `python3 diag/X.py` 单独跑；Node 与 Python 入口能力等价 |
-| **#4 双视角输出** | 文本 + JSON 双输出，同字段值必须一致；崩溃也输出 NDJSON 错误行 |
-| **#5 数据溯源** | 每字段能查到来源；缺失数据分类报告（`{found, reason, checked}`），不允许 None/"" 混用 |
-| **#6 失败显式** | 单模块崩溃不带崩 `all`；禁止 silent swallow 无注释 |
-| **#7 默认脱敏** | 任何含 secret 的字段必须过 sanitizer；`--unmask` 显式 opt-in |
-
-详细设计 → [docs/DESIGN.md](docs/DESIGN.md)（公理推导、目录结构、扩展指南）
+设计上遵循 7 条公理：observer-only、零运行时依赖、仓库内独立、双视角输出（文本/JSON 同字段同值）、数据溯源、失败显式、默认脱敏。详细推导见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 反馈
 
-- Issues: https://github.com/wujiaming88/openclaw-diag-cli/issues
-- 来源：从 4391 行的 `openclaw-diag.sh` 拆分重写
-
-## License
-
-MIT
+Issues: https://github.com/wujiaming88/openclaw-diag-cli/issues。License: MIT。

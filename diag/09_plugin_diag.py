@@ -533,7 +533,6 @@ def section_deps(out, config_path, unmask=False):
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 9：插件诊断",
-        prog="09_plugin_diag",
     )
     args = parser.parse_args()
     out = output.init("plugin_diag", json_mode=args.json, no_color=args.no_color)

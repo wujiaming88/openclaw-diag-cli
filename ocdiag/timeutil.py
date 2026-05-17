@@ -37,17 +37,6 @@ def fmt_duration(sec) -> str:
     return f"{s/3600:.1f}h"
 
 
-def fmt_duration_ms(ms) -> str:
-    if ms is None:
-        return "?"
-    s = float(ms) / 1000.0
-    if s < 60:
-        return f"{s:.1f}s"
-    if s < 3600:
-        return f"{s/60:.1f}min"
-    return f"{s/3600:.1f}h"
-
-
 def fmt_age(ms_delta) -> str:
     s = abs(float(ms_delta)) / 1000
     if s < 60:

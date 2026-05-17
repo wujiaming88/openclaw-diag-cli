@@ -45,8 +45,11 @@ function findPython() {
 }
 
 function pythonNotFound() {
-  console.error('Error: Python 3.8+ required but not found.');
-  console.error('  Install: https://www.python.org/downloads/  or  apt install python3');
+  console.error('Error: 需要 Python 3.8+ 但未找到。');
+  console.error('  Linux:   sudo apt install python3   /   sudo yum install python3');
+  console.error('  macOS:   brew install python3       /   或从 https://www.python.org/downloads/ 安装');
+  console.error('  Windows: https://www.python.org/downloads/  （记得勾上 "Add to PATH"）');
+  console.error('  装完后再次运行 openclaw-diag 即可。');
   process.exit(127);
 }
 
@@ -72,24 +75,23 @@ function printHelp(modules) {
   const lines = [
     'openclaw-diag — OpenClaw 诊断工具箱',
     '',
-    'Usage:',
+    '用法：',
     '  openclaw-diag                          打印 banner + 诊断目录',
-    '  openclaw-diag list                     列出全部诊断（按类型分组）',
     '  openclaw-diag <id> [args...]           跑单个诊断',
     '  openclaw-diag all [--skip a,b]         跑全部 state collectors',
-    '  openclaw-diag all [--json]             NDJSON 聚合输出（含错误行）',
-    '  openclaw-diag bundle <id>              打成 self-contained 单文件 .py',
-    '  openclaw-diag doctor [--json]          检查 Node / Python / ocdiag / OpenClaw env',
+    '  openclaw-diag list                     列出所有诊断',
+    '  openclaw-diag doctor                   检查 Node / Python / 环境',
+    '  openclaw-diag bundle <id>              生成单文件 .py（离线机器用）',
     '  openclaw-diag --version                打印版本号',
     '  openclaw-diag --help                   本帮助',
     '',
-    'State collectors (无需参数):',
-    '  ' + (state.length ? state.join('  ') : '(unable to query Python)'),
+    '扫描类（无需参数）：',
+    '  ' + (state.length ? state.join('  ') : '（无法连接到 Python）'),
     '',
-    'Object inspectors (需要 session uuid):',
-    '  ' + (obj.length ? obj.join('  ') : '(unable to query Python)'),
+    '对象类（需要 session uuid）：',
+    '  ' + (obj.length ? obj.join('  ') : '（无法连接到 Python）'),
     '',
-    '透传给诊断脚本: --config --log-dir --json --no-color --unmask',
+    '常用 flag：--json（结构化输出）  --no-color（关掉颜色）  --unmask（不脱敏）',
   ];
   console.log(lines.join('\n'));
 }

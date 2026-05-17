@@ -54,7 +54,6 @@ def read_lines(path: str) -> Tuple[List[Tuple[int, str]], str]:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 10：采集 shell 历史",
-        prog="10_shell_history",
     )
     args = parser.parse_args()
 

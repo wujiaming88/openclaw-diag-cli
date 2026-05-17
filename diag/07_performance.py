@@ -7,7 +7,6 @@ import glob
 import json
 import os
 import sys
-import tempfile
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -15,43 +14,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import cli, output
+from ocdiag.timeutil import parse_msg_ts, parse_obj_ts
+from ocdiag.tokens import fmt_tokens, pct
 
 
 NORMAL_STOPS = {"stop", "end_turn", "toolUse", "tool_calls", ""}
-
-
-def parse_obj_ts(ts_str):
-    if not ts_str:
-        return None
-    try:
-        return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-
-def parse_msg_ts(ms):
-    if ms is None:
-        return None
-    try:
-        return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-    except Exception:
-        return None
-
-
-def pct(sorted_vals, p):
-    if not sorted_vals:
-        return 0.0
-    n = len(sorted_vals)
-    idx = min(n - 1, int(n * p))
-    return sorted_vals[idx]
-
-
-def fmt_tokens(n):
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.1f}K"
-    return str(n)
 
 
 def fmt_args(tool_name, tc_args, max_len=100):
@@ -773,7 +740,6 @@ def render(out: output.Output, data, file_count):
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 7：模型与性能数据",
-        prog="07_performance",
     )
     args = parser.parse_args()
     out = output.init("performance", json_mode=args.json, no_color=args.no_color)

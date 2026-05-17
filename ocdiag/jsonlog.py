@@ -58,8 +58,3 @@ def parse_name(obj: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     return p.get("plugin"), p.get("subsystem")
 
 
-def log_level(obj: Dict[str, Any]) -> str:
-    meta = obj.get("_meta") or {}
-    if isinstance(meta, dict):
-        return meta.get("logLevelName", "") or ""
-    return ""

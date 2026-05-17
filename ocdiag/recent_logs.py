@@ -48,6 +48,3 @@ def latest_app_log(log_dir: str) -> Optional[str]:
     return matched[0][1]
 
 
-def all_logs(log_dir: str) -> List[str]:
-    pattern = os.path.join(log_dir, "openclaw-*.log")
-    return sorted(glob.glob(pattern))

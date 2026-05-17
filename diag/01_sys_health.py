@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -412,7 +411,6 @@ def section_time_sync(out: output.Output) -> None:
 def main() -> int:
     parser = cli.build_common_parser(
         description="模块 1：系统健康检查",
-        prog="01_sys_health",
     )
     args = parser.parse_args()
 

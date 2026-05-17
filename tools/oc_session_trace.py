@@ -52,14 +52,6 @@ def fmt_duration(ms: float) -> str:
     return f"{m}m{s:.1f}s"
 
 
-def human_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-
 def extract_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -110,6 +102,29 @@ def find_session_file(
     prio = {"active": 0, "deleted": 1, "reset": 2, "backup": 3}
     candidates.sort(key=lambda x: prio.get(x[1], 9))
     return candidates[0][0] if candidates else None
+
+
+def _recent_session_ids(base_dir: str, limit: int = 5) -> List[str]:
+    """Return the most-recently-modified active session UUIDs (no .reset/.bak/.deleted)."""
+    found: List[Tuple[float, str]] = []
+    for ad in glob.glob(os.path.join(base_dir, "*")):
+        sd = os.path.join(ad, "sessions")
+        if not os.path.isdir(sd):
+            continue
+        for entry in os.listdir(sd):
+            if not entry.endswith(".jsonl"):
+                continue
+            if ".trajectory" in entry or ".jsonl.reset." in entry:
+                continue
+            path = os.path.join(sd, entry)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            sid = entry[:-len(".jsonl")]
+            found.append((mtime, sid))
+    found.sort(reverse=True)
+    return [sid for _, sid in found[:limit]]
 
 
 def find_trajectory_file(session_file: str) -> Optional[str]:
@@ -634,6 +649,7 @@ def format_json(session_id, session_file, user_msg_index, user_msg_id, analysis,
 
 def main():
     parser = argparse.ArgumentParser(
+        prog=os.environ.get("OPENCLAW_DIAG_PROG") or None,
         description="Trace the processing timeline of a user message in an OpenClaw session.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -652,8 +668,14 @@ def main():
 
     session_file = find_session_file(args.session_id, args.base_dir, args.agent)
     if not session_file:
-        print(f"Error: no session file found for '{args.session_id}' under {args.base_dir}",
+        print(f"Error: 找不到 session '{args.session_id}'（在 {args.base_dir} 下）",
               file=sys.stderr)
+        suggestions = _recent_session_ids(args.base_dir, limit=5)
+        if suggestions:
+            print(f"  最近的 5 个 session：", file=sys.stderr)
+            for sid in suggestions:
+                print(f"    {sid}", file=sys.stderr)
+            print(f"  提示：UUID 完整 36 位，前缀也可（至少 8 位）。", file=sys.stderr)
         sys.exit(1)
 
     records = load_records(session_file)

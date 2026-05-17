@@ -10,10 +10,12 @@ Layout:
 
 from __future__ import annotations
 
+import json
 import os
 import runpy
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import List
 
@@ -46,6 +48,23 @@ MODULE_BY_ID = {**STATE_BY_ID, **OBJECT_BY_ID}
 MODULE_IDS = set(MODULE_BY_ID.keys())
 
 
+def cmd_list_json() -> int:
+    """Machine-readable module catalogue. Single source of truth consumed
+    by the Node shell and the bundle script (axiom #3)."""
+    payload = {
+        "state_collectors": [
+            {"id": mid, "label": label, "script": rel}
+            for mid, label, rel in STATE_COLLECTORS
+        ],
+        "object_inspectors": [
+            {"id": mid, "label": label, "script": rel}
+            for mid, label, rel in OBJECT_INSPECTORS
+        ],
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
 def cmd_list() -> int:
     print("Available diagnostics:")
     print()
@@ -64,11 +83,24 @@ def cmd_list() -> int:
     return 0
 
 
-def run_script(script_rel: str, extra_args: List[str]) -> int:
+def run_script(
+    script_rel: str,
+    extra_args: List[str],
+    module_id: str = None,
+) -> int:
+    """Execute a diag script in-process. Returns the rc.
+
+    On crash, in addition to the human-readable stderr trace we emit a single
+    NDJSON error record to stdout when the script was invoked with --json.
+    This guarantees `all --json` produces N records for N modules — including
+    crashes — so downstream parsers don't silently lose modules. (Axiom #4)
+    """
     script_path = REPO_ROOT / script_rel
     if not script_path.is_file():
         print(f"Error: script not found: {script_path}", file=sys.stderr)
         return 2
+    json_mode = "--json" in extra_args
+    mid = module_id or script_path.stem
     saved_argv = sys.argv[:]
     try:
         sys.argv = [str(script_path), *extra_args]
@@ -79,11 +111,25 @@ def run_script(script_rel: str, extra_args: List[str]) -> int:
             return int(e.code) if e.code is not None else 0
         except (TypeError, ValueError):
             return 1
-    except Exception as e:
+    except BaseException as e:  # noqa: BLE001 — emit then re-classify
         print(f"  ERROR: {script_path.name} crashed: {type(e).__name__}: {e}",
               file=sys.stderr)
-        import traceback
         traceback.print_exc(file=sys.stderr)
+        if json_mode:
+            err_record = {
+                "module": mid,
+                "status": "error",
+                "error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
+            }
+            try:
+                sys.stdout.write(json.dumps(err_record, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                # If stdout itself is broken (closed pipe), there's nothing
+                # productive to do — the stderr trace above already records
+                # the crash.
+                pass
         return 2
     finally:
         sys.argv = saved_argv
@@ -101,7 +147,7 @@ def cmd_all(extra_args: List[str], skip_ids: List[str]) -> int:
         n += 1
         print(f"\n[{n}/{total}] {label} ({mid})...", flush=True, file=progress_stream)
         t0 = time.time()
-        rc = run_script(script, extra_args)
+        rc = run_script(script, extra_args, module_id=mid)
         elapsed = time.time() - t0
         print(f"[{n}/{total}] {label} ({mid}) ... done ({elapsed:.1f}s)",
               flush=True, file=progress_stream)
@@ -154,7 +200,19 @@ def main(argv=None) -> int:
     head, rest = argv[0], argv[1:]
 
     if head == "list":
+        if "--json" in rest:
+            return cmd_list_json()
         return cmd_list()
+
+    if head == "doctor":
+        from ocdiag import doctor
+        json_mode = "--json" in rest
+        node_version = None
+        for i, a in enumerate(rest):
+            if a == "--node-version" and i + 1 < len(rest):
+                node_version = rest[i + 1]
+                break
+        return doctor.run(json_mode=json_mode, node_version=node_version)
 
     if head == "all":
         skip_ids, passthrough = _split_skip(rest)
@@ -171,13 +229,13 @@ def main(argv=None) -> int:
             return cmd_all(passthrough, skip_ids)
         if target in MODULE_BY_ID:
             _, script = MODULE_BY_ID[target]
-            return run_script(script, sub)
+            return run_script(script, sub, module_id=target)
         print(f"Error: unknown diagnostic '{target}'. Use `ocdiag list`.", file=sys.stderr)
         return 2
 
     if head in MODULE_BY_ID:
         _, script = MODULE_BY_ID[head]
-        return run_script(script, rest)
+        return run_script(script, rest, module_id=head)
 
     print(f"Error: unknown command '{head}'. Use `ocdiag list` to see available diagnostics.",
           file=sys.stderr)

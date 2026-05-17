@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import cli, output
 from ocdiag.jsonlog import parse_name
+from ocdiag.sensitive import sanitize_text
 from ocdiag.timeutil import fmt_hms
 
 
@@ -110,13 +111,18 @@ def scan_logs(today_logs):
     for logf in today_logs:
         try:
             fh = open(logf, "r", errors="replace")
-        except Exception:
+        except OSError:
+            # Best-effort: if today's log is unreadable, skip it; the parent
+            # caller still surfaces "no log data" via the empty plugin_diag
+            # output. (We don't fail the whole module for one missing file.)
             continue
         with fh:
             for line in fh:
                 try:
                     o = json.loads(line)
-                except Exception:
+                except (json.JSONDecodeError, ValueError):
+                    # Expected: log files are JSONL; non-JSON lines are emitted
+                    # by Node before logger init. Drop those lines silently.
                     continue
                 plugin, sub = parse_name(o)
                 lvl = o.get("_meta", {}).get("logLevelName", "")
@@ -190,18 +196,23 @@ def scan_logs(today_logs):
 
 
 def load_configured(config_path):
+    """Return {plugin_id: enabled_bool}. Status reported as second return."""
     configured = {}
-    if config_path and os.path.isfile(config_path):
-        try:
-            with open(config_path) as f:
-                cfg = json.load(f)
-            entries = cfg.get("plugins", {}).get("entries", {}) or {}
-            for k, v in entries.items():
-                if isinstance(v, dict):
-                    configured[k] = bool(v.get("enabled", False))
-        except Exception:
-            pass
-    return configured
+    status = {"found": True}
+    if not config_path or not os.path.isfile(config_path):
+        return configured, {"found": False, "reason": "config_not_found",
+                            "checked": config_path or ""}
+    try:
+        with open(config_path) as f:
+            cfg = json.load(f)
+        entries = cfg.get("plugins", {}).get("entries", {}) or {}
+        for k, v in entries.items():
+            if isinstance(v, dict):
+                configured[k] = bool(v.get("enabled", False))
+    except (OSError, json.JSONDecodeError) as e:
+        return configured, {"found": False, "reason": "config_unreadable",
+                            "checked": config_path, "error": str(e)[:200]}
+    return configured, status
 
 
 def load_extensions(oc_home):
@@ -274,7 +285,10 @@ def section_state(out, scan, configured, extensions):
     })
 
 
-def section_errors(out, scan, configured):
+def section_errors(out, scan, configured, unmask=False):
+    def _scrub(s: str) -> str:
+        return s if unmask else sanitize_text(s)
+
     out.subsection("9.2 插件错误/警告")
     plugin_level_counts = scan["plugin_level_counts"]
     plugin_error_samples = scan["plugin_error_samples"]
@@ -313,9 +327,11 @@ def section_errors(out, scan, configured):
         if samples:
             for ts, lvl, text in dedup_messages(samples, max_unique=999):
                 tag = {"ERROR": "E", "FATAL": "F", "WARN": "W"}.get(lvl, "?")
-                snippet = text.replace("\n", " ")
+                snippet = _scrub(text.replace("\n", " "))
                 out.item(f"  [{tag}] {fmt_hms(ts)}: {snippet}")
-                sample_payload.append({"ts": ts, "level": lvl, "msg": text[:300]})
+                sample_payload.append({
+                    "ts": ts, "level": lvl, "msg": _scrub(text[:300]),
+                })
         if err > 0 or warn > 0 or sample_payload:
             errors_payload[p] = {
                 "error_count": err,
@@ -331,9 +347,9 @@ def section_errors(out, scan, configured):
         out.item(f"[plugin-manager]: {len(pm_errors)} ERROR, {len(pm_warns)} WARN, "
                  f"{len(plugin_diag_messages)} total")
         for ts, _lvl, text in dedup_messages(pm_errors, max_unique=999):
-            out.item(f"  [E] {fmt_hms(ts)}: {text.replace(chr(10),' ')}")
+            out.item(f"  [E] {fmt_hms(ts)}: {_scrub(text.replace(chr(10),' '))}")
         for ts, _lvl, text in dedup_messages(pm_warns, max_unique=999):
-            out.item(f"  [W] {fmt_hms(ts)}: {text.replace(chr(10),' ')}")
+            out.item(f"  [W] {fmt_hms(ts)}: {_scrub(text.replace(chr(10),' '))}")
     elif plugin_diag_messages:
         out.item(f"[plugin-manager]: 0 ERROR, 0 WARN, {len(plugin_diag_messages)} total")
 
@@ -444,12 +460,15 @@ def walk_urls(val, out_set):
             walk_urls(v, out_set)
 
 
-def section_deps(out, config_path):
+def section_deps(out, config_path, unmask=False):
     out.subsection("9.5 插件外部依赖")
     plugin_deps = {}
     if not (config_path and os.path.isfile(config_path)):
         out.item("未发现已启用插件的外部依赖配置")
         out.set_data("plugin_deps", {})
+        out.set_data("plugin_deps_status",
+                     {"found": False, "reason": "config_not_found",
+                      "checked": config_path or ""})
         return
     try:
         with open(config_path) as f:
@@ -464,8 +483,13 @@ def section_deps(out, config_path):
             walk_urls(pconf, hosts)
             hosts = {h for h in hosts if not h.startswith(("127.", "localhost", "0.0.0.0"))}
             plugin_deps[pid] = hosts
-    except Exception:
-        pass
+    except (OSError, json.JSONDecodeError) as e:
+        out.item(f"配置读取/解析失败: {type(e).__name__}")
+        out.set_data("plugin_deps", {})
+        out.set_data("plugin_deps_status",
+                     {"found": False, "reason": "config_unreadable",
+                      "checked": config_path, "error": str(e)[:200]})
+        return
 
     if not plugin_deps:
         out.item("未发现已启用插件的外部依赖配置")
@@ -519,14 +543,18 @@ def main() -> int:
     today_logs = sorted(glob.glob(os.path.join(args.log_dir, f"openclaw-{today}.log")))
 
     scan = scan_logs(today_logs)
-    configured = load_configured(args.config)
+    configured, configured_status = load_configured(args.config)
     extensions = load_extensions(args.openclaw_home)
+    if not configured_status.get("found", True):
+        out.item(f"配置加载失败: {configured_status.get('reason')} "
+                 f"({configured_status.get('checked')})")
+        out.set_data("configured_status", configured_status)
 
     section_state(out, scan, configured, extensions)
-    section_errors(out, scan, configured)
+    section_errors(out, scan, configured, unmask=args.unmask)
     section_hooks(out, scan)
     section_channels(out, scan)
-    section_deps(out, args.config)
+    section_deps(out, args.config, unmask=args.unmask)
 
     return out.done()
 

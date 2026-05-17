@@ -14,6 +14,7 @@ from typing import Iterator, List, Optional, TextIO, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import paths
+from ocdiag.sensitive import sanitize_text
 
 
 DEFAULT_BASE_DIR = paths.SESSIONS_BASE
@@ -85,23 +86,57 @@ def write_header(out, path, state):
     out.write(SEPARATOR + "\n\n")
 
 
-def extract_file(path, state, out, pretty=True, type_filter=None):
+def _sanitize_record(obj):
+    """Walk a session record and scrub free-form text content fields.
+
+    Sessions store user/assistant messages under ``message.content``. We don't
+    rewrite tool args or metadata: those keep structure that matters for
+    diagnosis. We only scrub free-form prose where secrets typically live
+    (user-pasted tokens, error tracebacks).
+    """
+    if not isinstance(obj, dict):
+        return obj
+    msg = obj.get("message")
+    if isinstance(msg, dict):
+        content = msg.get("content")
+        if isinstance(content, str):
+            msg["content"] = sanitize_text(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    for k in ("text", "content"):
+                        v = part.get(k)
+                        if isinstance(v, str):
+                            part[k] = sanitize_text(v)
+        # Also scrub any top-level text-ish fields the gateway may have set.
+        for k in ("text", "summary"):
+            v = msg.get(k)
+            if isinstance(v, str):
+                msg[k] = sanitize_text(v)
+    return obj
+
+
+def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True):
     write_header(out, path, state)
     written = 0
     for line_no, obj, raw, err in stream_records(path):
         if err is not None:
             out.write(f"--- Record {line_no} [PARSE ERROR: {err}] ---\n")
-            out.write(raw + "\n\n")
+            out.write((sanitize_text(raw) if sanitize else raw) + "\n\n")
             written += 1
             continue
         rtype = obj.get("type", "?") if isinstance(obj, dict) else "?"
         if type_filter is not None and rtype not in type_filter:
             continue
         out.write(f"--- Record {line_no} [type: {rtype}] ---\n")
+        if sanitize:
+            obj = _sanitize_record(obj)
         if pretty:
             out.write(json.dumps(obj, indent=2, ensure_ascii=False))
         else:
-            out.write(raw)
+            # Non-pretty mode: emit the (possibly sanitized) JSON or fall back
+            # to the original raw line if we didn't touch it.
+            out.write(json.dumps(obj, ensure_ascii=False) if sanitize else raw)
         out.write("\n\n")
         written += 1
     return written
@@ -192,6 +227,9 @@ def main() -> int:
     p.add_argument("--types", help="Filter by record type (comma-separated, e.g. 'message,toolCall')")
     p.add_argument("--summary", action="store_true",
                    help="Show record-count summary instead of full extraction")
+    p.add_argument("--unmask", action="store_true",
+                   help="Disable default sanitization of secret-shaped substrings "
+                        "in message content (off = scrubbed)")
     args = p.parse_args()
 
     files = find_session_files(args.session_id, args.base_dir, args.agent)
@@ -231,7 +269,7 @@ def main() -> int:
                 summarize_file(path, state, out_fp)
             else:
                 extract_file(path, state, out_fp, pretty=not args.no_pretty,
-                             type_filter=type_filter)
+                             type_filter=type_filter, sanitize=not args.unmask)
     except BrokenPipeError:
         try:
             sys.stdout.flush()

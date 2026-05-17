@@ -1,8 +1,12 @@
 #!/usr/bin/env node
 // openclaw-diag — Node entry shell.
-// Locates python3, forwards args to ocdiag.dispatcher, transparently passes stdio
-// and exit code. Implements two Node-side commands (doctor, bundle dispatch,
-// --version, --help) so the user gets useful UX even before Python runs.
+//
+// All real logic lives in Python (ocdiag.dispatcher, ocdiag.doctor). This
+// shell exists for one reason only: npx-friendly install. It locates a
+// suitable python3, hands argv to the Python dispatcher, and forwards stdio
+// + exit code transparently. The single source of truth for the module
+// catalogue is `ocdiag/dispatcher.py`; the Node shell pulls the list from
+// `ocdiag list --json` instead of duplicating it (axiom #3).
 
 'use strict';
 
@@ -12,26 +16,11 @@ const fs = require('fs');
 
 const REPO_ROOT = path.resolve(__dirname, '..');
 const PKG = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf8'));
+const DISPATCHER = path.join(REPO_ROOT, 'bin', 'ocdiag');
 
 const PYTHON_CANDIDATES = process.platform === 'win32'
   ? ['python3', 'python', 'py']
   : ['python3', 'python'];
-
-// Keep these in sync with ocdiag/dispatcher.py.
-const STATE_COLLECTORS = [
-  'sys_health', 'environment', 'configuration', 'gateway', 'recent_errors',
-  'cron_jobs', 'performance', 'sessions', 'plugin_diag', 'shell_history',
-];
-const OBJECT_INSPECTORS = ['trace', 'extract'];
-const MODULE_IDS = new Set([...STATE_COLLECTORS, ...OBJECT_INSPECTORS]);
-
-const STATE_SCRIPTS = [
-  '01_sys_health.py', '02_environment.py', '03_configuration.py',
-  '04_gateway.py', '05_recent_errors.py', '06_cron_jobs.py',
-  '07_performance.py', '08_sessions.py', '09_plugin_diag.py',
-  '10_shell_history.py',
-];
-const OBJECT_SCRIPTS = ['oc_session_trace.py', 'oc_session_extract.py'];
 
 function findPython() {
   for (const cmd of PYTHON_CANDIDATES) {
@@ -49,7 +38,7 @@ function findPython() {
         }
       }
     } catch (_) {
-      // try next
+      // try next candidate
     }
   }
   return null;
@@ -61,11 +50,25 @@ function pythonNotFound() {
   process.exit(127);
 }
 
+function fetchModules(pyCmd) {
+  const r = spawnSync(pyCmd, [DISPATCHER, 'list', '--json'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (r.status !== 0) return null;
+  try {
+    return JSON.parse((r.stdout || '').toString());
+  } catch (_) {
+    return null;
+  }
+}
+
 function printVersion() {
   console.log(PKG.version);
 }
 
-function printHelp() {
+function printHelp(modules) {
+  const state = modules ? modules.state_collectors.map((m) => m.id) : [];
+  const obj = modules ? modules.object_inspectors.map((m) => m.id) : [];
   const lines = [
     'openclaw-diag — OpenClaw 诊断工具箱',
     '',
@@ -74,30 +77,27 @@ function printHelp() {
     '  openclaw-diag list                     列出全部诊断（按类型分组）',
     '  openclaw-diag <id> [args...]           跑单个诊断',
     '  openclaw-diag all [--skip a,b]         跑全部 state collectors',
-    '  openclaw-diag all [--json]             NDJSON 聚合输出',
+    '  openclaw-diag all [--json]             NDJSON 聚合输出（含错误行）',
     '  openclaw-diag bundle <id>              打成 self-contained 单文件 .py',
     '  openclaw-diag doctor [--json]          检查 Node / Python / ocdiag / OpenClaw env',
     '  openclaw-diag --version                打印版本号',
     '  openclaw-diag --help                   本帮助',
     '',
     'State collectors (无需参数):',
-    '  ' + STATE_COLLECTORS.join('  '),
+    '  ' + (state.length ? state.join('  ') : '(unable to query Python)'),
     '',
     'Object inspectors (需要 session uuid):',
-    '  ' + OBJECT_INSPECTORS.join('  '),
+    '  ' + (obj.length ? obj.join('  ') : '(unable to query Python)'),
     '',
-    '透传给诊断脚本: --config --log-dir --json --no-color',
+    '透传给诊断脚本: --config --log-dir --json --no-color --unmask',
   ];
   console.log(lines.join('\n'));
 }
 
-function runDispatcher(args) {
-  const py = findPython();
-  if (!py) pythonNotFound();
-  const dispatcher = path.join(REPO_ROOT, 'bin', 'ocdiag');
-  const child = spawn(py.cmd, [dispatcher, ...args], { stdio: 'inherit' });
+function spawnDispatcher(pyCmd, args) {
+  const child = spawn(pyCmd, [DISPATCHER, ...args], { stdio: 'inherit' });
   child.on('error', (err) => {
-    console.error(`Error: failed to spawn ${py.cmd}: ${err.message}`);
+    console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
     process.exit(1);
   });
   child.on('exit', (code, signal) => {
@@ -109,159 +109,42 @@ function runDispatcher(args) {
   });
 }
 
-function runScript(scriptPath, args) {
-  const py = findPython();
-  if (!py) pythonNotFound();
-  const child = spawn(py.cmd, [scriptPath, ...args], { stdio: 'inherit' });
-  child.on('error', (err) => {
-    console.error(`Error: failed to spawn ${py.cmd}: ${err.message}`);
-    process.exit(1);
-  });
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-      return;
-    }
-    process.exit(code == null ? 1 : code);
-  });
-}
-
-function runBundle(args) {
+function runBundle(pyCmd, args) {
   if (args.length === 0) {
     console.error('Error: bundle requires a module id (e.g. `openclaw-diag bundle gateway`)');
     process.exit(2);
   }
-  runScript(path.join(REPO_ROOT, 'lib', 'bundle.py'), args);
-}
-
-// ── doctor ──
-
-function nodeVersionOk() {
-  const m = process.versions.node.match(/^(\d+)\./);
-  return m && parseInt(m[1], 10) >= 18;
-}
-
-function checkOcdiagImport(pyCmd) {
-  const r = spawnSync(
-    pyCmd,
-    ['-c', 'import sys, os; sys.path.insert(0, os.environ["OCDIAG_REPO_ROOT"]); import ocdiag; print(ocdiag.__version__)'],
-    {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, OCDIAG_REPO_ROOT: REPO_ROOT },
-    },
-  );
-  if (r.status === 0) {
-    return { ok: true, version: (r.stdout || '').toString().trim() };
-  }
-  return { ok: false, error: ((r.stderr || '') + (r.stdout || '')).toString().trim() };
-}
-
-function checkDiagScripts(pyCmd) {
-  const failed = [];
-  const all = [
-    ...STATE_SCRIPTS.map((n) => ({ name: n, path: path.join(REPO_ROOT, 'diag', n) })),
-    ...OBJECT_SCRIPTS.map((n) => ({ name: n, path: path.join(REPO_ROOT, 'tools', n) })),
-  ];
-  for (const item of all) {
-    const r = spawnSync(pyCmd, [item.path, '--help'], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 10000,
-    });
-    if (r.status !== 0) {
-      failed.push({ script: item.name, status: r.status, stderr: ((r.stderr || '').toString().trim()).slice(0, 200) });
-    }
-  }
-  return { failed, total: all.length };
-}
-
-function checkOpenclawConfig() {
-  const home = process.env.HOME || require('os').homedir();
-  const cfg = process.env.OPENCLAW_CONFIG
-    || path.join(process.env.OPENCLAW_HOME || path.join(home, '.openclaw'), 'openclaw.json');
-  return { path: cfg, exists: fs.existsSync(cfg) };
-}
-
-function runDoctor(args) {
-  const jsonMode = args.includes('--json');
-  const result = {
-    node: { version: process.versions.node, ok: nodeVersionOk() },
-    python: null,
-    ocdiag: null,
-    diag_scripts: null,
-    openclaw_config: null,
-  };
-
-  const py = findPython();
-  if (!py) {
-    result.python = { ok: false, error: 'Python 3.8+ not found in PATH' };
-    if (jsonMode) {
-      console.log(JSON.stringify(result, null, 2));
-    } else {
-      console.log(`✓ Node v${result.node.version}${result.node.ok ? '' : ' (need >= 18)'}`);
-      console.log('✗ Python 3.8+ not found in PATH');
-      console.log('  Install: https://www.python.org/downloads/  or  apt install python3');
-    }
+  const child = spawn(pyCmd, [path.join(REPO_ROOT, 'lib', 'bundle.py'), ...args], {
+    stdio: 'inherit',
+  });
+  child.on('error', (err) => {
+    console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
     process.exit(1);
-  }
-  result.python = { ok: true, version: py.version, cmd: py.cmd };
-
-  const ocdiag = checkOcdiagImport(py.cmd);
-  result.ocdiag = ocdiag;
-
-  const { failed, total } = checkDiagScripts(py.cmd);
-  result.diag_scripts = {
-    ok: failed.length === 0,
-    total,
-    failed,
-  };
-
-  const cfg = checkOpenclawConfig();
-  result.openclaw_config = cfg;
-
-  if (jsonMode) {
-    console.log(JSON.stringify(result, null, 2));
-  } else {
-    console.log(`${result.node.ok ? '✓' : '✗'} Node v${result.node.version}${result.node.ok ? '' : ' (need >= 18)'}`);
-    console.log(`✓ Python ${py.version} (${py.cmd})`);
-    if (ocdiag.ok) {
-      console.log(`✓ ocdiag package importable (version ${ocdiag.version})`);
-    } else {
-      console.log('✗ ocdiag package not importable');
-      if (ocdiag.error) {
-        console.log('  ' + ocdiag.error.split('\n').slice(-3).join(' | '));
-      }
+  });
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
     }
-    if (failed.length === 0) {
-      console.log(`✓ All ${total} diagnostics respond to --help`);
-    } else {
-      console.log(`✗ ${failed.length}/${total} diagnostics failed --help:`);
-      for (const f of failed) {
-        console.log(`    ${f.script} (rc=${f.status})`);
-      }
-    }
-    if (cfg.exists) {
-      console.log(`✓ OpenClaw config present (${cfg.path})`);
-    } else {
-      console.log(`ℹ OpenClaw config not found (${cfg.path}) — diagnostics will run but report missing`);
-    }
-  }
-
-  const ok = result.node.ok && result.python.ok && ocdiag.ok && failed.length === 0;
-  process.exit(ok ? 0 : 1);
+    process.exit(code == null ? 1 : code);
+  });
 }
 
-// ── main ──
+function runDoctor(pyCmd, args) {
+  // Forward Node version into the Python doctor so it can include it in the
+  // report. ocdiag.doctor handles the actual logic; we just spawn it.
+  spawnDispatcher(pyCmd, ['doctor', '--node-version', process.versions.node, ...args]);
+}
 
 function main() {
   const argv = process.argv.slice(2);
+  const py = findPython();
 
   if (argv.length === 0) {
-    const py = findPython();
     if (!py) pythonNotFound();
     console.log(`openclaw-diag v${PKG.version} — OpenClaw 诊断工具箱`);
     console.log('');
-    const dispatcher = path.join(REPO_ROOT, 'bin', 'ocdiag');
-    spawnSync(py.cmd, [dispatcher, 'list'], { stdio: 'inherit' });
+    spawnSync(py.cmd, [DISPATCHER, 'list'], { stdio: 'inherit' });
     console.log('');
     console.log('常用命令：');
     console.log('  openclaw-diag gateway           跑单个 state collector');
@@ -279,20 +162,24 @@ function main() {
     process.exit(0);
   }
   if (head === '--help' || head === '-h') {
-    printHelp();
+    if (!py) pythonNotFound();
+    printHelp(fetchModules(py.cmd));
     process.exit(0);
   }
+
+  if (!py) pythonNotFound();
+
   if (head === 'doctor') {
-    runDoctor(argv.slice(1));
+    runDoctor(py.cmd, argv.slice(1));
     return;
   }
   if (head === 'bundle') {
-    runBundle(argv.slice(1));
+    runBundle(py.cmd, argv.slice(1));
     return;
   }
 
-  // Pass through everything else (flat ids, `all`, `list`, `run` alias, unknown) to dispatcher.
-  runDispatcher(argv);
+  // Pass everything else (flat ids, `all`, `list`, `run` alias, unknown) to dispatcher.
+  spawnDispatcher(py.cmd, argv);
 }
 
 main();

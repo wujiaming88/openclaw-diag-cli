@@ -146,11 +146,20 @@ def section_restart_events(out: output.Output) -> None:
 
 def section_model_api(out: output.Output, args) -> None:
     if not os.path.isfile(args.config):
+        out.item("模型 API: 配置文件未找到")
+        out.set_data("model_api_status", {
+            "found": False, "reason": "config_not_found", "checked": args.config,
+        })
         return
     try:
         with open(args.config) as f:
             cfg = json.load(f)
-    except Exception:
+    except (OSError, json.JSONDecodeError) as e:
+        out.item(f"模型 API: 配置读取失败 ({type(e).__name__})")
+        out.set_data("model_api_status", {
+            "found": False, "reason": "config_unreadable",
+            "checked": args.config, "error": str(e)[:200],
+        })
         return
     models = cfg.get("models", {}) or {}
     all_cfgs = {}
@@ -290,8 +299,12 @@ def section_ws_lifecycle(out: output.Output, app_log: str) -> None:
                 else:
                     continue
                 events.append((ts_dt, ts_str, account, kind, msg))
-    except OSError:
-        out.item("Channel WS: 读取应用日志失败")
+    except OSError as e:
+        out.item(f"Channel WS: 读取应用日志失败 ({type(e).__name__})")
+        out.set_data("ws_summary_status", {
+            "found": False, "reason": "log_unreadable",
+            "checked": app_log, "error": str(e)[:200],
+        })
         return
 
     if not events and not expired:
@@ -564,7 +577,12 @@ def section_gateway_errors(out: output.Output, app_log: str) -> None:
                     continue
                 kind, code, reason = r
                 events.append((ts, kind, code, reason or "(no reason)"))
-    except OSError:
+    except OSError as e:
+        out.item(f"Gateway 错误码: 读取应用日志失败 ({type(e).__name__})")
+        out.set_data("gateway_errors_status", {
+            "found": False, "reason": "log_unreadable",
+            "checked": app_log, "error": str(e)[:200],
+        })
         return
 
     if not events:
@@ -622,6 +640,7 @@ def main() -> int:
     out.section("模块 4：Gateway 状态")
 
     port = 18789
+    port_source = "default"
     if os.path.isfile(args.config):
         try:
             with open(args.config) as f:
@@ -629,8 +648,13 @@ def main() -> int:
             cp = cfg.get("gateway", {}).get("port")
             if cp:
                 port = int(cp)
-        except Exception:
-            pass
+                port_source = "config"
+        except (OSError, json.JSONDecodeError, ValueError) as e:
+            out.set_data("port_source_status", {
+                "found": False, "reason": "config_unreadable",
+                "checked": args.config, "error": str(e)[:200],
+            })
+    out.set_data("port_source", port_source)
 
     section_process_port(out, args, port)
     section_restart_events(out)

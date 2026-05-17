@@ -16,7 +16,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import cli, output, paths
-from ocdiag.sensitive import safe_val
+from ocdiag.sensitive import safe_val, sanitize_text
 
 
 def run(cmd, timeout=5):
@@ -123,6 +123,12 @@ def main() -> int:
         out.item("OpenClaw 版本: 无法确定")
         out.evidence("openclaw --version", "命令未找到或无输出")
     out.set_data("oc_version", oc_version)
+    if not oc_version:
+        out.set_data("oc_version_status", {
+            "found": False,
+            "reason": "command_not_found",
+            "checked": "openclaw --version + pnpm/global node_modules",
+        })
 
     service_file = paths.SERVICE_FILE
     svc_version = None
@@ -153,6 +159,10 @@ def main() -> int:
         out.item("Node.js: 未找到")
         out.evidence("node --version", "命令未找到")
     out.set_data("node_version", node_ver)
+    if not node_ver:
+        out.set_data("node_version_status", {
+            "found": False, "reason": "command_not_found", "checked": "node --version",
+        })
 
     rc, stdout, _ = run(["free", "-m"])
     mem_avail = ""
@@ -166,6 +176,10 @@ def main() -> int:
     if mem_avail:
         out.item(f"可用内存: {mem_avail} MB")
     out.set_data("memory_available_mb", mem_avail)
+    if not mem_avail:
+        out.set_data("memory_status", {
+            "found": False, "reason": "free_unavailable", "checked": "free -m",
+        })
 
     rc, stdout, _ = run(["df", "-m", paths.OPENCLAW_HOME])
     disk_avail = ""
@@ -178,6 +192,11 @@ def main() -> int:
     if disk_avail:
         out.item(f"磁盘可用 ({paths.OPENCLAW_HOME}): {disk_avail} MB")
     out.set_data("disk_available_mb", disk_avail)
+    if not disk_avail:
+        out.set_data("disk_status", {
+            "found": False, "reason": "df_unavailable",
+            "checked": f"df -m {paths.OPENCLAW_HOME}",
+        })
 
     gw_status = gateway_systemctl_status()
     if gw_status:
@@ -245,8 +264,16 @@ def main() -> int:
         out.set_data("gateway_env", [{"key": k, "value": v} for k, v in env_pairs])
     elif pid:
         out.item(f"无法读取 /proc/{pid}/environ（权限不足？）")
+        out.set_data("gateway_env_status", {
+            "found": False, "reason": "proc_unreadable",
+            "checked": f"/proc/{pid}/environ",
+        })
     else:
         out.item("Gateway 进程未运行，跳过")
+        out.set_data("gateway_env_status", {
+            "found": False, "reason": "process_not_running",
+            "checked": "pgrep -f openclaw.*gateway",
+        })
 
     if os.path.isfile(paths.SERVICE_ENV_FILE):
         out.line("")
@@ -281,9 +308,10 @@ def main() -> int:
         try:
             with open(service_file) as f:
                 for line in f:
-                    out.item(line.rstrip("\n"))
-        except OSError:
-            pass
+                    raw = line.rstrip("\n")
+                    out.item(raw if args.unmask else sanitize_text(raw))
+        except OSError as e:
+            out.item(f"读取失败: {e}")
 
     return out.done()
 

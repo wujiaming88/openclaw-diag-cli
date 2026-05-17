@@ -21,19 +21,12 @@ from typing import Dict, List, Optional
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# ID → script filename, kept in sync with ocdiag/dispatcher.py:MODULES.
-MODULES: List[tuple] = [
-    ("sys_health",     "diag/01_sys_health.py"),
-    ("environment",    "diag/02_environment.py"),
-    ("configuration",  "diag/03_configuration.py"),
-    ("gateway",        "diag/04_gateway.py"),
-    ("recent_errors",  "diag/05_recent_errors.py"),
-    ("cron_jobs",      "diag/06_cron_jobs.py"),
-    ("performance",    "diag/07_performance.py"),
-    ("sessions",       "diag/08_sessions.py"),
-    ("plugin_diag",    "diag/09_plugin_diag.py"),
-    ("shell_history",  "diag/10_shell_history.py"),
-]
+# Single source of truth: ocdiag.dispatcher. We import it dynamically so the
+# bundle script stays runnable from a fresh checkout (no install needed).
+sys.path.insert(0, str(REPO_ROOT))
+from ocdiag.dispatcher import STATE_COLLECTORS  # noqa: E402
+
+MODULES: List[tuple] = [(mid, rel) for mid, _label, rel in STATE_COLLECTORS]
 MODULE_BY_ID = {mid: rel for mid, rel in MODULES}
 
 # Order matters: each submodule is exec'd into its own module object, and its

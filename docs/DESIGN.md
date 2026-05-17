@@ -10,32 +10,48 @@
 - **`openclaw-diag.sh` 已成 4391 行单体 bash**，里面塞着 10 段 heredoc 嵌入的 Python，难修改、难单测、难复用。
 - **诊断脚本应该是"原子操作"**：每条数据有明确来源，每个模块解决一类问题，可以单独跑、组合管道、被自动化驱动。
 
-## 6 条设计公理
+## 7 条设计公理
 
-不可让步的硬约束。所有目录结构、API、输出格式都从这 6 条推导。
+不可让步的硬约束。所有目录结构、API、输出格式都从这 7 条推导。
 
-### 1. 只读
-诊断脚本永远不修改文件、不写配置、不重启服务。
-**收益**：生产环境、事故现场、客户机器都能放心跑。
+### 1. Observer-only（不是 read-only）
+**不改变被诊断系统的状态**：不写 OpenClaw 配置 / session / cron；不发 POST/PUT/DELETE；不重启服务。
+**允许做的事**：HTTP GET 探测、DNS 查询、TCP connect、调只读 API；写诊断输出到 `-o` / stdout / 用户文件系统。
+**收益**：生产环境、事故现场、客户机器都能放心跑——但仍然能做需要发包的实际诊断（比如端口扫描、API 可达性）。
 
 ### 2. 零运行时依赖
 只用 Python 3.8+ 标准库。不写 `requirements.txt`，不要 `pip install`。
 **唯一例外**：`croniter` 在 `06_cron_jobs.py` 中可选导入（缺失时退化到从历史 runs 推算间隔）。
+**注意**：系统工具（`curl` / `dig` / `free` / `df` / `ss` / `journalctl`）属于「诊断装备」，不算运行时依赖。
 **收益**：任何能跑 OpenClaw 的节点都能跑诊断。
 
-### 3. 独立可执行
-每个诊断脚本能单独跑通，不依赖 dispatcher、不需要先 source env、不需要先执行别的脚本。
+### 3. 仓库内独立（含入口能力等价）
+- 每个诊断脚本能 `python3 diag/X.py` 单独跑通；不依赖 dispatcher、不需要先 source env。
+- `bin/openclaw-diag.js`（Node）和 `bin/ocdiag`（Python）入口必须**能力等价**：任何子命令两边都通，输出一致。
+  - Node 入口是薄壳，所有逻辑在 Python 侧。
+  - 模块清单是 single source of truth：`ocdiag/dispatcher.py`，Node / bundle 通过 `ocdiag list --json` 读取。
 
-### 4. 可组合
-默认人类可读文本，加 `--json` 输出结构化 JSON；`run all --json` 输出 NDJSON（每行一个模块）。进度信息走 stderr，不污染 stdout。
+### 4. 双视角输出（文本 + JSON 必须一致）
+默认人类可读文本，加 `--json` 输出结构化 JSON；`run all --json` 输出 NDJSON（每行一个模块）。
+- **同一字段，文本和 JSON 值必须一致**——不只是「差不多」。
+- stderr 严格分流，不污染 stdout 上的 NDJSON。
+- **崩溃也输出 NDJSON 错误行**：`{module, status:"error", error, traceback}`——dispatcher 在模块崩溃时仍会发一条 NDJSON 行到 stdout，让 NDJSON 永远是 N 行（N = 模块数 - skip 数）。stderr 上还有完整 traceback。
 
-### 5. 数据可靠
-脚本输出的每个数字、每个状态都必须能溯源——见 README 的「数据来源表」。同一字段，文本输出和 JSON 输出值必须一致。
+### 5. 数据溯源（含缺失分类）
+脚本输出的每个数字、每个状态都必须能溯源——见 README 的「数据来源表」。
+- **缺失数据分类报告**，不允许用 `None` / `""` 模糊代替。
+- 推荐结构：`{"found": false, "reason": "config_not_found", "checked": "/path"}` 或在主字段旁加 `<field>_status` 子字段。
 
-### 6. 故障隔离
+### 6. 失败显式
 - 单模块崩溃**不能**带崩 `run all`：dispatcher 在 `runpy.run_path` 外包 try/except。
-- 单数据源缺失（配置不存在、日志没生成）**不能**抛异常，要明确报告"未找到"。
+- 单数据源缺失（配置不存在、日志没生成）**不能**抛异常，要明确报告（公理 #5 的结构化 missing）。
 - 失败要在 stderr 留 traceback，rc 非 0；不静默吞异常。
+- **禁止 silent swallow 无注释**：所有 `except: pass / continue / return` 必须有显式注释说明"这里 swallow 是正常为空 / 该数据可选缺失"，否则改成明确报告。
+
+### 7. 默认脱敏（Default sanitization）
+- 任何可能含 secret 的字段必须过统一 sanitizer (`ocdiag.sensitive.sanitize_text`)，应用到 shell history、plugin 错误样本、systemd 服务文件、session message content。
+- 默认 mask；`--unmask` 显式 opt-in 关掉脱敏（用于安全的离线分析）。
+- Sanitizer 是 best-effort，不是保证：用户仍需对扫描内容承担最终责任。
 
 ## 目录结构（来自公理）
 
@@ -104,12 +120,14 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-注册到 dispatcher：在 `ocdiag/dispatcher.py:MODULES` 加一行。
+注册到 dispatcher：在 `ocdiag/dispatcher.py:STATE_COLLECTORS` 或 `OBJECT_INSPECTORS` 加一行。这是 single source of truth；Node 入口和 `lib/bundle.py` 都从这里读模块清单，不要在三处分别维护。
 
 **强约束**：
 - 流式读 JSONL（`for line in open(...)`），不能 `.read().split('\n')`
 - 子进程调用必须带 `timeout`
-- 数据源缺失明确报告"未找到"，不抛异常
+- 数据源缺失明确报告"未找到"，不抛异常；用 `{found, reason, checked}` 结构（公理 #5）
+- 用户输出含 secret 风险的字段（消息文本、错误样本、服务文件）走 `sanitize_text()`（公理 #7）
+- 单模块崩溃由 dispatcher 兜底；不要 try-except `BaseException` 自己吞掉
 
 ## 不做的事（反模式）
 
@@ -118,10 +136,12 @@ if __name__ == "__main__":
 | 不写测试框架 | 优先靠 ground truth 对齐验证 |
 | 不加 web UI / TUI / Rich | 与公理 #2、#4 冲突 |
 | 不需要 `pip install` | 公理 #2、#3 |
-| 不重启 / 不修改 / 不发请求 | 公理 #1 |
+| 不改变被诊断系统的状态（POST/重启/写配置） | 公理 #1 — 但允许只读探测 |
 | 不强制配置 / 不强制 token | 任何节点 clone 即跑 |
 | 不引入 jq 子进程 | Python 自带 json |
 | 不内嵌 Python 在 bash heredoc | 这是我们要替代的旧形态 |
+| 不在 Node 侧实现业务逻辑 | 公理 #3 — Node 是薄壳，逻辑全在 Python |
+| 不输出未脱敏的 free-form 文本 | 公理 #7 — 默认 sanitize，`--unmask` opt-in |
 
 ## 来历
 

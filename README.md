@@ -1,6 +1,7 @@
 # OpenClaw 诊断工具箱
 
-> 排查 OpenClaw 故障的只读 CLI。一组诊断、一个入口、零依赖。
+> 排查 OpenClaw 故障的 observer-only CLI。一组诊断、一个入口、零依赖。
+> **Observer-only**：不改变被诊断系统的状态；可发只读探测请求、可写诊断输出。
 
 ## 安装
 
@@ -76,12 +77,12 @@ openclaw-diag gateway --json
 openclaw-diag cron_jobs --json | jq '.data.jobs[] | select(.status!="ok")'
 
 # 看哪个模型的 P95 延迟最高
-openclaw-diag performance | grep -A1 "P95"
+openclaw-diag performance --json | jq '.data.models | to_entries | sort_by(-.value.p95_s) | .[0:3]'
 
 # 哪些插件今天有 ERROR
 openclaw-diag plugin_diag --json | jq '.data.plugin_errors | to_entries[] | select(.value.error_count > 0)'
 
-# 把所有诊断聚合成单个 JSON 报告
+# 把所有诊断聚合成单个 JSON 报告（含错误行 — 公理 #4）
 openclaw-diag all --json 2>/dev/null | jq -s '.' > report.json
 
 # 找出有 stuck session 的事件
@@ -90,8 +91,11 @@ openclaw-diag sessions --json | jq '.data.stuck_sessions'
 # 追踪用户消息时间轴
 openclaw-diag trace <session-uuid> --msg-index 0
 
-# 导出 session 为可读格式
+# 导出 session 为可读格式（默认脱敏 — 公理 #7）
 openclaw-diag extract <session-uuid> --summary
+
+# 同上但保留原文（含潜在 secret）
+openclaw-diag extract <session-uuid> --unmask
 ```
 
 ## 离线机器：bundle 出单文件
@@ -128,15 +132,17 @@ ssh prod-server "python3 /tmp/standalone-gateway.py --json"
 | 1 | 诊断运行成功但报告 `status: "error"`（数据源缺失等） |
 | 2 | 诊断崩溃（已隔离，不影响 `all`） |
 
-## 设计原则
+## 设计原则（7 条公理）
 
 | | |
 |---|---|
-| **只读** | 永远不修改文件、不重启服务 |
-| **零依赖** | 仅 Python 3.8+ 标准库 |
-| **故障隔离** | 单诊断崩溃不带崩 `all` |
-| **数据可靠** | 每个字段都能溯源 |
-| **可组合** | 文本 + JSON 双输出，stderr 与 stdout 分流 |
+| **#1 Observer-only** | 不改变被诊断系统状态；允许只读探测（HTTP GET / DNS / TCP connect）和写诊断输出 |
+| **#2 零运行时依赖** | 仅 Python 3.8+ 标准库；系统工具（curl/dig/free/df/ss/journalctl）属于诊断装备，不算依赖 |
+| **#3 仓库内独立** | 每个 diag 能 `python3 diag/X.py` 单独跑；Node 与 Python 入口能力等价 |
+| **#4 双视角输出** | 文本 + JSON 双输出，同字段值必须一致；崩溃也输出 NDJSON 错误行 |
+| **#5 数据溯源** | 每字段能查到来源；缺失数据分类报告（`{found, reason, checked}`），不允许 None/"" 混用 |
+| **#6 失败显式** | 单模块崩溃不带崩 `all`；禁止 silent swallow 无注释 |
+| **#7 默认脱敏** | 任何含 secret 的字段必须过 sanitizer；`--unmask` 显式 opt-in |
 
 详细设计 → [docs/DESIGN.md](docs/DESIGN.md)（公理推导、目录结构、扩展指南）
 

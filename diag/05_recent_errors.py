@@ -79,21 +79,25 @@ def render_log_line(line: str, max_len: int = 300) -> str:
         return line
 
 
-def collect_error_lines(log_files: List[str]) -> List[str]:
+def collect_error_lines(log_files: List[str]):
+    """Returns (matched_lines, unreadable_files). One unreadable file does not
+    abort the whole scan, but we tell the caller which paths failed."""
     out: List[str] = []
+    unreadable: List[dict] = []
     for lf in log_files:
         try:
             with open(lf, errors="replace") as f:
                 for ln in f:
                     if _ERR_RE.search(ln):
                         out.append(ln.rstrip("\n"))
-        except OSError:
-            continue
-    return out
+        except OSError as e:
+            unreadable.append({"path": lf, "error": f"{type(e).__name__}: {e}"})
+    return out, unreadable
 
 
-def collect_api_errors(log_files: List[str]) -> List[str]:
+def collect_api_errors(log_files: List[str]):
     out: List[str] = []
+    unreadable: List[dict] = []
     for lf in log_files:
         try:
             with open(lf, errors="replace") as f:
@@ -107,9 +111,9 @@ def collect_api_errors(log_files: List[str]) -> List[str]:
                     if _API_EXCLUDE_TXT_RE.search(ln):
                         continue
                     out.append(ln.rstrip("\n"))
-        except OSError:
-            continue
-    return out
+        except OSError as e:
+            unreadable.append({"path": lf, "error": f"{type(e).__name__}: {e}"})
+    return out, unreadable
 
 
 def journalctl_errors() -> str:
@@ -152,10 +156,15 @@ def tool_errors_from_session(session_path: str):
                 msg = obj.get("message", {}) or {}
                 if msg.get("isError"):
                     counts[msg.get("toolName", "unknown")] += 1
-            except Exception:
-                pass
+            except (json.JSONDecodeError, ValueError):
+                # Expected: session.jsonl can have malformed lines from
+                # interrupted writes; skip and keep counting.
+                continue
     except OSError:
-        pass
+        # Session file disappeared between glob() and open(). Caller already
+        # falls back to "no recent session"; reporting per-file unreadable
+        # would mostly add noise here.
+        return counts
     return counts
 
 
@@ -187,8 +196,10 @@ def main() -> int:
     out.line("")
 
     if logs:
-        err_lines = collect_error_lines(logs)
+        err_lines, err_unreadable = collect_error_lines(logs)
         out.set_data("app_error_count", len(err_lines))
+        if err_unreadable:
+            out.set_data("app_log_unreadable", err_unreadable)
         if err_lines:
             out.item(f"应用日志 ERROR 级别: {len(err_lines)} 条 — Gateway 运行时报错，包括工具失败、模型异常等")
             rendered = []
@@ -202,7 +213,7 @@ def main() -> int:
         else:
             out.item("应用日志 ERROR 级别: 0 条 — Gateway 运行时报错")
 
-        api_lines = collect_api_errors(logs)
+        api_lines, _api_unreadable = collect_api_errors(logs)
         out.set_data("api_error_count", len(api_lines))
         if api_lines:
             out.item(f"模型 API HTTP 错误: {len(api_lines)} 条 ")

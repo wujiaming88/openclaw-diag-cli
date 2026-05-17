@@ -12,6 +12,7 @@ from typing import List, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ocdiag import cli, output
+from ocdiag.sensitive import sanitize_text
 
 
 DANGEROUS_RE = re.compile(
@@ -34,15 +35,20 @@ def list_history_files() -> List[str]:
     return [c for c in candidates if os.path.isfile(c)]
 
 
-def read_lines(path: str) -> List[Tuple[int, str]]:
+def read_lines(path: str) -> Tuple[List[Tuple[int, str]], str]:
+    """Read history file. Returns (lines, error_str). error_str=='' on success.
+
+    Permission denied / missing files become an explicit error instead of an
+    empty list, so the caller can distinguish "no commands" from "couldn't read".
+    """
     out: List[Tuple[int, str]] = []
     try:
         with open(path, "r", errors="replace") as f:
             for i, line in enumerate(f, 1):
                 out.append((i, line.rstrip("\n")))
-    except OSError:
-        pass
-    return out
+        return out, ""
+    except OSError as e:
+        return out, f"{type(e).__name__}: {e}"
 
 
 def main() -> int:
@@ -54,6 +60,10 @@ def main() -> int:
 
     out = output.init("shell_history", json_mode=args.json, no_color=args.no_color)
     out.section("模块 10：命令执行历史")
+
+    def maybe_sanitize(s: str) -> str:
+        return s if args.unmask else sanitize_text(s)
+
     out.line("  系统 shell 历史记录，用于判断是否有人或脚本执行过高危命令"
              "（rm -rf、kill、systemctl stop 等）。")
     out.line("")
@@ -66,7 +76,16 @@ def main() -> int:
 
     files_data = []
     for hfile in history_files:
-        lines = read_lines(hfile)
+        lines, read_err = read_lines(hfile)
+        if read_err:
+            out.item(f"{os.path.basename(hfile)} — 读取失败 ({read_err})")
+            files_data.append({
+                "path": hfile,
+                "found": False,
+                "reason": "unreadable",
+                "error": read_err,
+            })
+            continue
         total = len(lines)
         out.item(f"{os.path.basename(hfile)} — 共 {total} 条记录")
 
@@ -79,7 +98,7 @@ def main() -> int:
 
         if dangerous:
             out.item(f"  高危命令: {len(dangerous)} 条 ")
-            ev = "\n".join(f"{n}: {ln}" for n, ln in dangerous)
+            ev = "\n".join(f"{n}: {maybe_sanitize(ln)}" for n, ln in dangerous)
             out.evidence(f"{hfile} (高危)", ev)
         else:
             out.item("  高危命令: 0 条")
@@ -92,7 +111,7 @@ def main() -> int:
                 f"  OpenClaw 相关命令: 全文 {oc_total} 条，最近 30 条采样 {len(oc_cmds)} 条 — "
                 "用户手动执行的 openclaw 命令"
             )
-            ev = "\n".join(f"{n}: {ln}" for n, ln in oc_cmds)
+            ev = "\n".join(f"{n}: {maybe_sanitize(ln)}" for n, ln in oc_cmds)
             out.evidence(f"{hfile} (openclaw)", ev)
         else:
             out.item("  OpenClaw 相关命令: 0 条")
@@ -100,14 +119,14 @@ def main() -> int:
         recent = lines[-20:]
         if recent:
             out.item("  最近 20 条命令:")
-            ev = "\n".join(ln for _, ln in recent)
+            ev = "\n".join(maybe_sanitize(ln) for _, ln in recent)
             out.evidence(f"{hfile} (最近)", ev)
 
         files_data.append({
             "path": hfile,
             "total_lines": total,
             "dangerous_count": len(dangerous),
-            "dangerous": [{"line": n, "cmd": ln} for n, ln in dangerous],
+            "dangerous": [{"line": n, "cmd": maybe_sanitize(ln)} for n, ln in dangerous],
             "openclaw_count_total": oc_total,
             "openclaw_count_sample_30": len(oc_cmds),
             "recent_count": len(recent),

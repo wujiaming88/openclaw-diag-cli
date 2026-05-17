@@ -432,11 +432,18 @@ def render(out: output.Output, data, file_count):
     else:
         for i, (sec, val, hint) in enumerate(bottleneck_items):
             out.item(f"#{i+1}: {sec}（P95={val:.1f}s, {hint}）")
+    out.set_data("bottleneck", {
+        "model_p95": round(model_p95, 3),
+        "tool_p95": round(tool_p95, 3),
+        "model_top": model_top,
+        "tool_top": tool_top,
+    })
 
     out.subsection("模型性能")
     out.item(f"数据来源: 最近 {file_count} 个 session 文件")
     out.line("")
     model_stats = data["model_stats"]
+    models_payload = {}
     if not model_stats:
         out.item("最近 Session 中未发现模型使用数据")
     else:
@@ -481,9 +488,29 @@ def render(out: output.Output, data, file_count):
             stops_str = " ".join(f"{k}:{v}" for k, v in sorted(stops.items(), key=lambda x: -x[1]))
             out.item(f"  stopReasons: {stops_str}" if stops_str else "  stopReasons: (none)")
             out.line("")
+            models_payload[model_key] = {
+                "calls": calls,
+                "p50_s": round(p50, 3),
+                "p95_s": round(p95, 3),
+                "max_s": round(mx, 3),
+                "throughput_tok_s": (
+                    None if s["output"] == 0 or total_dur <= 0
+                    else round(s["output"] / total_dur, 1)
+                ),
+                "input_tokens": s["input"],
+                "output_tokens": s["output"],
+                "cache_read_tokens": s["cache_read"],
+                "cache_write_tokens": s["cache_write"],
+                "cost_usd": round(s["cost"], 6),
+                "success_rate_pct": round(success, 1),
+                "stop_reasons": dict(stops),
+            }
+    out.set_data("models", models_payload)
+    out.set_data("session_files_analyzed", file_count)
 
     out.subsection("工具性能（Top 10 by 调用量）")
     timed_tools = {n: s for n, s in data["tool_stats"].items() if s["durations"]}
+    tools_payload = {}
     if not timed_tools:
         out.item("（无工具调用数据）")
     else:
@@ -491,8 +518,11 @@ def render(out: output.Output, data, file_count):
         for name, s in ranked:
             durs = sorted(s["durations"])
             calls = s["calls"]
+            p50 = pct(durs, 0.50)
+            p95 = pct(durs, 0.95)
+            mx = durs[-1]
             err_rate = (s["errors"] / calls * 100) if calls else 0.0
-            dur_str = f"P50={pct(durs,0.50):.3f}s P95={pct(durs,0.95):.3f}s Max={durs[-1]:.3f}s"
+            dur_str = f"P50={p50:.3f}s P95={p95:.3f}s Max={mx:.3f}s"
             out.item(f"{name}: {calls} 次 | {dur_str} | 错误 {err_rate:.0f}%")
             timed = [r for r in s["records"] if r["dur"] is not None]
             timed.sort(key=lambda r: r["dur"], reverse=True)
@@ -511,6 +541,15 @@ def render(out: output.Output, data, file_count):
                 tail = f", {r['err_brief']}" if r["err_brief"] else ""
                 out.item(f"  失败: {args} (error, {dur_txt}{tail})")
                 err_shown += 1
+            tools_payload[name] = {
+                "calls": calls,
+                "errors": s["errors"],
+                "error_rate_pct": round(err_rate, 1),
+                "p50_s": round(p50, 3),
+                "p95_s": round(p95, 3),
+                "max_s": round(mx, 3),
+            }
+    out.set_data("tools", tools_payload)
 
     out.subsection("慢调用 Top 20")
     slow = sorted(data["slow_calls_top"], key=lambda x: x[0], reverse=True)
@@ -529,12 +568,17 @@ def render(out: output.Output, data, file_count):
     else:
         for i, entry in enumerate(top20, 1):
             out.item(f"[{i}] {entry[2]}")
+    out.set_data("slow_calls_top20", [
+        {"duration_s": round(e[0], 3), "kind": e[1], "summary": e[2]}
+        for e in top20
+    ])
 
     out.subsection("异常 stopReason — 模型非正常结束（如 error、中断）")
     abnormal_stops = data["abnormal_stops"]
     out.item(f"共 {len(abnormal_stops)} 条" + ("（无异常）" if not abnormal_stops else ""))
     for s in abnormal_stops[:20]:
         out.item(s)
+    out.set_data("abnormal_stops", abnormal_stops)
 
     out.subsection("模型 API 错误分布")
     api_err_total = sum(data["api_error_stats"].values())
@@ -548,9 +592,16 @@ def render(out: output.Output, data, file_count):
             out.item("分布:")
             for cat, n in sorted(data["api_error_stats"].items(), key=lambda kv: -kv[1]):
                 out.item(f"  {cat}: {n}")
+    out.set_data("api_errors", {
+        "total_calls": api_total,
+        "error_count": api_err_total,
+        "error_rate_pct": round(api_err_total / api_total * 100, 2) if api_total else 0.0,
+        "by_category": dict(data["api_error_stats"]),
+    })
 
     out.subsection("端到端消息延迟（user 发送 → assistant 最终响应）")
     e2e = data["e2e_latencies"]
+    e2e_payload = {"count": 0}
     if not e2e:
         out.item("（数据不足，未发现 user→assistant 配对）")
     else:
@@ -573,10 +624,19 @@ def render(out: output.Output, data, file_count):
             n = bucket_counts[lbl]
             pct_v = (n / total * 100) if total else 0.0
             out.item(f"  {lbl}: {n} ({pct_v:.1f}%)")
+        e2e_payload = {
+            "count": total,
+            "p50_s": round(p50, 3),
+            "p95_s": round(p95, 3),
+            "max_s": round(mx, 3),
+            "buckets": dict(bucket_counts),
+        }
+    out.set_data("e2e_latency", e2e_payload)
 
     out.subsection("延迟 vs 上下文大小")
     ctx_buckets_def = data["ctx_buckets_def"]
     ctx_durs = data["ctx_bucket_durs"]
+    ctx_payload = {}
     if not any(ctx_durs.get(l) for l, _ in ctx_buckets_def):
         out.item("（数据不足）")
     else:
@@ -585,13 +645,21 @@ def render(out: output.Output, data, file_count):
             durs = sorted(ctx_durs.get(b_label, []))
             if not durs:
                 out.line(f"    {b_label:<14} {0:>8} {'-':>10} {'-':>10}")
+                ctx_payload[b_label] = {"count": 0, "p50_s": None, "p95_s": None}
                 continue
             p50 = pct(durs, 0.50)
             p95 = pct(durs, 0.95)
             out.line(f"    {b_label:<14} {len(durs):>8} {p50:>9.1f}s {p95:>9.1f}s")
+            ctx_payload[b_label] = {
+                "count": len(durs),
+                "p50_s": round(p50, 3),
+                "p95_s": round(p95, 3),
+            }
+    out.set_data("ctx_buckets", ctx_payload)
 
     out.subsection("每日趋势（最近 7 天）")
     daily_stats = data["daily_stats"]
+    daily_payload = []
     if not daily_stats:
         out.item("（数据不足）")
     else:
@@ -602,12 +670,22 @@ def render(out: output.Output, data, file_count):
             d = daily_stats.get(d_key)
             if not d or d["calls"] == 0:
                 out.line(f"    {d_key:<10} {0:>8} {'-':>10} {'-':>14}")
+                daily_payload.append({"date": d_key, "calls": 0,
+                                       "p50_s": None, "output_tokens": 0})
                 continue
             durs = sorted(d["durs"])
             p50 = pct(durs, 0.50) if durs else 0.0
             out.line(f"    {d_key:<10} {d['calls']:>8} {p50:>9.1f}s {fmt_tokens(d['output']):>14}")
+            daily_payload.append({
+                "date": d_key,
+                "calls": d["calls"],
+                "p50_s": round(p50, 3),
+                "output_tokens": d["output"],
+            })
+    out.set_data("daily_trend", daily_payload)
 
     out.subsection("Cache 命中率")
+    cache_payload = {"total_calls": data["cache_total_calls"]}
     if data["cache_total_calls"] == 0:
         out.item("（无数据）")
     else:
@@ -622,17 +700,34 @@ def render(out: output.Output, data, file_count):
             f"cache_write: {fmt_tokens(data['cache_sum_cache_write'])}"
         )
         denom = data["cache_sum_input"] + data["cache_sum_cache_read"]
+        ratio_pct = None
         if denom > 0:
             ratio = data["cache_sum_cache_read"] / denom * 100
+            ratio_pct = round(ratio, 3)
             out.item(
                 f"上下文 cache 占比: cacheRead/(input+cacheRead) = "
                 f"{ratio:.3f}% ({fmt_tokens(data['cache_sum_cache_read'])}/{fmt_tokens(denom)})"
             )
+        cache_payload = {
+            "total_calls": data["cache_total_calls"],
+            "calls_with_cache_read": data["cache_calls_with_cache"],
+            "hit_rate_pct": round(hit_pct, 2),
+            "input_tokens": data["cache_sum_input"],
+            "cache_read_tokens": data["cache_sum_cache_read"],
+            "cache_write_tokens": data["cache_sum_cache_write"],
+            "ctx_cache_ratio_pct": ratio_pct,
+        }
+    out.set_data("cache_hit_rate", cache_payload)
 
     out.subsection("工具错误明细")
     tool_stats = data["tool_stats"]
     err_total = sum(s["errors"] for s in tool_stats.values())
     call_total = sum(s["calls"] for s in tool_stats.values())
+    tool_errors_payload = {
+        "total_errors": err_total,
+        "total_calls": call_total,
+        "by_tool": {},
+    }
     if err_total == 0:
         out.item(f"共 0 次错误 (总调用 {call_total} 次中)")
     else:
@@ -642,13 +737,22 @@ def render(out: output.Output, data, file_count):
             if s["errors"] == 0:
                 continue
             out.line(f"    {name} ({s['errors']}次):")
+            samples = []
             for r in s["error_records"][:3]:
                 ts_label = r["ts"].strftime("%Y-%m-%d %H:%M:%S") if r["ts"] else "?"
                 brief = r["err_brief"] or "(无错误内容)"
                 out.line(f"      {ts_label} | {brief[:100]}")
+                samples.append({"ts": ts_label, "brief": brief[:200]})
+            tool_errors_payload["by_tool"][name] = {
+                "errors": s["errors"],
+                "calls": s["calls"],
+                "samples": samples,
+            }
+    out.set_data("tool_errors", tool_errors_payload)
 
     out.subsection("Session 消耗 Top 5")
     session_stats = data["session_stats"]
+    session_top_payload = []
     if not session_stats:
         out.item("（无数据）")
     else:
@@ -657,6 +761,13 @@ def render(out: output.Output, data, file_count):
         for sid, ss in ranked:
             out.line(f"    {sid:<40} {ss['calls']:>8} "
                      f"{fmt_tokens(ss['tokens']):>10} {ss['duration']:>11.0f}s")
+            session_top_payload.append({
+                "session": sid,
+                "calls": ss["calls"],
+                "tokens": ss["tokens"],
+                "duration_s": round(ss["duration"], 1),
+            })
+    out.set_data("session_top5", session_top_payload)
 
 
 def main() -> int:
@@ -675,11 +786,6 @@ def main() -> int:
 
     data = analyze_sessions(session_files)
     render(out, data, len(session_files))
-
-    if args.json:
-        out.set_data("model_count", len(data["model_stats"]))
-        out.set_data("session_files_analyzed", len(session_files))
-        out.set_data("e2e_latency_count", len(data["e2e_latencies"]))
     return out.done()
 
 

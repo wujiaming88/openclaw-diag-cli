@@ -36,4 +36,10 @@ def build_common_parser(description: str, prog: Optional[str] = None) -> argpars
     )
     p.add_argument("--json", action="store_true", help="Emit JSON output")
     p.add_argument("--no-color", action="store_true", help="Disable colored output")
+    p.add_argument(
+        "--unmask",
+        action="store_true",
+        help="Disable default sanitization of secrets in free-form text "
+             "(shell history / plugin errors / systemd / sessions). Off by default.",
+    )
     return p

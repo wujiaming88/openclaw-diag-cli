@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -258,14 +259,18 @@ def main() -> int:
                     if not line or line.startswith("#") or line.startswith("["):
                         continue
                     if line.startswith("Environment="):
-                        pair = line[len("Environment="):]
-                        eq = pair.find("=")
-                        if eq > 0:
-                            key = pair[:eq]
-                            val = pair[eq + 1:].strip('"').strip("'")
+                        raw = line[len("Environment="):].strip()
+                        # systemd 支持单行多键：Environment="A=1" "B=2" 或 Environment=A=1 B=2
+                        try:
+                            tokens = shlex.split(raw, posix=True)
+                        except ValueError:
+                            tokens = [raw]
+                        for tok in tokens:
+                            if "=" not in tok:
+                                out.item(tok)
+                                continue
+                            key, val = tok.split("=", 1)
                             out.item(f"{key} = {safe_val(key, val)}")
-                        else:
-                            out.item(pair)
         except OSError as e:
             out.item(f"读取失败: {e}")
 

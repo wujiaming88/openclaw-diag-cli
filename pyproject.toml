@@ -23,4 +23,9 @@ classifiers = [
 ocdiag = "ocdiag.dispatcher:main"
 
 [tool.setuptools]
-packages = ["ocdiag"]
+packages = ["ocdiag", "diag", "tools"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+diag = ["*.py"]
+tools = ["*.py"]

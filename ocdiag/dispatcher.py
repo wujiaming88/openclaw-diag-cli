@@ -59,6 +59,8 @@ def run_script(script_rel: str, extra_args: List[str]) -> int:
 
 
 def cmd_run(target: str, extra_args: List[str], skip_ids: List[str]) -> int:
+    json_mode = "--json" in extra_args
+    progress_stream = sys.stderr if json_mode else sys.stdout
     if target == "all":
         rc_overall = 0
         total = sum(1 for mid, _, _ in MODULES if mid not in skip_ids)
@@ -67,11 +69,11 @@ def cmd_run(target: str, extra_args: List[str], skip_ids: List[str]) -> int:
             if mid in skip_ids:
                 continue
             n += 1
-            print(f"\n[{n}/{total}] {label} ({mid})...", flush=True)
+            print(f"\n[{n}/{total}] {label} ({mid})...", flush=True, file=progress_stream)
             t0 = time.time()
             rc = run_script(script, extra_args)
             elapsed = time.time() - t0
-            print(f"[{n}/{total}] {label} ({mid}) ... done ({elapsed:.1f}s)", flush=True)
+            print(f"[{n}/{total}] {label} ({mid}) ... done ({elapsed:.1f}s)", flush=True, file=progress_stream)
             if rc != 0:
                 rc_overall = rc
         return rc_overall

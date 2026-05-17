@@ -87,7 +87,7 @@ class Output:
             }
             if self._error_msg:
                 payload["error"] = self._error_msg
-            self.stream.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            self.stream.write(json.dumps(payload, ensure_ascii=False))
             self.stream.write("\n")
         else:
             for ln in self._lines:

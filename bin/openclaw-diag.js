@@ -60,6 +60,8 @@ function printHelp() {
     '  openclaw-diag run all [--skip a,b]     Run all modules (skip optional)',
     '  openclaw-diag run <id> --json          Emit JSON (NDJSON for "all")',
     '  openclaw-diag bundle <id>              Print self-contained single-file .py to stdout',
+    '  openclaw-diag trace <uuid>             Trace one user message timeline in a session',
+    '  openclaw-diag extract <uuid>           Extract session.jsonl into readable form',
     '  openclaw-diag doctor [--json]          Check Node / Python / ocdiag / OpenClaw env',
     '  openclaw-diag --version                Print package version',
     '  openclaw-diag --help                   Print this help',
@@ -90,15 +92,10 @@ function runDispatcher(args) {
   });
 }
 
-function runBundle(args) {
-  if (args.length === 0) {
-    console.error('Error: bundle requires a module id (e.g. `openclaw-diag bundle gateway`)');
-    process.exit(2);
-  }
+function runScript(scriptPath, args) {
   const py = findPython();
   if (!py) pythonNotFound();
-  const bundleScript = path.join(REPO_ROOT, 'lib', 'bundle.py');
-  const child = spawn(py.cmd, [bundleScript, ...args], { stdio: 'inherit' });
+  const child = spawn(py.cmd, [scriptPath, ...args], { stdio: 'inherit' });
   child.on('error', (err) => {
     console.error(`Error: failed to spawn ${py.cmd}: ${err.message}`);
     process.exit(1);
@@ -110,6 +107,14 @@ function runBundle(args) {
     }
     process.exit(code == null ? 1 : code);
   });
+}
+
+function runBundle(args) {
+  if (args.length === 0) {
+    console.error('Error: bundle requires a module id (e.g. `openclaw-diag bundle gateway`)');
+    process.exit(2);
+  }
+  runScript(path.join(REPO_ROOT, 'lib', 'bundle.py'), args);
 }
 
 // ── doctor ──
@@ -269,6 +274,14 @@ function main() {
   }
   if (head === 'bundle') {
     runBundle(argv.slice(1));
+    return;
+  }
+  if (head === 'trace') {
+    runScript(path.join(REPO_ROOT, 'tools', 'oc_session_trace.py'), argv.slice(1));
+    return;
+  }
+  if (head === 'extract') {
+    runScript(path.join(REPO_ROOT, 'tools', 'oc_session_extract.py'), argv.slice(1));
     return;
   }
 

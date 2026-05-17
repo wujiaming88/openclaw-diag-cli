@@ -62,6 +62,14 @@ def run_script(script_rel: str, extra_args: List[str]) -> int:
         sys.argv = saved_argv
 
 
+def cmd_trace(extra_args: List[str]) -> int:
+    return run_script("tools/oc_session_trace.py", extra_args)
+
+
+def cmd_extract(extra_args: List[str]) -> int:
+    return run_script("tools/oc_session_extract.py", extra_args)
+
+
 def cmd_run(target: str, extra_args: List[str], skip_ids: List[str]) -> int:
     json_mode = "--json" in extra_args
     progress_stream = sys.stderr if json_mode else sys.stdout
@@ -98,6 +106,8 @@ def main(argv=None) -> int:
         print("  ocdiag list                      列出所有诊断模块")
         print("  ocdiag run <id>                  运行单个模块（id 或 all）")
         print("  ocdiag run all [--skip ids]      运行全部模块，可跳过若干")
+        print("  ocdiag trace <uuid>              跟踪 session 中一条用户消息的时间轴")
+        print("  ocdiag extract <uuid>            导出 session.jsonl 为可读格式")
         print()
         print("--skip 后接逗号分隔的 module id 列表（如 performance,sessions）。")
         print("其它参数（--config / --log-dir / --json / --no-color）原样传递。")
@@ -107,6 +117,12 @@ def main(argv=None) -> int:
 
     if cmd == "list":
         return cmd_list()
+
+    if cmd == "trace":
+        return cmd_trace(rest)
+
+    if cmd == "extract":
+        return cmd_extract(rest)
 
     if cmd == "run":
         if not rest:

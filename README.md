@@ -53,10 +53,10 @@ openclaw-diag run gateway --json
 
 ```bash
 # 跟踪一条用户消息从进入到响应的完整时间轴
-openclaw-diag tools/oc_session_trace.py <session-uuid> --msg-index 0
+openclaw-diag trace <session-uuid> --msg-index 0
 
 # 导出 session 为可读格式（支持 reset / bak / deleted 全状态）
-openclaw-diag tools/oc_session_extract.py <session-uuid> --summary
+openclaw-diag extract <session-uuid> --summary
 ```
 
 ## 常见配方

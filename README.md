@@ -2,6 +2,27 @@
 
 > OpenClaw / ArkClaw 故障诊断工具集。零依赖、只读、可组合的纯 Python 脚本。
 
+## 快速开始
+
+无需 git clone，通过 npm 拉一份缓存即可（之后离线可用）：
+
+```bash
+# 一次性运行（npm 缓存后离线可用）
+npx openclaw-diag-cli list
+npx openclaw-diag-cli run gateway
+npx openclaw-diag-cli run all --json | jq -s '.'
+
+# 装到 PATH（更短的命令）
+npm install -g openclaw-diag-cli
+openclaw-diag list
+openclaw-diag doctor                       # 检查环境是否就绪
+openclaw-diag bundle gateway > gw.py       # 生成单文件诊断脚本
+```
+
+依赖：Node 18+（npx）和 Python 3.8+。Node 层是零 npm 依赖的薄壳，只负责定位
+`python3` 并把参数透传给现有的 dispatcher，所以 `python3 diag/04_gateway.py`
+和 `python3 bin/ocdiag run gateway` 仍然完全可用。
+
 ## 为什么存在
 
 排查 OpenClaw 故障时面对的真实痛点：
@@ -127,6 +148,16 @@ python3 bin/ocdiag list                # 列出 10 个模块
 python3 bin/ocdiag run gateway         # 跑 04_gateway
 python3 bin/ocdiag run all             # 全部跑一遍（任一模块崩了不影响其他）
 python3 bin/ocdiag run all --skip performance,sessions  # 跳过重模块
+```
+
+### npm / npx 入口（同样支持上述全部参数）
+
+```bash
+npx openclaw-diag-cli list
+npx openclaw-diag-cli run gateway --json
+npx openclaw-diag-cli run all --skip performance,sessions
+npx openclaw-diag-cli doctor                # 检查 Node/Python/ocdiag/OpenClaw
+npx openclaw-diag-cli bundle 04_gateway > standalone-gateway.py
 ```
 
 ### JSON 管道（公理 #4 的真正用法）

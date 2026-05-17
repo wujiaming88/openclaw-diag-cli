@@ -1,0 +1,42 @@
+{
+  "name": "openclaw-diag-cli",
+  "version": "0.1.0",
+  "description": "OpenClaw / ArkClaw read-only diagnostic CLI. Zero-dependency Python scripts wrapped in Node for npx-friendly install.",
+  "keywords": [
+    "openclaw",
+    "arkclaw",
+    "diagnostic",
+    "cli",
+    "ops",
+    "troubleshooting",
+    "ai-agent"
+  ],
+  "homepage": "https://github.com/wujiaming88/openclaw-diag-cli#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wujiaming88/openclaw-diag-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wujiaming88/openclaw-diag-cli/issues"
+  },
+  "license": "MIT",
+  "author": "wujiaming88",
+  "bin": {
+    "openclaw-diag": "./bin/openclaw-diag.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "ocdiag/",
+    "diag/",
+    "tools/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node bin/openclaw-diag.js list && echo OK"
+  }
+}

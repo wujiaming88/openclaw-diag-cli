@@ -1,0 +1,40 @@
+# OpenClaw internal docs (must not ship to npm)
+*-SPEC.md
+*-FIXES*.md
+openclaw-diag-cli-*.md
+
+# Python build/cache artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Verification scratch files
+/tmp/
+ocdiag-verify*.txt
+
+# Git internals
+.git/
+.gitignore
+.gitattributes
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Test / coverage
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Backup files
+*.bak
+*.bak.*

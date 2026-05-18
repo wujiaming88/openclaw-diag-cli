@@ -33,7 +33,7 @@ def human_size(n: int) -> str:
 def _system_prompt_for(path: str, session_id: str) -> Optional[Dict[str, Any]]:
     """Look up the active session's systemPromptReport in sessions.json.
 
-    Returns a compact dict (chars / source / token estimate / project-context
+    Returns a compact dict (chars / source / project-context
     / tools count / skills count) suitable for header + summary + JSON
     rendering. Returns None on any miss — extract must keep working when the
     store is absent or the entry is gone.
@@ -52,7 +52,6 @@ def _system_prompt_for(path: str, session_id: str) -> Optional[Dict[str, Any]]:
     return {
         "source": report.get("source") or "run",
         "chars": chars,
-        "estimated_tokens": max(0, chars // 4),
         "project_context_chars": sp.get("projectContextChars"),
         "non_project_context_chars": sp.get("nonProjectContextChars"),
         "tools_count": len(tools_entries),
@@ -67,9 +66,8 @@ def _system_prompt_for(path: str, session_id: str) -> Optional[Dict[str, Any]]:
 def _format_system_prompt_line(sp: Dict[str, Any]) -> str:
     """One-line summary used by the file header and the --summary block."""
     chars = sp.get("chars") or 0
-    tok = sp.get("estimated_tokens") or 0
     src = sp.get("source") or "?"
-    return f"System prompt: {chars:,} chars (~{tok:,} tok) [{src}]"
+    return f"System prompt: {chars:,} chars [{src}]"
 
 
 def stream_records(path):

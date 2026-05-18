@@ -584,7 +584,6 @@ def build_system_prompt_info(
         return {
             "source": store_report.get("source") or "run",
             "chars": chars,
-            "estimatedTokens": _estimate_tokens(chars),
             "projectContextChars": sp.get("projectContextChars"),
             "nonProjectContextChars": sp.get("nonProjectContextChars"),
             "tools": {
@@ -608,7 +607,6 @@ def build_system_prompt_info(
         return {
             "source": "trajectory",
             "chars": chars,
-            "estimatedTokens": _estimate_tokens(chars),
             "tools": {"count": tsp.get("tools_in_request")},
             "messages_in_request": tsp.get("messages_in_request"),
             "truncatedInTrajectory": bool(tsp.get("truncated_in_trajectory")),
@@ -627,19 +625,25 @@ def render_system_prompt_text(sp: Dict[str, Any], indent: str = "  ") -> List[st
     lines: List[str] = []
     src = sp.get("source") or "?"
     chars = sp.get("chars") or 0
-    tok = sp.get("estimatedTokens") or _estimate_tokens(chars)
+    first_call_tok = sp.get("firstCallInputTokens")
     lines.append(f"{indent}Context size:")
+    # Show chars without token estimate (estimate was inaccurate for CJK)
     lines.append(
-        f"{indent}  System prompt: {_fmt_int(chars)} chars (~{_fmt_int(tok)} tok) [{src}]"
+        f"{indent}  System prompt: {_fmt_int(chars)} chars [{src}]"
     )
+    if sp.get("truncatedInTrajectory"):
+        lines.append(f"{indent}    (approximate, full text not stored in trajectory)")
     pc = sp.get("projectContextChars")
     npc = sp.get("nonProjectContextChars")
     if isinstance(pc, int):
         lines.append(f"{indent}    project-context: {_fmt_int(pc)} chars")
     if isinstance(npc, int):
         lines.append(f"{indent}    non-project:     {_fmt_int(npc)} chars")
-    if sp.get("truncatedInTrajectory"):
-        lines.append(f"{indent}    (approximate, full text not stored in trajectory)")
+    # Show actual first-call input tokens when available
+    if isinstance(first_call_tok, int) and first_call_tok > 0:
+        lines.append(
+            f"{indent}  First call context: {_fmt_int(first_call_tok)} tok (actual)"
+        )
     tools = sp.get("tools") or {}
     if isinstance(tools.get("schemaChars"), int):
         lines.append(
@@ -907,6 +911,17 @@ def main():
     # to whatever the trajectory recorded. Either source can fail silently.
     store_report = sessions.lookup_system_prompt_report(session_file, full_session_id)
     system_prompt = build_system_prompt_info(store_report, traj_info)
+
+    # Enrich with actual first-call token count from session data
+    if system_prompt is not None and analysis.get("model_calls"):
+        first_call = analysis["model_calls"][0]
+        actual_input = (
+            (first_call.get("tokens_in") or 0)
+            + (first_call.get("cache_read") or 0)
+            + (first_call.get("cache_write") or 0)
+        )
+        if actual_input > 0:
+            system_prompt["firstCallInputTokens"] = actual_input
 
     if args.json:
         out_str = format_json(full_session_id, session_file, user_msg_ordinal,

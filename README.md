@@ -105,7 +105,6 @@ openclaw-diag list   # 看完整列表
 |---|---|
 | `openclaw-diag all` | 跑全部 state collectors |
 | `openclaw-diag doctor` | 检查 Node / Python / openclaw-diag / OpenClaw 环境 |
-| `openclaw-diag bundle <id>` | 打成单文件 .py，离线机器零依赖运行 |
 
 ## 配方（jq 管道）
 
@@ -123,18 +122,7 @@ openclaw-diag sessions --json | jq '.data.stuck_sessions'
 openclaw-diag all --json 2>/dev/null > report.ndjson
 ```
 
-## 离线机器与配置覆盖
-
-如果目标机器没法装 npm，先在有网的机器上 `bundle` 出单文件：
-
-```bash
-# 在有网的机器上
-openclaw-diag bundle gateway > standalone-gateway.py
-
-# 拷到目标机器（只需 Python 3.8+，无需安装任何东西）
-scp standalone-gateway.py prod-server:/tmp/
-ssh prod-server "python3 /tmp/standalone-gateway.py --json"
-```
+## 配置覆盖
 
 诊断他人机器或容器时，无需改代码，用环境变量或 flag 覆盖默认路径：
 

@@ -16,9 +16,10 @@ Callers may pass a full UUID or a prefix of at least MIN_PREFIX_LEN chars.
 from __future__ import annotations
 
 import glob
+import json
 import os
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import paths
 
@@ -129,6 +130,43 @@ def resolve(
     prio = {"active": 0, "lock": 1, "deleted": 2, "reset": 3, "backup": 4, "unknown": 9}
     files.sort(key=lambda x: (prio.get(x[1], 9), x[0]))
     return files, []
+
+
+def lookup_system_prompt_report(
+    session_file: str,
+    session_id: str,
+) -> Optional[Dict[str, Any]]:
+    """从 session store (`sessions.json`) 里捞出该 sessionId 的 systemPromptReport。
+
+    OpenClaw 在 ``<session-dir>/sessions.json`` 维护一个以 sessionKey
+    （channel + 用户/subagent id）为主键、value 为 SessionEntry 的 store。
+    其中 ``systemPromptReport`` 字段是最近一次 run 时记录的 system prompt
+    画像（含 chars / projectContextChars / tools / skills /
+    injectedWorkspaceFiles 等），是 trace/extract 展示「system prompt 大小」
+    的首选数据源。
+
+    线性扫一遍 store 找到 ``entry.sessionId == session_id`` 的项，命中则
+    返回其 ``systemPromptReport``（可能为 None）；找不到、文件不存在、
+    JSON 解析失败、IO 异常一律安静返回 None — 调用方不应因为这条诊断
+    增强而 crash。
+    """
+    try:
+        store_path = os.path.join(os.path.dirname(session_file), "sessions.json")
+        if not os.path.isfile(store_path):
+            return None
+        with open(store_path, "r", encoding="utf-8") as f:
+            store = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(store, dict):
+        return None
+    for entry in store.values():
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("sessionId") == session_id:
+            report = entry.get("systemPromptReport")
+            return report if isinstance(report, dict) else None
+    return None
 
 
 def recent_session_ids(

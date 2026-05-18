@@ -29,6 +29,48 @@ def human_size(n: int) -> str:
     return f"{n:.1f} PB"
 
 
+def _system_prompt_for(path: str, session_id: str) -> Optional[Dict[str, Any]]:
+    """Look up the active session's systemPromptReport in sessions.json.
+
+    Returns a compact dict (chars / source / token estimate / project-context
+    / tools count / skills count) suitable for header + summary + JSON
+    rendering. Returns None on any miss — extract must keep working when the
+    store is absent or the entry is gone.
+    """
+    report = sessions.lookup_system_prompt_report(path, session_id)
+    if not report:
+        return None
+    sp = report.get("systemPrompt") or {}
+    chars = sp.get("chars")
+    if not isinstance(chars, int) or chars <= 0:
+        return None
+    tools = report.get("tools") or {}
+    skills = report.get("skills") or {}
+    tools_entries = tools.get("entries") if isinstance(tools.get("entries"), list) else []
+    skills_entries = skills.get("entries") if isinstance(skills.get("entries"), list) else []
+    return {
+        "source": report.get("source") or "run",
+        "chars": chars,
+        "estimated_tokens": max(0, chars // 4),
+        "project_context_chars": sp.get("projectContextChars"),
+        "non_project_context_chars": sp.get("nonProjectContextChars"),
+        "tools_count": len(tools_entries),
+        "tools_schema_chars": tools.get("schemaChars"),
+        "skills_count": len(skills_entries),
+        "skills_prompt_chars": skills.get("promptChars"),
+        "provider": report.get("provider"),
+        "model": report.get("model"),
+    }
+
+
+def _format_system_prompt_line(sp: Dict[str, Any]) -> str:
+    """One-line summary used by the file header and the --summary block."""
+    chars = sp.get("chars") or 0
+    tok = sp.get("estimated_tokens") or 0
+    src = sp.get("source") or "?"
+    return f"System prompt: {chars:,} chars (~{tok:,} tok) [{src}]"
+
+
 def stream_records(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
         for i, line in enumerate(f, start=1):
@@ -42,7 +84,7 @@ def stream_records(path):
                 yield i, None, stripped, str(e)
 
 
-def write_header(out, path, state):
+def write_header(out, path, state, system_prompt=None):
     try:
         size = os.path.getsize(path)
     except OSError:
@@ -51,6 +93,8 @@ def write_header(out, path, state):
     out.write(f"File: {path}\n")
     out.write(f"Size: {human_size(size)}\n")
     out.write(f"State: {state}\n")
+    if state == "active" and system_prompt:
+        out.write(_format_system_prompt_line(system_prompt) + "\n")
     out.write(SEPARATOR + "\n\n")
 
 
@@ -83,8 +127,9 @@ def _sanitize_record(obj):
     return obj
 
 
-def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True):
-    write_header(out, path, state)
+def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True,
+                 system_prompt=None):
+    write_header(out, path, state, system_prompt=system_prompt)
     written = 0
     for line_no, obj, raw, err in stream_records(path):
         if err is not None:
@@ -107,8 +152,8 @@ def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True)
     return written
 
 
-def summarize_file(path, state, out):
-    write_header(out, path, state)
+def summarize_file(path, state, out, system_prompt=None):
+    write_header(out, path, state, system_prompt=system_prompt)
     info = _collect_summary(path, sanitize=False)
     out.write(f"Total records: {info['total_records']}\n")
     if info["parse_errors"]:
@@ -242,7 +287,7 @@ def _resolve_or_die(session_id: str, base_dir: str, agent: Optional[str],
 
 def _emit_json(session_id: str, selected: List[Tuple[str, str]],
                out_fp: TextIO, summary_only: bool, type_filter,
-               sanitize: bool) -> None:
+               sanitize: bool, full_session_id: Optional[str] = None) -> None:
     files_payload: List[Dict[str, Any]] = []
     aggregate_total = 0
     aggregate_by_type: Dict[str, int] = {}
@@ -258,6 +303,11 @@ def _emit_json(session_id: str, selected: List[Tuple[str, str]],
             "state": state,
             "size_bytes": size,
         }
+        if state == "active":
+            sid = full_session_id or session_id
+            sp = _system_prompt_for(path, sid)
+            if sp:
+                entry["system_prompt"] = sp
         if summary_only:
             s = _collect_summary(path, sanitize=sanitize)
             entry["summary"] = s
@@ -333,6 +383,15 @@ def main() -> int:
     if args.types:
         type_filter = {t.strip() for t in args.types.split(",") if t.strip()}
 
+    # Recover the canonical UUID from a resolved file (caller may have passed
+    # a prefix). All resolved files in `selected` share the same session id.
+    full_session_id = args.session_id
+    if selected:
+        first_path = selected[0][0]
+        base = os.path.basename(first_path).split(".jsonl", 1)[0]
+        if base:
+            full_session_id = base
+
     out_path = args.output
     out_fp: TextIO
     close_out = False
@@ -347,14 +406,17 @@ def main() -> int:
             _emit_json(args.session_id, selected, out_fp,
                        summary_only=args.summary,
                        type_filter=type_filter,
-                       sanitize=not args.unmask)
+                       sanitize=not args.unmask,
+                       full_session_id=full_session_id)
         else:
             for path, state in selected:
+                sp = _system_prompt_for(path, full_session_id) if state == "active" else None
                 if args.summary:
-                    summarize_file(path, state, out_fp)
+                    summarize_file(path, state, out_fp, system_prompt=sp)
                 else:
                     extract_file(path, state, out_fp, pretty=not args.no_pretty,
-                                 type_filter=type_filter, sanitize=not args.unmask)
+                                 type_filter=type_filter, sanitize=not args.unmask,
+                                 system_prompt=sp)
     except BrokenPipeError:
         try:
             sys.stdout.flush()

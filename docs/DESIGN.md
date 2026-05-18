@@ -29,7 +29,7 @@
 - 每个诊断脚本能 `python3 diag/X.py` 单独跑通；不依赖 dispatcher、不需要先 source env。
 - `bin/openclaw-diag.js`（Node）和 `bin/ocdiag`（Python）入口必须**能力等价**：任何子命令两边都通，输出一致。
   - Node 入口是薄壳，所有逻辑在 Python 侧。
-  - 模块清单是 single source of truth：`ocdiag/dispatcher.py`，Node / bundle 通过 `ocdiag list --json` 读取。
+  - 模块清单是 single source of truth：`ocdiag/dispatcher.py`，Node 通过 `ocdiag list --json` 读取。
 
 ### 4. 双视角输出（文本 + JSON 必须一致）
 默认人类可读文本，加 `--json` 输出结构化 JSON；`run all --json` 输出 NDJSON（每行一个模块）。
@@ -84,9 +84,6 @@ openclaw-diag-cli/
 │   ├── oc_session_trace.py     单消息时间轴追踪
 │   └── oc_session_extract.py   session 导出（含 reset/bak/deleted 全状态）
 │
-├── lib/
-│   └── bundle.py               bundle 子命令实现
-│
 └── bin/
     ├── ocdiag                  Python dispatcher
     └── openclaw-diag.js        npx 入口（Node 薄壳）
@@ -120,7 +117,7 @@ if __name__ == "__main__":
     sys.exit(main())
 ```
 
-注册到 dispatcher：在 `ocdiag/dispatcher.py:STATE_COLLECTORS` 或 `OBJECT_INSPECTORS` 加一行。这是 single source of truth；Node 入口和 `lib/bundle.py` 都从这里读模块清单，不要在三处分别维护。
+注册到 dispatcher：在 `ocdiag/dispatcher.py:STATE_COLLECTORS` 或 `OBJECT_INSPECTORS` 加一行。这是 single source of truth；Node 入口从这里读模块清单，不要在两处分别维护。
 
 **强约束**：
 - 流式读 JSONL（`for line in open(...)`），不能 `.read().split('\n')`

@@ -396,6 +396,63 @@ def load_trajectory_info(traj_path, base_epoch_ms):
         info["context_compilation_ms"] = ts_map["context.compiled"] - ts_map["session.started"]
     if "context.compiled" in ts_map and "prompt.submitted" in ts_map:
         info["prompt_submission_ms"] = ts_map["prompt.submitted"] - ts_map["context.compiled"]
+
+    # Bracket the run's wall-clock window so callers can decide whether the
+    # session-store systemPromptReport (which only retains the *latest* run)
+    # actually describes this traced run, or a later one.
+    best_run_started = ts_map.get("session.started")
+    if isinstance(best_run_started, int) and best_run_started > 0:
+        info["session_started_ms"] = best_run_started
+        later_starts: List[int] = []
+        for rid, evt_list in runs.items():
+            if rid == best_run:
+                continue
+            for ev in evt_list:
+                if ev.get("type") == "session.started":
+                    ts = iso_to_epoch_ms(ev.get("ts", ""))
+                    if ts > best_run_started:
+                        later_starts.append(ts)
+                    break
+        if later_starts:
+            info["next_run_started_ms"] = min(later_starts)
+
+    # Fallback system prompt size: the trajectory's last context.compiled event
+    # carries either the literal systemPrompt string (small prompts) or a
+    # truncation envelope with originalChars (>32K chars). Size here may be
+    # ~1-2% off vs the runtime store value because it reflects what was logged
+    # to trajectory, not what was actually submitted to the model.
+    sp_chars: Optional[int] = None
+    sp_truncated = False
+    sp_tools_count: Optional[int] = None
+    sp_messages_count: Optional[int] = None
+    for e in evts:
+        if e.get("type") != "context.compiled":
+            continue
+        data = e.get("data") or {}
+        sp = data.get("systemPrompt")
+        if isinstance(sp, str):
+            sp_chars = len(sp)
+            sp_truncated = False
+        elif isinstance(sp, dict) and sp.get("truncated"):
+            try:
+                sp_chars = int(sp.get("originalChars") or 0) or None
+            except (TypeError, ValueError):
+                sp_chars = None
+            sp_truncated = True
+        tools = data.get("tools")
+        if isinstance(tools, list):
+            sp_tools_count = len(tools)
+        msgs = data.get("messages")
+        if isinstance(msgs, list):
+            sp_messages_count = len(msgs)
+    if sp_chars is not None:
+        info["systemPrompt"] = {
+            "chars": sp_chars,
+            "source": "trajectory",
+            "truncated_in_trajectory": sp_truncated,
+            "tools_in_request": sp_tools_count,
+            "messages_in_request": sp_messages_count,
+        }
     return info
 
 
@@ -467,8 +524,155 @@ def _pct(part, total):
     return f"{part / total * 100:.1f}%"
 
 
+def _estimate_tokens(chars: int) -> int:
+    """Rough char-to-token estimator (~4 chars/token). Fine for this UI."""
+    if chars <= 0:
+        return 0
+    return chars // 4
+
+
+def build_system_prompt_info(
+    store_report: Optional[Dict[str, Any]],
+    traj_info: Optional[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Merge sessions.json (preferred) and trajectory (fallback) into one view.
+
+    Store data is more accurate (it's what the runtime computed before any
+    trajectory truncation) and richer (project/non-project breakdown,
+    injected files, skills/tools schema sizes). Trajectory only kicks in when
+    the store has no entry — e.g. an old session that was reset and the store
+    no longer tracks it.
+
+    Caveat: the store keeps only the **most recent** systemPromptReport per
+    session. When the user traces an older message in an active session
+    (--msg-index/--msg-id/--msg-match), the store entry can describe a later
+    run. We use the trajectory's per-run window (session_started_ms ..
+    next_run_started_ms) to detect that mismatch and fall back to the
+    trajectory data for that older run.
+    """
+    use_store = bool(store_report)
+    if store_report and traj_info:
+        gen_at = store_report.get("generatedAt")
+        run_started = traj_info.get("session_started_ms")
+        next_started = traj_info.get("next_run_started_ms")
+        if isinstance(gen_at, int) and isinstance(run_started, int):
+            in_window = gen_at >= run_started
+            if isinstance(next_started, int):
+                in_window = in_window and gen_at < next_started
+            use_store = in_window
+    if use_store and store_report:
+        sp = store_report.get("systemPrompt") or {}
+        chars = sp.get("chars")
+        if not isinstance(chars, int) or chars <= 0:
+            return None
+        tools = store_report.get("tools") or {}
+        skills = store_report.get("skills") or {}
+        injected_raw = store_report.get("injectedWorkspaceFiles") or []
+        injected: List[Dict[str, Any]] = []
+        for f in injected_raw:
+            if not isinstance(f, dict):
+                continue
+            injected.append({
+                "name": f.get("name") or "?",
+                "rawChars": f.get("rawChars"),
+                "injectedChars": f.get("injectedChars"),
+                "truncated": bool(f.get("truncated")),
+            })
+        tools_entries = tools.get("entries") if isinstance(tools.get("entries"), list) else []
+        skills_entries = skills.get("entries") if isinstance(skills.get("entries"), list) else []
+        return {
+            "source": store_report.get("source") or "run",
+            "chars": chars,
+            "estimatedTokens": _estimate_tokens(chars),
+            "projectContextChars": sp.get("projectContextChars"),
+            "nonProjectContextChars": sp.get("nonProjectContextChars"),
+            "tools": {
+                "count": len(tools_entries),
+                "schemaChars": tools.get("schemaChars"),
+            },
+            "skills": {
+                "count": len(skills_entries),
+                "promptChars": skills.get("promptChars"),
+            },
+            "injectedWorkspaceFiles": injected,
+            "truncatedInTrajectory": False,
+            "provider": store_report.get("provider"),
+            "model": store_report.get("model"),
+        }
+    if traj_info and isinstance(traj_info.get("systemPrompt"), dict):
+        tsp = traj_info["systemPrompt"]
+        chars = tsp.get("chars")
+        if not isinstance(chars, int) or chars <= 0:
+            return None
+        return {
+            "source": "trajectory",
+            "chars": chars,
+            "estimatedTokens": _estimate_tokens(chars),
+            "tools": {"count": tsp.get("tools_in_request")},
+            "messages_in_request": tsp.get("messages_in_request"),
+            "truncatedInTrajectory": bool(tsp.get("truncated_in_trajectory")),
+        }
+    return None
+
+
+def _fmt_int(n: Optional[int]) -> str:
+    if not isinstance(n, int):
+        return "?"
+    return f"{n:,}"
+
+
+def render_system_prompt_text(sp: Dict[str, Any], indent: str = "  ") -> List[str]:
+    """Render the 'Context size:' block for the text-mode trace output."""
+    lines: List[str] = []
+    src = sp.get("source") or "?"
+    chars = sp.get("chars") or 0
+    tok = sp.get("estimatedTokens") or _estimate_tokens(chars)
+    lines.append(f"{indent}Context size:")
+    lines.append(
+        f"{indent}  System prompt: {_fmt_int(chars)} chars (~{_fmt_int(tok)} tok) [{src}]"
+    )
+    pc = sp.get("projectContextChars")
+    npc = sp.get("nonProjectContextChars")
+    if isinstance(pc, int):
+        lines.append(f"{indent}    project-context: {_fmt_int(pc)} chars")
+    if isinstance(npc, int):
+        lines.append(f"{indent}    non-project:     {_fmt_int(npc)} chars")
+    if sp.get("truncatedInTrajectory"):
+        lines.append(f"{indent}    (chars from trajectory truncation envelope)")
+    tools = sp.get("tools") or {}
+    if isinstance(tools.get("schemaChars"), int):
+        lines.append(
+            f"{indent}  Tool schemas (JSON): {_fmt_int(tools['schemaChars'])} chars "
+            f"({tools.get('count', '?')} tools)"
+        )
+    elif isinstance(tools.get("count"), int):
+        lines.append(f"{indent}  Tools in request:    {tools['count']}")
+    skills = sp.get("skills") or {}
+    if isinstance(skills.get("promptChars"), int):
+        lines.append(
+            f"{indent}  Skills (text):       {_fmt_int(skills['promptChars'])} chars "
+            f"({skills.get('count', '?')} skills)"
+        )
+    msgs_n = sp.get("messages_in_request")
+    if isinstance(msgs_n, int):
+        lines.append(f"{indent}  Messages in request: {msgs_n}")
+    files = sp.get("injectedWorkspaceFiles") or []
+    if files:
+        lines.append(f"{indent}  Injected workspace files ({len(files)}):")
+        for f in files[:8]:
+            raw = f.get("rawChars")
+            inj = f.get("injectedChars")
+            tag = " (TRUNCATED)" if f.get("truncated") else ""
+            lines.append(
+                f"{indent}    {f.get('name', '?')}: raw {_fmt_int(raw)} → injected {_fmt_int(inj)}{tag}"
+            )
+        if len(files) > 8:
+            lines.append(f"{indent}    ... +{len(files) - 8} more")
+    return lines
+
+
 def format_text(session_id, user_msg_index, user_msg_id, analysis,
-                traj_info=None, gw_info=None):
+                traj_info=None, gw_info=None, system_prompt=None):
     lines: List[str] = []
     lines.append(SEP)
     lines.append(f"Message Trace: session {session_id}")
@@ -581,6 +785,10 @@ def format_text(session_id, user_msg_index, user_msg_id, analysis,
             lines.append(f"    status: {traj_info['status']}")
         lines.append("")
 
+    if system_prompt:
+        lines.extend(render_system_prompt_text(system_prompt))
+        lines.append("")
+
     if gw_info:
         lines.append("  Gateway timing (from log):")
         if "run_to_prompt_ms" in gw_info:
@@ -593,7 +801,7 @@ def format_text(session_id, user_msg_index, user_msg_id, analysis,
 
 
 def format_json(session_id, session_file, user_msg_index, user_msg_id, analysis,
-                traj_info=None, gw_info=None):
+                traj_info=None, gw_info=None, system_prompt=None):
     result = {
         "session_id": session_id, "session_file": session_file,
         "user_message_index": user_msg_index, "user_message_id": user_msg_id,
@@ -605,6 +813,8 @@ def format_json(session_id, session_file, user_msg_index, user_msg_id, analysis,
         result["trajectory"] = traj_info
     if gw_info:
         result["gateway"] = gw_info
+    if system_prompt:
+        result["systemPrompt"] = system_prompt
     return json.dumps(result, indent=2, ensure_ascii=False)
 
 
@@ -690,12 +900,19 @@ def main():
         if log_files:
             gw_info = load_gateway_timing(log_files, full_session_id, analysis["base_epoch_ms"])
 
+    # Prefer the runtime store's systemPromptReport (precise, rich); fall back
+    # to whatever the trajectory recorded. Either source can fail silently.
+    store_report = sessions.lookup_system_prompt_report(session_file, full_session_id)
+    system_prompt = build_system_prompt_info(store_report, traj_info)
+
     if args.json:
         out_str = format_json(full_session_id, session_file, user_msg_ordinal,
-                              user_msg_id, analysis, traj_info, gw_info)
+                              user_msg_id, analysis, traj_info, gw_info,
+                              system_prompt=system_prompt)
     else:
         out_str = format_text(full_session_id, user_msg_ordinal, user_msg_id,
-                              analysis, traj_info, gw_info)
+                              analysis, traj_info, gw_info,
+                              system_prompt=system_prompt)
 
     if args.output:
         with open(args.output, "w") as f:

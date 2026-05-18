@@ -81,7 +81,6 @@ function printHelp(modules) {
     '  openclaw-diag all [--skip a,b]         跑全部 state collectors',
     '  openclaw-diag list                     列出所有诊断',
     '  openclaw-diag doctor                   检查 Node / Python / 环境',
-    '  openclaw-diag bundle <id>              生成单文件 .py（离线机器用）',
     '  openclaw-diag --version                打印版本号',
     '  openclaw-diag --help                   本帮助',
     '',
@@ -98,27 +97,6 @@ function printHelp(modules) {
 
 function spawnDispatcher(pyCmd, args) {
   const child = spawn(pyCmd, [DISPATCHER, ...args], { stdio: 'inherit' });
-  child.on('error', (err) => {
-    console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
-    process.exit(1);
-  });
-  child.on('exit', (code, signal) => {
-    if (signal) {
-      process.kill(process.pid, signal);
-      return;
-    }
-    process.exit(code == null ? 1 : code);
-  });
-}
-
-function runBundle(pyCmd, args) {
-  if (args.length === 0) {
-    console.error('Error: bundle requires a module id (e.g. `openclaw-diag bundle gateway`)');
-    process.exit(2);
-  }
-  const child = spawn(pyCmd, [path.join(REPO_ROOT, 'lib', 'bundle.py'), ...args], {
-    stdio: 'inherit',
-  });
   child.on('error', (err) => {
     console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
     process.exit(1);
@@ -173,10 +151,6 @@ function main() {
 
   if (head === 'doctor') {
     runDoctor(py.cmd, argv.slice(1));
-    return;
-  }
-  if (head === 'bundle') {
-    runBundle(py.cmd, argv.slice(1));
     return;
   }
 

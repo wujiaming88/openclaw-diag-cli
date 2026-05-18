@@ -5,7 +5,6 @@ Layout:
   ocdiag <object-inspector> ARG runs that inspector  (e.g. `ocdiag trace UUID`)
   ocdiag all [--skip a,b]       runs every state collector
   ocdiag list                   prints the catalogue grouped by parameter mode
-  ocdiag bundle <id>            emits a self-contained single-file .py
   ocdiag doctor                 environment health check
 """
 
@@ -51,7 +50,7 @@ MODULE_IDS = set(MODULE_BY_ID.keys())
 
 def cmd_list_json() -> int:
     """Machine-readable module catalogue. Single source of truth consumed
-    by the Node shell and the bundle script (axiom #3)."""
+    by the Node shell (axiom #3)."""
     payload = {
         "state_collectors": [
             {"id": mid, "label": label, "script": rel}
@@ -80,7 +79,6 @@ def cmd_list() -> int:
     print("  其它命令：")
     print("    all              一次跑完所有扫描类")
     print("    doctor           检查 Node / Python / openclaw-diag / OpenClaw 环境")
-    print("    bundle <id>      生成 self-contained 单文件 .py（离线机器用）")
     return 0
 
 
@@ -167,26 +165,6 @@ def cmd_all(extra_args: List[str], skip_ids: List[str]) -> int:
     return rc_overall
 
 
-def cmd_bundle(rest: List[str]) -> int:
-    """Generate a self-contained single-file diag script.
-
-    Lives here (rather than in lib/bundle.py only) so the Python entry has
-    parity with Node — `python3 bin/ocdiag bundle gateway` works the same as
-    `node bin/openclaw-diag.js bundle gateway`. (Axiom #3)
-    """
-    if not rest or rest[0] in ("-h", "--help"):
-        print("Usage: openclaw-diag bundle <id>", file=sys.stderr)
-        print("       Emits the bundle to stdout. Use shell redirection to save.", file=sys.stderr)
-        print(file=sys.stderr)
-        print("Available ids:", file=sys.stderr)
-        for mid, _label, _ in STATE_COLLECTORS:
-            print(f"  {mid}", file=sys.stderr)
-        return 0 if rest else 2
-    sys.path.insert(0, str(REPO_ROOT / "lib"))
-    import bundle  # type: ignore
-    return bundle.main(rest)
-
-
 def _split_skip(rest: List[str]) -> Tuple[List[str], List[str]]:
     """Pull out --skip a,b out of an argv tail; return (skip_ids, passthrough)."""
     skip_ids: List[str] = []
@@ -206,7 +184,7 @@ def _split_skip(rest: List[str]) -> Tuple[List[str], List[str]]:
 def _suggest_command(unknown: str) -> Optional[str]:
     """Best-effort typo suggestion for a misspelled command."""
     import difflib
-    candidates = list(MODULE_BY_ID.keys()) + ["all", "list", "doctor", "bundle"]
+    candidates = list(MODULE_BY_ID.keys()) + ["all", "list", "doctor"]
     matches = difflib.get_close_matches(unknown, candidates, n=1, cutoff=0.6)
     return matches[0] if matches else None
 
@@ -219,7 +197,6 @@ def print_help() -> None:
     print("  openclaw-diag all [--skip a,b]    跑全部 state collectors")
     print("  openclaw-diag list                列出所有诊断")
     print("  openclaw-diag doctor              检查环境")
-    print("  openclaw-diag bundle <id>         生成单文件 .py")
     print()
     print("扫描类（无需参数）：")
     print("  " + "  ".join(mid for mid, _, _ in STATE_COLLECTORS))
@@ -256,9 +233,6 @@ def main(argv=None) -> int:
     if head == "all":
         skip_ids, passthrough = _split_skip(rest)
         return cmd_all(passthrough, skip_ids)
-
-    if head == "bundle":
-        return cmd_bundle(rest)
 
     if head in MODULE_BY_ID:
         _, script = MODULE_BY_ID[head]

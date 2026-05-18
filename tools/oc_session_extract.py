@@ -7,13 +7,14 @@ import argparse
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import paths, sessions
+from ocdiag import output, paths, sessions
 from ocdiag.sensitive import sanitize_text
 
 
@@ -362,7 +363,9 @@ def main() -> int:
     p.add_argument("--unmask", action="store_true",
                    help="Disable default sanitization of secret-shaped substrings "
                         "in message content (off = scrubbed)")
+    p.add_argument("--no-color", action="store_true", help="Disable colored output")
     args = p.parse_args()
+    t0 = time.time()
 
     # --list and --all see lock files; default mode hides them so non-interactive
     # callers (cron, jq pipes) don't trip on a transient .jsonl.lock sibling.
@@ -401,6 +404,15 @@ def main() -> int:
     else:
         out_fp = sys.stdout
 
+    emit_chrome = not args.json and not args.list
+    if emit_chrome:
+        title = f"Session Extract · {full_session_id[:8]}"
+        if args.summary:
+            title += " · summary"
+        out_fp.write(output.render_banner(
+            "extract", title, no_color=args.no_color, stream=out_fp,
+        ) + "\n\n")
+
     try:
         if args.json:
             _emit_json(args.session_id, selected, out_fp,
@@ -417,6 +429,11 @@ def main() -> int:
                     extract_file(path, state, out_fp, pretty=not args.no_pretty,
                                  type_filter=type_filter, sanitize=not args.unmask,
                                  system_prompt=sp)
+        if emit_chrome:
+            elapsed_ms = int((time.time() - t0) * 1000)
+            out_fp.write("\n" + output.render_footer(
+                elapsed_ms, no_color=args.no_color, stream=out_fp,
+            ) + "\n")
     except BrokenPipeError:
         try:
             sys.stdout.flush()

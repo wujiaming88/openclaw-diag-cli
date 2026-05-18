@@ -15,13 +15,14 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import paths, sessions
+from ocdiag import output, paths, sessions
 
 
 DEFAULT_BASE_DIR = paths.SESSIONS_BASE
@@ -835,7 +836,9 @@ def main():
     parser.add_argument("--no-trajectory", action="store_true", help="Skip trajectory enrichment")
     parser.add_argument("--no-log", action="store_true", help="Skip gateway log enrichment")
     parser.add_argument("--json", action="store_true", help="Output as structured JSON")
+    parser.add_argument("--no-color", action="store_true", help="Disable colored output")
     args = parser.parse_args()
+    t0 = time.time()
 
     ok, msg = sessions.is_valid_query(args.session_id)
     if not ok:
@@ -913,6 +916,17 @@ def main():
         out_str = format_text(full_session_id, user_msg_ordinal, user_msg_id,
                               analysis, traj_info, gw_info,
                               system_prompt=system_prompt)
+
+    if not args.json:
+        # When writing to a file, force no-color so the file does not contain
+        # ANSI escape sequences. Otherwise honor the --no-color flag and let
+        # render_*() decide based on stdout.isatty().
+        no_color = args.no_color or bool(args.output)
+        title = f"Message Trace · session {full_session_id[:8]}"
+        banner = output.render_banner("trace", title, no_color=no_color)
+        elapsed_ms = int((time.time() - t0) * 1000)
+        footer = output.render_footer(elapsed_ms, no_color=no_color)
+        out_str = f"{banner}\n\n{out_str}\n{footer}"
 
     if args.output:
         with open(args.output, "w") as f:

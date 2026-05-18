@@ -29,19 +29,3 @@ SERVICE_ENV_FILE = _env_path(
     "OPENCLAW_SERVICE_ENV_FILE",
     os.path.join(HOME, ".config", "systemd", "user", "openclaw-gateway.service.d", "env.conf"),
 )
-
-
-def home() -> str:
-    return HOME
-
-
-def config_path() -> str:
-    return CONFIG
-
-
-def log_dir() -> str:
-    return LOG_DIR
-
-
-def sessions_base() -> str:
-    return SESSIONS_BASE

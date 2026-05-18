@@ -4,16 +4,16 @@
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional, TextIO, Tuple
+from typing import Any, Dict, List, Optional, TextIO, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import paths
+from ocdiag import paths, sessions
 from ocdiag.sensitive import sanitize_text
 
 
@@ -27,61 +27,6 @@ def human_size(n: int) -> str:
             return f"{n:.1f} {unit}" if unit != "B" else f"{n} {unit}"
         n /= 1024
     return f"{n:.1f} PB"
-
-
-def classify_state(filename: str) -> str:
-    if filename.endswith(".jsonl"):
-        return "active"
-    if ".jsonl.deleted." in filename:
-        return "deleted"
-    if ".jsonl.reset." in filename:
-        return "reset"
-    if ".jsonl.bak-" in filename:
-        return "backup"
-    return "unknown"
-
-
-def _recent_session_ids(base_dir, limit=5):
-    """Return the most-recently-modified active session UUIDs."""
-    found: List[Tuple[float, str]] = []
-    for ad in glob.glob(os.path.join(base_dir, "*")):
-        sd = os.path.join(ad, "sessions")
-        if not os.path.isdir(sd):
-            continue
-        for entry in os.listdir(sd):
-            if not entry.endswith(".jsonl"):
-                continue
-            if ".trajectory" in entry or ".jsonl.reset." in entry:
-                continue
-            path = os.path.join(sd, entry)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            sid = entry[:-len(".jsonl")]
-            found.append((mtime, sid))
-    found.sort(reverse=True)
-    return [sid for _, sid in found[:limit]]
-
-
-def find_session_files(session_id, base_dir=DEFAULT_BASE_DIR, agent=None):
-    if agent:
-        agent_dirs = [os.path.join(base_dir, agent)]
-    else:
-        agent_dirs = sorted(glob.glob(os.path.join(base_dir, "*")))
-    found = []
-    for agent_dir in agent_dirs:
-        sessions_dir = os.path.join(agent_dir, "sessions")
-        if not os.path.isdir(sessions_dir):
-            continue
-        pattern = os.path.join(sessions_dir, f"{session_id}.jsonl*")
-        for path in sorted(glob.glob(pattern)):
-            name = os.path.basename(path)
-            if ".trajectory" in name:
-                continue
-            state = classify_state(name)
-            found.append((path, state))
-    return found
 
 
 def stream_records(path):
@@ -131,7 +76,6 @@ def _sanitize_record(obj):
                         v = part.get(k)
                         if isinstance(v, str):
                             part[k] = sanitize_text(v)
-        # Also scrub any top-level text-ish fields the gateway may have set.
         for k in ("text", "summary"):
             v = msg.get(k)
             if isinstance(v, str):
@@ -157,8 +101,6 @@ def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True)
         if pretty:
             out.write(json.dumps(obj, indent=2, ensure_ascii=False))
         else:
-            # Non-pretty mode: emit the (possibly sanitized) JSON or fall back
-            # to the original raw line if we didn't touch it.
             out.write(json.dumps(obj, ensure_ascii=False) if sanitize else raw)
         out.write("\n\n")
         written += 1
@@ -167,7 +109,23 @@ def extract_file(path, state, out, pretty=True, type_filter=None, sanitize=True)
 
 def summarize_file(path, state, out):
     write_header(out, path, state)
-    counts: dict = {}
+    info = _collect_summary(path, sanitize=False)
+    out.write(f"Total records: {info['total_records']}\n")
+    if info["parse_errors"]:
+        out.write(f"Parse errors: {info['parse_errors']}\n")
+    out.write("By type:\n")
+    by_type = info["by_type"]
+    for k in sorted(by_type, key=lambda k: -by_type[k]):
+        out.write(f"  {k}: {by_type[k]}\n")
+    tr = info["time_range"]
+    if tr["start"] or tr["end"]:
+        out.write(f"Time range: {tr['start'] or '?'}  →  {tr['end'] or '?'}\n")
+    out.write("\n")
+
+
+def _collect_summary(path: str, sanitize: bool = True) -> Dict[str, Any]:
+    """Walk one file and produce a summary block (used by text + JSON mode)."""
+    by_type: Dict[str, int] = {}
     total = 0
     earliest: Optional[str] = None
     latest: Optional[str] = None
@@ -178,25 +136,40 @@ def summarize_file(path, state, out):
             parse_errors += 1
             continue
         if not isinstance(obj, dict):
-            counts["<non-object>"] = counts.get("<non-object>", 0) + 1
+            by_type["<non-object>"] = by_type.get("<non-object>", 0) + 1
             continue
         rtype = obj.get("type", "<no-type>")
-        counts[rtype] = counts.get(rtype, 0) + 1
+        by_type[rtype] = by_type.get(rtype, 0) + 1
         ts = obj.get("timestamp")
         if isinstance(ts, str):
             if earliest is None or ts < earliest:
                 earliest = ts
             if latest is None or ts > latest:
                 latest = ts
-    out.write(f"Total records: {total}\n")
-    if parse_errors:
-        out.write(f"Parse errors: {parse_errors}\n")
-    out.write("By type:\n")
-    for k in sorted(counts, key=lambda k: -counts[k]):
-        out.write(f"  {k}: {counts[k]}\n")
-    if earliest or latest:
-        out.write(f"Time range: {earliest or '?'}  →  {latest or '?'}\n")
-    out.write("\n")
+    return {
+        "total_records": total,
+        "parse_errors": parse_errors,
+        "by_type": by_type,
+        "time_range": {"start": earliest, "end": latest},
+    }
+
+
+def _collect_records(path: str, type_filter, sanitize: bool) -> List[Dict]:
+    out: List[Dict] = []
+    for line_no, obj, raw, err in stream_records(path):
+        if err is not None:
+            out.append({"line": line_no, "parse_error": err, "raw": raw})
+            continue
+        if not isinstance(obj, dict):
+            out.append({"line": line_no, "value": obj})
+            continue
+        rtype = obj.get("type", "?")
+        if type_filter is not None and rtype not in type_filter:
+            continue
+        if sanitize:
+            obj = _sanitize_record(obj)
+        out.append(obj)
+    return out
 
 
 def list_files(files, out):
@@ -234,42 +207,118 @@ def select_files(files, extract_all, _out):
     return []
 
 
+def _resolve_or_die(session_id: str, base_dir: str, agent: Optional[str],
+                    include_transient: bool) -> List[Tuple[str, str]]:
+    ok, msg = sessions.is_valid_query(session_id)
+    if not ok:
+        sys.stderr.write(f"Error: {msg}\n")
+        sys.exit(2)
+    files, candidates = sessions.resolve(
+        session_id, base_dir=base_dir, agent=agent,
+        include_transient=include_transient,
+    )
+    if candidates:
+        sys.stderr.write(
+            f"Error: 前缀 '{session_id}' 匹配多个 session（请补长前缀）：\n"
+        )
+        for sid in candidates:
+            sys.stderr.write(f"    {sid}\n")
+        sys.exit(1)
+    if not files:
+        sys.stderr.write(
+            f"Error: 找不到 session '{session_id}'（在 {base_dir} 下）"
+            + (f" agent={agent}" if agent else "")
+            + "\n"
+        )
+        suggestions = sessions.recent_session_ids(base_dir, limit=5)
+        if suggestions:
+            sys.stderr.write("  最近的 5 个 session：\n")
+            for sid in suggestions:
+                sys.stderr.write(f"    {sid}\n")
+            sys.stderr.write("  提示：完整 UUID 或前缀（至少 8 位）都可。\n")
+        sys.exit(1)
+    return files
+
+
+def _emit_json(session_id: str, selected: List[Tuple[str, str]],
+               out_fp: TextIO, summary_only: bool, type_filter,
+               sanitize: bool) -> None:
+    files_payload: List[Dict[str, Any]] = []
+    aggregate_total = 0
+    aggregate_by_type: Dict[str, int] = {}
+    aggregate_start: Optional[str] = None
+    aggregate_end: Optional[str] = None
+    for path, state in selected:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        entry: Dict[str, Any] = {
+            "path": path,
+            "state": state,
+            "size_bytes": size,
+        }
+        if summary_only:
+            s = _collect_summary(path, sanitize=sanitize)
+            entry["summary"] = s
+            aggregate_total += s["total_records"]
+            for k, v in s["by_type"].items():
+                aggregate_by_type[k] = aggregate_by_type.get(k, 0) + v
+            tr = s["time_range"]
+            if tr["start"] and (aggregate_start is None or tr["start"] < aggregate_start):
+                aggregate_start = tr["start"]
+            if tr["end"] and (aggregate_end is None or tr["end"] > aggregate_end):
+                aggregate_end = tr["end"]
+        else:
+            entry["records"] = _collect_records(path, type_filter, sanitize=sanitize)
+        files_payload.append(entry)
+
+    payload: Dict[str, Any] = {
+        "session_id": session_id,
+        "files": files_payload,
+        "generated_at": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "sanitized": sanitize,
+    }
+    if summary_only:
+        payload["summary"] = {
+            "total_records": aggregate_total,
+            "by_type": aggregate_by_type,
+            "time_range": {"start": aggregate_start, "end": aggregate_end},
+        }
+    out_fp.write(json.dumps(payload, ensure_ascii=False, indent=2))
+    out_fp.write("\n")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(
         prog=os.environ.get("OPENCLAW_DIAG_PROG") or None,
         description="Extract OpenClaw session JSONL files into human-readable format.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("session_id", help="Session UUID to extract")
+    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
     p.add_argument("-o", "--output", help="Write output to FILE instead of stdout")
     p.add_argument("-a", "--all", action="store_true",
-                   help="Extract all versions found (active + deleted + reset + backup)")
-    p.add_argument("--list", action="store_true", help="List found files; do not extract")
+                   help="Extract all versions (active + reset + deleted + backup + lock)")
+    p.add_argument("--list", action="store_true",
+                   help="List all matching files (incl. .lock); do not extract")
     p.add_argument("--agent", help="Limit search to specific agent directory")
     p.add_argument("--base-dir", default=DEFAULT_BASE_DIR, help="Override base directory")
     p.add_argument("--no-pretty", action="store_true", help="Output raw JSON lines")
     p.add_argument("--types", help="Filter by record type (comma-separated, e.g. 'message,toolCall')")
     p.add_argument("--summary", action="store_true",
                    help="Show record-count summary instead of full extraction")
+    p.add_argument("--json", action="store_true",
+                   help="Emit structured JSON (compatible with state collectors' --json)")
     p.add_argument("--unmask", action="store_true",
                    help="Disable default sanitization of secret-shaped substrings "
                         "in message content (off = scrubbed)")
     args = p.parse_args()
 
-    files = find_session_files(args.session_id, args.base_dir, args.agent)
-    if not files:
-        sys.stderr.write(
-            f"Error: 找不到 session '{args.session_id}'（在 {args.base_dir} 下）"
-            + (f" agent={args.agent}" if args.agent else "")
-            + "\n"
-        )
-        suggestions = _recent_session_ids(args.base_dir, limit=5)
-        if suggestions:
-            sys.stderr.write("  最近的 5 个 session：\n")
-            for sid in suggestions:
-                sys.stderr.write(f"    {sid}\n")
-            sys.stderr.write("  提示：完整 UUID 或前缀（至少 8 位）都可。\n")
-        return 1
+    # --list and --all see lock files; default mode hides them so non-interactive
+    # callers (cron, jq pipes) don't trip on a transient .jsonl.lock sibling.
+    include_transient = bool(args.all or args.list)
+    files = _resolve_or_die(args.session_id, args.base_dir, args.agent,
+                            include_transient=include_transient)
 
     if args.list:
         list_files(files, sys.stdout)
@@ -294,12 +343,18 @@ def main() -> int:
         out_fp = sys.stdout
 
     try:
-        for path, state in selected:
-            if args.summary:
-                summarize_file(path, state, out_fp)
-            else:
-                extract_file(path, state, out_fp, pretty=not args.no_pretty,
-                             type_filter=type_filter, sanitize=not args.unmask)
+        if args.json:
+            _emit_json(args.session_id, selected, out_fp,
+                       summary_only=args.summary,
+                       type_filter=type_filter,
+                       sanitize=not args.unmask)
+        else:
+            for path, state in selected:
+                if args.summary:
+                    summarize_file(path, state, out_fp)
+                else:
+                    extract_file(path, state, out_fp, pretty=not args.no_pretty,
+                                 type_filter=type_filter, sanitize=not args.unmask)
     except BrokenPipeError:
         try:
             sys.stdout.flush()

@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import paths
+from ocdiag import paths, sessions
 
 
 DEFAULT_BASE_DIR = paths.SESSIONS_BASE
@@ -67,64 +67,25 @@ def extract_text(content: Any) -> str:
     return str(content)
 
 
-def find_session_file(
+def resolve_session_file(
     session_id: str,
     base_dir: str = DEFAULT_BASE_DIR,
     agent: Optional[str] = None,
-) -> Optional[str]:
-    if agent:
-        agent_dirs = [os.path.join(base_dir, agent)]
-    else:
-        agent_dirs = sorted(glob.glob(os.path.join(base_dir, "*")))
+) -> Tuple[Optional[str], List[str]]:
+    """Resolve UUID-or-prefix to a single session file path.
 
-    candidates: List[Tuple[str, str]] = []
-    for ad in agent_dirs:
-        sd = os.path.join(ad, "sessions")
-        if not os.path.isdir(sd):
-            continue
-        for entry in os.listdir(sd):
-            if not entry.startswith(session_id):
-                continue
-            if ".trajectory" in entry or entry.endswith(".json"):
-                continue
-            full = os.path.join(sd, entry)
-            if not os.path.isfile(full):
-                continue
-            if entry == f"{session_id}.jsonl":
-                candidates.append((full, "active"))
-            elif ".jsonl.deleted." in entry:
-                candidates.append((full, "deleted"))
-            elif ".jsonl.reset." in entry:
-                candidates.append((full, "reset"))
-            elif ".jsonl.bak-" in entry:
-                candidates.append((full, "backup"))
-
-    prio = {"active": 0, "deleted": 1, "reset": 2, "backup": 3}
-    candidates.sort(key=lambda x: prio.get(x[1], 9))
-    return candidates[0][0] if candidates else None
-
-
-def _recent_session_ids(base_dir: str, limit: int = 5) -> List[str]:
-    """Return the most-recently-modified active session UUIDs (no .reset/.bak/.deleted)."""
-    found: List[Tuple[float, str]] = []
-    for ad in glob.glob(os.path.join(base_dir, "*")):
-        sd = os.path.join(ad, "sessions")
-        if not os.path.isdir(sd):
-            continue
-        for entry in os.listdir(sd):
-            if not entry.endswith(".jsonl"):
-                continue
-            if ".trajectory" in entry or ".jsonl.reset." in entry:
-                continue
-            path = os.path.join(sd, entry)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            sid = entry[:-len(".jsonl")]
-            found.append((mtime, sid))
-    found.sort(reverse=True)
-    return [sid for _, sid in found[:limit]]
+    Returns ``(path, candidates)``. ``path`` is None on miss or ambiguity;
+    ``candidates`` is non-empty only when the prefix matched multiple
+    distinct session UUIDs.
+    """
+    files, candidates = sessions.resolve(
+        session_id, base_dir=base_dir, agent=agent, include_transient=False,
+    )
+    if candidates:
+        return None, candidates
+    if not files:
+        return None, []
+    return files[0][0], []
 
 
 def find_trajectory_file(session_file: str) -> Optional[str]:
@@ -666,17 +627,36 @@ def main():
     parser.add_argument("--json", action="store_true", help="Output as structured JSON")
     args = parser.parse_args()
 
-    session_file = find_session_file(args.session_id, args.base_dir, args.agent)
+    ok, msg = sessions.is_valid_query(args.session_id)
+    if not ok:
+        print(f"Error: {msg}", file=sys.stderr)
+        sys.exit(2)
+    session_file, candidates = resolve_session_file(
+        args.session_id, args.base_dir, args.agent,
+    )
+    if candidates:
+        print(
+            f"Error: 前缀 '{args.session_id}' 匹配多个 session（请补长前缀）：",
+            file=sys.stderr,
+        )
+        for sid in candidates:
+            print(f"    {sid}", file=sys.stderr)
+        sys.exit(1)
     if not session_file:
         print(f"Error: 找不到 session '{args.session_id}'（在 {args.base_dir} 下）",
               file=sys.stderr)
-        suggestions = _recent_session_ids(args.base_dir, limit=5)
+        suggestions = sessions.recent_session_ids(args.base_dir, limit=5)
         if suggestions:
             print(f"  最近的 5 个 session：", file=sys.stderr)
             for sid in suggestions:
                 print(f"    {sid}", file=sys.stderr)
             print(f"  提示：UUID 完整 36 位，前缀也可（至少 8 位）。", file=sys.stderr)
         sys.exit(1)
+
+    # If the user passed a prefix, recover the full UUID from the resolved
+    # filename so log lookups and JSON output use the canonical id.
+    resolved_basename = os.path.basename(session_file)
+    full_session_id = resolved_basename.split(".jsonl", 1)[0]
 
     records = load_records(session_file)
     if not records:
@@ -708,13 +688,13 @@ def main():
     if not args.no_log:
         log_files = find_gateway_logs(args.log_dir)
         if log_files:
-            gw_info = load_gateway_timing(log_files, args.session_id, analysis["base_epoch_ms"])
+            gw_info = load_gateway_timing(log_files, full_session_id, analysis["base_epoch_ms"])
 
     if args.json:
-        out_str = format_json(args.session_id, session_file, user_msg_ordinal,
+        out_str = format_json(full_session_id, session_file, user_msg_ordinal,
                               user_msg_id, analysis, traj_info, gw_info)
     else:
-        out_str = format_text(args.session_id, user_msg_ordinal, user_msg_id,
+        out_str = format_text(full_session_id, user_msg_ordinal, user_msg_id,
                               analysis, traj_info, gw_info)
 
     if args.output:

@@ -6,7 +6,7 @@ OpenClaw 出问题时，**先跑这条命令再开 ticket**：
 npx openclaw-diag-cli all
 ```
 
-零安装、零依赖、observer-only — 只读探测，绝不改你的状态。
+零安装、零依赖、observer-only — 不改 OpenClaw 的配置 / session / cron / 服务状态；只读探测，可写诊断输出（落到工具自己的目录）。
 
 ## 这是什么
 
@@ -60,17 +60,16 @@ openclaw-diag trace <session-uuid>
 ```
 ── 模块 4：Gateway 状态 ──
 
-  • 进程 / 端口
-    PID 12847 (uptime 3d 2h)，监听 :8080，HTTP /healthz → 200
-  • 24h 重启
-    无重启事件
-  • Model API
-    amazon-bedrock 可达（DNS+HTTP+认证均通）
-  • WS 生命周期
-    最近 1h 内 134 次连接，平均存活 47s，无异常关闭
+  • Systemd: Active: active (running) since Sun 2026-05-17 20:45:02 CST; 11h ago
+  • Main PID: 142687 (node)
+  • 端口 18789 监听: 是 | HTTP 健康检查: 200
+  • 24h 启停事件: 0 次启动 — 近 24h 无重启/停止记录
+  • 模型 API [https://bedrock-runtime.us-east-1.amazonaws.com]: HTTP 200
+  • Channel WS: 最近 1h 5 次连接，平均存活 32s
+  • Gateway 错误码: 0 条
 ```
 
-加 `--json` 后输出严格结构化（同字段、同值），方便管道处理。
+加 `--json` 后输出结构化（覆盖文本里出现的核心字段，便于 jq / 监控管道）。
 
 ## 诊断列表
 
@@ -93,12 +92,12 @@ openclaw-diag list   # 看完整列表
 | `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook 异常、Channel、外部依赖 DNS |
 | `shell_history` | 高危命令、openclaw 命令、最近操作 |
 
-**对象类（需要 session uuid）**
+**对象类（需要 session uuid 或 ≥ 8 位前缀；都支持 `--json`）**
 
 | 诊断 | 看什么 |
 |---|---|
 | `trace <uuid>` | 一条用户消息从进入到响应的完整时间轴 |
-| `extract <uuid>` | session.jsonl 导出为可读格式（active / reset / deleted / backup 全状态） |
+| `extract <uuid>` | session.jsonl 导出为可读格式（active / reset / deleted / backup 全状态；`--summary` 仅汇总） |
 
 **其它命令**
 

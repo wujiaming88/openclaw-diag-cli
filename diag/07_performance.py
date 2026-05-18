@@ -406,6 +406,7 @@ def render(out: output.Output, data, file_count):
         "tool_top": tool_top,
     })
 
+    out.progress(2, 6, "模型性能")
     out.subsection("模型性能")
     out.item(f"数据来源: 最近 {file_count} 个 session 文件")
     out.line("")
@@ -475,6 +476,7 @@ def render(out: output.Output, data, file_count):
     out.set_data("models", models_payload)
     out.set_data("session_files_analyzed", file_count)
 
+    out.progress(3, 6, "工具性能")
     out.subsection("工具性能（Top 10 by 调用量）")
     timed_tools = {n: s for n, s in data["tool_stats"].items() if s["durations"]}
     tools_payload = {}
@@ -518,6 +520,7 @@ def render(out: output.Output, data, file_count):
             }
     out.set_data("tools", tools_payload)
 
+    out.progress(4, 6, "慢调用")
     out.subsection("慢调用 Top 20")
     slow = sorted(data["slow_calls_top"], key=lambda x: x[0], reverse=True)
     seen_keys = set()
@@ -566,6 +569,7 @@ def render(out: output.Output, data, file_count):
         "by_category": dict(data["api_error_stats"]),
     })
 
+    out.progress(5, 6, "延迟分析")
     out.subsection("端到端消息延迟（user 发送 → assistant 最终响应）")
     e2e = data["e2e_latencies"]
     e2e_payload = {"count": 0}
@@ -651,6 +655,7 @@ def render(out: output.Output, data, file_count):
             })
     out.set_data("daily_trend", daily_payload)
 
+    out.progress(6, 6, "Cache")
     out.subsection("Cache 命中率")
     cache_payload = {"total_calls": data["cache_total_calls"]}
     if data["cache_total_calls"] == 0:
@@ -750,6 +755,7 @@ def main() -> int:
         out.item("未找到 Session 文件")
         return out.done()
 
+    out.progress(1, 6, "Session 扫描")
     data = analyze_sessions(session_files)
     render(out, data, len(session_files))
     return out.done()

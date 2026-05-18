@@ -114,6 +114,7 @@ def main() -> int:
     out = output.init("environment", json_mode=args.json, no_color=args.no_color)
     out.section("模块 2：基础环境")
 
+    out.progress(1, 5, "OpenClaw 版本")
     oc_version = detect_oc_version()
     if oc_version:
         out.item(f"OpenClaw 版本: {oc_version}")
@@ -149,6 +150,7 @@ def main() -> int:
                 out.item(f"版本一致: CLI={cli_clean} = service={svc_version}")
     out.set_data("service_version", svc_version)
 
+    out.progress(2, 5, "Node 版本")
     node_ver = detect_node_version()
     if node_ver:
         major = node_ver.lstrip("v").split(".", 1)[0]
@@ -196,6 +198,7 @@ def main() -> int:
             "checked": f"df -m {paths.OPENCLAW_HOME}",
         })
 
+    out.progress(3, 5, "Gateway 服务")
     gw_status = gateway_systemctl_status()
     if gw_status:
         active_state = ""
@@ -227,6 +230,7 @@ def main() -> int:
             out.evidence("pgrep -f openclaw-gatewa", "无输出")
         out.set_data("gateway_pids", pids_clean.split() if pids_clean else [])
 
+    out.progress(4, 5, "端口检测")
     port = 18789
     if os.path.isfile(args.config):
         try:
@@ -250,6 +254,7 @@ def main() -> int:
     out.line("")
     out.line("  ── Gateway 进程环境变量（OpenClaw 实际运行环境） ──")
     out.line("")
+    out.progress(5, 5, "进程环境变量")
     pid = gateway_pid()
     env_pairs = parse_proc_environ(pid) if pid else None
     if pid and env_pairs is not None:

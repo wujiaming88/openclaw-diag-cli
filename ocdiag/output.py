@@ -32,6 +32,9 @@ from . import __version__
 LINE_WIDTH = 76
 _HEAVY_BAR = "━" * LINE_WIDTH
 
+# Braille-dot spinner. Single-color, plain unicode — no extra deps.
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
 # ANSI
 _RESET = "\x1b[0m"
 _BOLD = "\x1b[1m"
@@ -214,6 +217,10 @@ class Output:
         self._status = "ok"
         self._error_msg: Optional[str] = None
         self._t0 = time.time()
+        # Spinner state for progress(). Tracked per-Output so concurrent
+        # collectors (unused today, but cheap to support) don't share frames.
+        self._spinner_idx = 0
+        self._progress_max_width = 0
 
     # ── color helper ──
     def _use_color(self) -> bool:
@@ -276,6 +283,50 @@ class Output:
     def fail(self, message: str) -> None:
         self._status = "error"
         self._error_msg = message
+
+    # ── progress indicator ──
+    def progress(self, step: int, total: int, label: str) -> None:
+        """Render a transient progress line on stderr.
+
+        Silent when stderr is not a TTY or when JSON mode is active. Uses
+        \\r to overwrite the prior frame so collectors that update progress
+        rapidly do not flood the terminal. Cleared by done() before the
+        final banner is written to stdout.
+        """
+        if self.json_mode:
+            return
+        try:
+            if not sys.stderr.isatty():
+                return
+        except Exception:
+            return
+        frame = _SPINNER_FRAMES[self._spinner_idx % len(_SPINNER_FRAMES)]
+        self._spinner_idx += 1
+        line = f"  {frame} [{step}/{total}] {label}"
+        width = _vwidth(line)
+        if width > self._progress_max_width:
+            self._progress_max_width = width
+        try:
+            sys.stderr.write("\r" + line)
+            sys.stderr.flush()
+        except (BrokenPipeError, OSError):
+            pass
+
+    def _clear_progress(self) -> None:
+        """Erase the current progress line from stderr, if any was written."""
+        if self._progress_max_width <= 0:
+            return
+        try:
+            if not sys.stderr.isatty():
+                return
+        except Exception:
+            return
+        try:
+            sys.stderr.write("\r" + (" " * self._progress_max_width) + "\r")
+            sys.stderr.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        self._progress_max_width = 0
 
     # ── verdict / grouping ──
     def _group_subsections(self) -> List[Dict[str, Any]]:
@@ -498,6 +549,9 @@ class Output:
 
     # ── finish ──
     def done(self) -> int:
+        # Wipe any in-flight progress line on stderr before we render banner /
+        # JSON to stdout, so the user sees clean output (no leftover spinner).
+        self._clear_progress()
         if not self._title_zh:
             self._title_zh = self.module
         if self.json_mode:
@@ -580,6 +634,10 @@ def current() -> Output:
 
 def emit(text: str = "") -> None:
     current().emit(text)
+
+
+def progress(step: int, total: int, label: str) -> None:
+    current().progress(step, total, label)
 
 
 # ── helpers for object inspectors that render their own text ──

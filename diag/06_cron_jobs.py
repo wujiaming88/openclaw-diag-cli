@@ -224,6 +224,7 @@ def analyze(job, runs, now_ms):
 
 
 def section_jobs(out: output.Output, jobs_file: str, state_file: str, runs_dir: str) -> None:
+    out.progress(1, 4, "任务列表")
     out.item("【OpenClaw 定时任务】— jobs.json + jobs-state.json + runs/")
     if not os.path.isfile(jobs_file):
         out.item("  jobs.json 不存在 — 未创建过定时任务")
@@ -268,6 +269,7 @@ def section_jobs(out: output.Output, jobs_file: str, state_file: str, runs_dir: 
         if jid and not j.get("state") and jid in ext_state:
             j["state"] = ext_state[jid]
 
+    out.progress(2, 4, "执行记录")
     now_ms = int(time.time() * 1000)
     analyses = []
     for j in jobs:
@@ -512,6 +514,7 @@ def section_jobs(out: output.Output, jobs_file: str, state_file: str, runs_dir: 
 
 
 def section_heartbeat(out: output.Output, args) -> None:
+    out.progress(3, 4, "Heartbeat")
     out.line("")
     out.item("【OpenClaw Heartbeat】— Agent 定期唤醒机制，用于执行 HEARTBEAT.md 中的周期性任务")
 
@@ -611,6 +614,7 @@ def section_heartbeat(out: output.Output, args) -> None:
 
 
 def section_system_crontab(out: output.Output) -> None:
+    out.progress(4, 4, "系统 crontab")
     out.line("")
     out.item("【系统 crontab】")
     try:

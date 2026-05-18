@@ -167,6 +167,7 @@ def analyze_session_file(fpath: str):
 
 
 def session_data_dimension(out: output.Output, sessions_base: str) -> None:
+    out.progress(1, 3, "文件扫描")
     active_cutoff = time.time() - 7 * 86400
     all_files_info = []
     active_files = []
@@ -208,6 +209,7 @@ def session_data_dimension(out: output.Output, sessions_base: str) -> None:
 
     agents_data: dict = {}
 
+    out.progress(2, 3, "Session 分析")
     by_agent = defaultdict(list)
     for agent_dir, fname, fpath, size, mtime in active_files:
         by_agent[agent_dir].append((fname, fpath, size, mtime))
@@ -366,6 +368,7 @@ def extract_stuck_match(obj):
 
 
 def stuck_dimension(out: output.Output, log_dir: str) -> None:
+    out.progress(3, 3, "Stuck 检测")
     out.line("")
     out.line("  ── Session Stuck 状态探测 ──")
     out.line("")

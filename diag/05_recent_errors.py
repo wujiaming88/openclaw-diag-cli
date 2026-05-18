@@ -195,6 +195,7 @@ def main() -> int:
     out.line("")
 
     if logs:
+        out.progress(1, 3, "应用日志")
         err_lines, err_unreadable = collect_error_lines(logs)
         out.set_data("app_error_count", len(err_lines))
         if err_unreadable:
@@ -225,6 +226,7 @@ def main() -> int:
     else:
         out.item("应用日志未找到（今日无更新的日志文件）")
 
+    out.progress(2, 3, "Journalctl")
     journal_out = journalctl_errors()
     if journal_out and "No entries" not in journal_out and "no entries" not in journal_out:
         lines = journal_out.splitlines()[:50]
@@ -236,6 +238,7 @@ def main() -> int:
         out.item("Journalctl ERROR: 0 条 — 系统级进程错误")
         out.set_data("journalctl_errors", 0)
 
+    out.progress(3, 3, "Session 错误")
     recent_session = find_recent_session(args.sessions_base)
     if recent_session:
         counts = tool_errors_from_session(recent_session)

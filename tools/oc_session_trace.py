@@ -639,7 +639,7 @@ def render_system_prompt_text(sp: Dict[str, Any], indent: str = "  ") -> List[st
     if isinstance(npc, int):
         lines.append(f"{indent}    non-project:     {_fmt_int(npc)} chars")
     if sp.get("truncatedInTrajectory"):
-        lines.append(f"{indent}    (chars from trajectory truncation envelope)")
+        lines.append(f"{indent}    (approximate, full text not stored in trajectory)")
     tools = sp.get("tools") or {}
     if isinstance(tools.get("schemaChars"), int):
         lines.append(
@@ -656,7 +656,7 @@ def render_system_prompt_text(sp: Dict[str, Any], indent: str = "  ") -> List[st
         )
     msgs_n = sp.get("messages_in_request")
     if isinstance(msgs_n, int):
-        lines.append(f"{indent}  Messages in request: {msgs_n}")
+        lines.append(f"{indent}  Context messages:    {msgs_n}")
     files = sp.get("injectedWorkspaceFiles") or []
     if files:
         lines.append(f"{indent}  Injected workspace files ({len(files)}):")

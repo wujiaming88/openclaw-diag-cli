@@ -237,6 +237,7 @@ def load_extensions(oc_home):
 
 
 def section_state(out, scan, configured, extensions):
+    out.progress(1, 5, "状态一致性")
     out.subsection("9.1 插件状态一致性")
     gateway_starts = scan["gateway_starts"]
     latest_start = gateway_starts[-1] if gateway_starts else None
@@ -289,6 +290,7 @@ def section_errors(out, scan, configured, unmask=False):
     def _scrub(s: str) -> str:
         return s if unmask else sanitize_text(s)
 
+    out.progress(2, 5, "错误/警告")
     out.subsection("9.2 插件错误/警告")
     plugin_level_counts = scan["plugin_level_counts"]
     plugin_error_samples = scan["plugin_error_samples"]
@@ -360,6 +362,7 @@ def section_errors(out, scan, configured, unmask=False):
 
 
 def section_hooks(out, scan):
+    out.progress(3, 5, "Hook 状态")
     out.subsection("9.3 Hook 执行状态")
     hook_errors = scan["hook_errors"]
     if not hook_errors:
@@ -402,6 +405,7 @@ def section_hooks(out, scan):
 
 
 def section_channels(out, scan):
+    out.progress(4, 5, "Channel 子系统")
     out.subsection("9.4 Channel 子系统")
     subsystem_level_counts = scan["subsystem_level_counts"]
     subsystem_error_samples = scan["subsystem_error_samples"]
@@ -461,6 +465,7 @@ def walk_urls(val, out_set):
 
 
 def section_deps(out, config_path, unmask=False):
+    out.progress(5, 5, "外部依赖")
     out.subsection("9.5 插件外部依赖")
     plugin_deps = {}
     if not (config_path and os.path.isfile(config_path)):

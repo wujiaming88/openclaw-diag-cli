@@ -30,6 +30,7 @@ def run(cmd, timeout=8):
 # ── 4.1: process & port ──
 
 def section_process_port(out: output.Output, args, port: int) -> None:
+    out.progress(1, 7, "Systemd 状态")
     rc, stdout, stderr = run(["systemctl", "--user", "status", "openclaw-gateway"])
     svc_status = (stdout or "") + (stderr or "")
     if "Active:" in svc_status:
@@ -50,6 +51,7 @@ def section_process_port(out: output.Output, args, port: int) -> None:
             out.item("进程: " + " | ".join(ps_out.strip().splitlines()))
     out.set_data("pids", pid_list)
 
+    out.progress(2, 7, "端口监听")
     rc, ss_out, _ = run(["ss", "-tlnp", f"sport = :{port}"])
     listening = bool(re.search(rf":{port}\b", ss_out))
     rc, http_out, _ = run([
@@ -66,6 +68,7 @@ def section_process_port(out: output.Output, args, port: int) -> None:
 # ── 4.2: 24h restart events ──
 
 def section_restart_events(out: output.Output) -> None:
+    out.progress(3, 7, "启停事件")
     rc, raw, _ = run([
         "journalctl", "--user", "-u", "openclaw-gateway",
         "--since", "24 hours ago", "--no-pager",
@@ -144,6 +147,7 @@ def section_restart_events(out: output.Output) -> None:
 # ── 4.3: model API connectivity ──
 
 def section_model_api(out: output.Output, args) -> None:
+    out.progress(4, 7, "模型 API")
     if not os.path.isfile(args.config):
         out.item("模型 API: 配置文件未找到")
         out.set_data("model_api_status", {
@@ -215,6 +219,7 @@ def extract_account(msg: str) -> str:
 
 
 def section_ws_lifecycle(out: output.Output, app_log: str) -> None:
+    out.progress(5, 7, "Channel WS")
     if not app_log or not os.path.isfile(app_log):
         return
     keyword_re = re.compile(
@@ -306,6 +311,7 @@ def section_ws_lifecycle(out: output.Output, app_log: str) -> None:
         })
         return
 
+    out.progress(6, 7, "Health-monitor 汇总")
     if not events and not expired:
         out.item("Channel WS: 今日无 WS 相关事件记录")
         return
@@ -545,6 +551,7 @@ VALID_GATEWAY_PREFIXES = ("gateway/", "feishu/core/lark-client", "feishu/channel
 
 
 def section_gateway_errors(out: output.Output, app_log: str) -> None:
+    out.progress(7, 7, "错误码")
     if not app_log or not os.path.isfile(app_log):
         return
     keyword_re = re.compile(

@@ -75,6 +75,7 @@ def main() -> int:
 
     files_data = []
     for hfile in history_files:
+        out.progress(1, 2, "读取历史")
         lines, read_err = read_lines(hfile)
         if read_err:
             out.item(f"{os.path.basename(hfile)} — 读取失败 ({read_err})")
@@ -88,6 +89,7 @@ def main() -> int:
         total = len(lines)
         out.item(f"{os.path.basename(hfile)} — 共 {total} 条记录")
 
+        out.progress(2, 2, "分析命令")
         dangerous: List[Tuple[int, str]] = []
         for n, ln in lines:
             if DANGEROUS_RE.search(ln) and "openclaw" not in ln.lower():

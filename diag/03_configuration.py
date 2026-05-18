@@ -107,6 +107,7 @@ def main() -> int:
     out.set_data("config_path", config_path)
     out.set_data("found", True)
 
+    out.progress(1, 2, "读取配置")
     try:
         with open(config_path) as f:
             config = json.load(f)
@@ -121,6 +122,7 @@ def main() -> int:
         return out.done()
 
     out.line("")
+    out.progress(2, 2, "展平输出")
     flat: list = []
     emit_config(out, flat, config)
     for line in flat:

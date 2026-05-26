@@ -184,4 +184,19 @@ trajectory 字段（`assistantTexts`、`messagingToolSentTexts`、`prompt`、`fi
 | 1 | 诊断运行成功但报告 `status: "error"`（数据源缺失等） |
 | 2 | 诊断崩溃（已隔离，不影响 `all`） |
 
+### 测试
+
+零依赖、纯标准库脚本，直接 `python3` 跑：
+
+```bash
+# trajectory 加载器 + 数据投影（10 个 fixture，含静默 cron / 工具泄漏 / schema 漂移 / 截断行）
+python3 tests/run_trajectory_tests.py
+
+# 9 个 trajectory-touching collector 的 E2E 测试
+# （隔离 HOME / OPENCLAW_SESSIONS，spawn `bin/ocdiag <module> --json`，断言 verdict + 关键字段）
+python3 tests/run_collector_tests.py
+```
+
+`run_collector_tests.py` 在临时目录里搭建最小 `~/.openclaw`，把 fixture 时间戳重写到 “刚才”，所以 24h / 7d / 30d 时间窗口都能命中。整套跑完 < 5s，命中率 100%。
+
 License: MIT

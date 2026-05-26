@@ -50,24 +50,25 @@ openclaw-diag trace <uuid>    # 追踪一条 session 的处理时间轴
 
 ## 三、能力详解
 
-### 扫描类（10 个 state collector，无需参数）
+### 扫描类（11 个 state collector，无需参数）
 
 | 诊断 | 看什么 | 示例 |
 |---|---|---|
 | `sys_health` | DNS / 网络 / CPU / 内存 / 磁盘 / IO / 进程 / 时间同步 | `openclaw-diag sys_health` |
-| `environment` | OpenClaw 版本一致性、Gateway 进程的环境变量 | `openclaw-diag environment` |
-| `configuration` | `openclaw.json` 展平（敏感字段已脱敏） | `openclaw-diag configuration` |
-| `gateway` | Gateway 进程、端口、24h 启停、WS 生命周期、错误码 | `openclaw-diag gateway` |
-| `recent_errors` | 应用日志 / journalctl / session 工具调用错误聚合 | `openclaw-diag recent_errors` |
-| `cron_jobs` | 定时任务状态、连续失败、调度漂移、静默检测 | `openclaw-diag cron_jobs` |
-| `performance` | 模型/工具耗时 P50/P95、慢调用 Top 20、E2E 延迟、Cache 命中率 | `openclaw-diag performance` |
-| `sessions` | Session 总览、活跃度、Stuck 探测 | `openclaw-diag sessions` |
-| `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook、Channel、外部 DNS | `openclaw-diag plugin_diag` |
+| `environment` | OpenClaw 版本一致性、Gateway 进程的环境变量 + **trajectory 14d 版本/Node 漂移** | `openclaw-diag environment` |
+| `configuration` | `openclaw.json` 展平（敏感字段已脱敏）+ **trajectory effective runtime config** | `openclaw-diag configuration` |
+| `gateway` | Gateway 进程、端口、24h 启停、WS 生命周期、错误码 + **trajectory 24h run 频率** | `openclaw-diag gateway` |
+| `recent_errors` | 应用日志 / journalctl / session 工具调用错误聚合 + **trajectory 7d run 错误信号** | `openclaw-diag recent_errors` |
+| `cron_jobs` | 定时任务状态、连续失败、调度漂移、静默检测 + **trajectory cron 投递审计 + delivery_audit** | `openclaw-diag cron_jobs` |
+| `performance` | 模型/工具耗时 P50/P95、慢调用 Top 20、E2E 延迟、Cache 命中率 + **trajectory cache health + system prompt budget** | `openclaw-diag performance` |
+| `sessions` | Session 总览、活跃度、Stuck 探测 + **trajectory run 健康度** | `openclaw-diag sessions` |
+| `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook、Channel、外部 DNS + **trajectory 插件快照 + drift 检测** | `openclaw-diag plugin_diag` |
 | `shell_history` | Shell 历史中的高危命令与最近 OpenClaw 操作 | `openclaw-diag shell_history` |
+| `run_health` | **(v0.6.0 新增)** trajectory 总体运行健康度（24h/7d/30d 多窗口）、abort 分布、active leak、P95 wall 耗时 | `openclaw-diag run_health` |
 
 ### 对象类（2 个 object inspector，需要 session uuid 或 ≥ 8 位前缀）
 
-**`trace <session_id>`** —— 还原一条用户消息从进入到响应的时间轴，包含 system prompt 大小、模型选型、每个工具调用的耗时、gateway 日志关联。
+**`trace <session_id>`** —— 还原一条用户消息从进入到响应的时间轴，包含 system prompt 大小、模型选型、每个工具调用的耗时、gateway 日志关联。v0.6.0 起额外渲染 trajectory 来源的 outcome / lifecycle / cache / delivery / plugin snapshot 信号。
 
 ```bash
 openclaw-diag trace 7f3a2c91                    # 默认追踪最后一条 user 消息
@@ -76,6 +77,9 @@ openclaw-diag trace 7f3a2c91 --msg-id msg_abc   # 指定 message id
 openclaw-diag trace 7f3a2c91 --msg-match "ssh"  # 按文本匹配第一条
 openclaw-diag trace 7f3a2c91 --no-trajectory    # 跳过 trajectory 富化
 openclaw-diag trace 7f3a2c91 --no-log           # 跳过 gateway 日志关联
+openclaw-diag trace 7f3a2c91 --show-tool-metas      # 渲染 toolMetas（默认 plaintext）
+openclaw-diag trace 7f3a2c91 --show-plugin-snapshot # 渲染 plugin entries 完整状态
+openclaw-diag trace 7f3a2c91 --mask                 # 启用 trajectory 文本字段脱敏
 ```
 
 **`extract <session_id>`** —— 把 `session.jsonl` 导出为人类可读格式，支持 active / reset / deleted / backup 四种状态。
@@ -136,13 +140,28 @@ openclaw-diag cron_jobs --json | jq '.data.jobs[] | select(.consecutive_failures
 openclaw-diag all --json > report.ndjson
 ```
 
+### Trajectory 数据层（v0.6.0+）
+
+OpenClaw 2026.5.x 起为每个 session 写入 `<uuid>.trajectory.jsonl` —— 按 7 个事件类型（`session.started` / `trace.metadata` / `context.compiled` / `prompt.submitted` / `model.completed` / `trace.artifacts` / `session.ended`）记录每个 run 的完整生命周期。openclaw-diag 在 v0.6.0 中把这层数据吸收为 first-class 数据源：
+
+- 所有 11 个 state collector 都消费 trajectory（如果存在）。来源都通过 `ocdiag.trajectory` 流式读取，不缓存。
+- 在 OpenClaw 2026.5.x 之前的版本上仍可正常工作 —— 缺失 trajectory 时退化到原有的 session.jsonl/log 数据源。
+- `OCDIAG_TRAJECTORY_WORKERS=N` 控制并发度（默认 4）。
+
+**敏感性变更**（与 DESIGN.md 公理 #7 的故意偏离）：
+
+trajectory 字段（`assistantTexts`、`messagingToolSentTexts`、`prompt`、`finalPromptText`、`toolMetas[].meta`）**默认明文展示**，因为这些数据的诊断价值远高于泄漏风险（trajectory 文件本就在用户家目录里）。
+
+- `--mask` 显式打开 trajectory 字段脱敏（仅 `trace` 命令支持）
+- 非-trajectory 来源的自由文本（shell 历史、plugin 错误样本、systemd 配置、session message body）**保持默认脱敏**，行为不变。
+
 ## 四、其他
 
 ### 设计原则
 
 1. **Observer-only** —— 只读取，绝不修改 OpenClaw 的配置 / session / cron / 服务状态
 2. **Zero-deps** —— 只用 Python 标准库 + Node 薄壳，不引入第三方 pip / npm 包
-3. **Default-sanitize** —— 默认脱敏 API key / token / credential 类字符串，`--unmask` 显式关闭
+3. **Default-sanitize** —— 默认脱敏 API key / token / credential 类字符串，`--unmask` 显式关闭。**例外**：trajectory 字段默认明文（见上文）
 
 ### 环境变量覆盖
 

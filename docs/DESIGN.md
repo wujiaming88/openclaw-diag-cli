@@ -52,6 +52,7 @@
 - 任何可能含 secret 的字段必须过统一 sanitizer (`ocdiag.sensitive.sanitize_text`)，应用到 shell history、plugin 错误样本、systemd 服务文件、session message content。
 - 默认 mask；`--unmask` 显式 opt-in 关掉脱敏（用于安全的离线分析）。
 - Sanitizer 是 best-effort，不是保证：用户仍需对扫描内容承担最终责任。
+- **v0.6.0 例外（trajectory 字段）**：trajectory JSONL 来源的自由文本（`assistantTexts`、`messagingToolSentTexts`、`prompt`、`finalPromptText`、`toolMetas[].meta`）**默认明文**展示（通过 `ocdiag.trajectory.sanitize_field` 路由），`--mask` 显式打开脱敏。理由：trajectory 文件本就在用户家目录里，明文渲染的诊断价值远高于泄漏风险。其他自由文本字段（shell history、plugin error、systemd unit、session message body）**保持默认脱敏**。
 
 ## 目录结构（来自公理）
 
@@ -63,6 +64,7 @@ openclaw-diag-cli/
 │   ├── timeutil.py     时间转换 + 格式化
 │   ├── tokens.py       token 计数 / 百分位 / 大小格式化
 │   ├── sensitive.py    密钥脱敏（公理 #1 延伸）
+│   ├── trajectory.py   *.trajectory.jsonl 流式解析 + Run 聚合（v0.6.0+）
 │   ├── output.py       双模式输出 — 公理 #4 实现
 │   ├── recent_logs.py  发现今日日志
 │   ├── cli.py          公共 argparse
@@ -78,7 +80,8 @@ openclaw-diag-cli/
 │   ├── 07_performance.py       模型/工具性能
 │   ├── 08_sessions.py          Session 数据
 │   ├── 09_plugin_diag.py       插件诊断
-│   └── 10_shell_history.py     Shell 历史
+│   ├── 10_shell_history.py     Shell 历史
+│   └── 11_run_health.py        Run 健康度（trajectory 视角）
 │
 ├── tools/
 │   ├── oc_session_trace.py     单消息时间轴追踪
@@ -139,6 +142,24 @@ if __name__ == "__main__":
 | 不内嵌 Python 在 bash heredoc | 这是我们要替代的旧形态 |
 | 不在 Node 侧实现业务逻辑 | 公理 #3 — Node 是薄壳，逻辑全在 Python |
 | 不输出未脱敏的 free-form 文本 | 公理 #7 — 默认 sanitize，`--unmask` opt-in |
+
+## Trajectory 观察层（v0.6.0+）
+
+OpenClaw 2026.5.x 起为每个 session 写入 `<sessionId>.trajectory.jsonl`，每次 run 7 个事件：
+
+| 事件 | 关键字段 |
+|---|---|
+| `session.started` | trigger / agentId / messageProvider / toolCount |
+| `trace.metadata` | harness.version / model / plugins.entries / skills / prompting.systemPromptReport / redaction |
+| `context.compiled` | systemPrompt / prompt / messages / tools / imagesCount |
+| `prompt.submitted` | actual submit ts |
+| `model.completed` | usage / promptCache.observation / compactionCount / assistantTexts / 6 abort flags |
+| `trace.artifacts` | finalStatus / itemLifecycle / toolMetas / didSendViaMessagingTool / messagingToolSent* / successfulCronAdds |
+| `session.ended` | status / abort flags |
+
+`ocdiag.trajectory` 是这层的唯一入口；任何模块都不直接打开 trajectory 文件。Loader 流式读、line-by-line、按 runId 聚合，容忍最后一行截断、schemaVersion 漂移、>50MB 单文件 skip。`ThreadPoolExecutor` 并发，`OCDIAG_TRAJECTORY_WORKERS` 控制并发度（默认 4）。
+
+每个 collector 把 trajectory 数据作为 *额外* 信号嵌入既有输出 —— 不替换 session.jsonl 或日志来源。trajectory 缺失时（OpenClaw 2026.5.x 之前）整个模块退化为原行为。
 
 ## 来历
 

@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import output, paths, sessions
+from ocdiag import output, paths, sessions, trajectory as traj_mod
 
 
 DEFAULT_BASE_DIR = paths.SESSIONS_BASE
@@ -388,11 +388,89 @@ def load_trajectory_info(traj_path, base_epoch_ms):
                 for k in ("provider", "name", "api", "thinkLevel", "reasoningLevel")
                 if model_info.get(k) is not None
             }
+            # Plugin snapshot — keep minimal but enough to render
+            plugins = data.get("plugins", {})
+            if isinstance(plugins, dict):
+                ents = plugins.get("entries")
+                if isinstance(ents, list):
+                    info["plugin_snapshot"] = [
+                        {
+                            "id": p.get("id"),
+                            "activated": p.get("activated"),
+                            "status": p.get("status"),
+                            "error": p.get("error"),
+                            "activationReason": p.get("activationReason"),
+                        }
+                        for p in ents if isinstance(p, dict)
+                    ]
+        elif etype == "model.completed":
+            data = e.get("data", {})
+            info["compactionCount"] = data.get("compactionCount") or 0
+            pc = data.get("promptCache") or {}
+            obs = pc.get("observation") if isinstance(pc, dict) else None
+            if isinstance(obs, dict):
+                info["cache"] = {
+                    "broke": obs.get("broke"),
+                    "cacheRead": obs.get("cacheRead"),
+                }
+        elif etype == "trace.artifacts":
+            data = e.get("data", {})
+            info["finalStatus"] = data.get("finalStatus")
+            info["aborted"] = bool(data.get("aborted"))
+            info["externalAbort"] = bool(data.get("externalAbort"))
+            info["timedOut"] = bool(data.get("timedOut"))
+            info["idleTimedOut"] = bool(data.get("idleTimedOut"))
+            info["timedOutDuringCompaction"] = bool(data.get("timedOutDuringCompaction"))
+            info["timedOutDuringToolExecution"] = bool(data.get("timedOutDuringToolExecution"))
+            pes = data.get("promptErrorSource")
+            info["promptErrorSource"] = pes if pes else None
+            il = data.get("itemLifecycle") or {}
+            if isinstance(il, dict):
+                info["lifecycle"] = {
+                    "started": il.get("startedCount") or 0,
+                    "completed": il.get("completedCount") or 0,
+                    "active": il.get("activeCount") or 0,
+                }
+            tm = data.get("toolMetas") or []
+            if isinstance(tm, list):
+                info["toolMetas"] = [
+                    {"toolName": m.get("toolName"), "meta": m.get("meta")}
+                    for m in tm if isinstance(m, dict)
+                ]
+            info["didSendViaMessagingTool"] = bool(data.get("didSendViaMessagingTool"))
+            info["messagingTargets"] = data.get("messagingToolSentTargets") or []
+            mts = data.get("messagingToolSentTexts") or []
+            info["messagingTextCount"] = len(mts) if isinstance(mts, list) else 0
+            info["messagingTexts"] = mts if isinstance(mts, list) else []
+            info["successfulCronAdds"] = data.get("successfulCronAdds") or 0
+            usage = data.get("usage") or {}
+            if isinstance(usage, dict):
+                info["usage"] = {
+                    "input": usage.get("input") or 0,
+                    "output": usage.get("output") or 0,
+                    "cacheRead": usage.get("cacheRead") or 0,
+                    "cacheWrite": usage.get("cacheWrite") or 0,
+                    "total": usage.get("total") or 0,
+                }
+                # Reuse cache.cacheRead from observation if present, else fall
+                # back to usage.cacheRead so the render layer always has a
+                # number to print.
+                cache_obj = info.get("cache") or {}
+                if not isinstance(cache_obj.get("cacheRead"), int):
+                    cache_obj["cacheRead"] = usage.get("cacheRead") or 0
+                if "broke" not in cache_obj:
+                    cache_obj["broke"] = None
+                info["cache"] = cache_obj
+            ats = data.get("assistantTexts") or []
+            if isinstance(ats, list):
+                info["assistantTexts"] = [str(t) for t in ats if t]
         elif etype == "session.ended":
             data = e.get("data", {})
             info["status"] = data.get("status")
-            info["aborted"] = data.get("aborted")
-            info["timedOut"] = data.get("timedOut")
+            if "aborted" not in info:
+                info["aborted"] = data.get("aborted")
+            if "timedOut" not in info:
+                info["timedOut"] = data.get("timedOut")
     if "session.started" in ts_map and "context.compiled" in ts_map:
         info["context_compilation_ms"] = ts_map["context.compiled"] - ts_map["session.started"]
     if "context.compiled" in ts_map and "prompt.submitted" in ts_map:
@@ -455,6 +533,43 @@ def load_trajectory_info(traj_path, base_epoch_ms):
             "messages_in_request": sp_messages_count,
         }
     return info
+
+
+def _apply_traj_redaction(
+    info: Dict[str, Any], *, mask: bool,
+    show_tool_metas: bool, show_plugin_snapshot: bool,
+) -> None:
+    """In-place: drop bulky/unwanted fields and apply the trajectory
+    sanitization toggle.
+
+    Trajectory free-form fields are *plaintext by default* (deliberate
+    departure from DESIGN.md axiom #7 — see ocdiag.trajectory). Pass
+    ``mask=True`` to opt INTO sanitization.
+    """
+    if not show_tool_metas:
+        # Always drop the bulky meta blob; keep just toolName for verdict
+        # readers. The leak warning logic still works because we keep the
+        # toolName list.
+        if isinstance(info.get("toolMetas"), list):
+            info["toolMetas"] = [
+                {"toolName": m.get("toolName")}
+                for m in info["toolMetas"] if isinstance(m, dict)
+            ]
+    elif mask:
+        info["toolMetas"] = traj_mod.sanitize_field(info.get("toolMetas"), mask=True)
+
+    if not show_plugin_snapshot:
+        info.pop("plugin_snapshot", None)
+
+    # Free-form text fields: assistantTexts, messagingTexts, finalPromptText.
+    if mask:
+        for key in ("assistantTexts", "messagingTexts"):
+            if key in info:
+                info[key] = traj_mod.sanitize_field(info[key], mask=True)
+        if isinstance(info.get("finalPromptText"), str):
+            info["finalPromptText"] = traj_mod.sanitize_field(
+                info["finalPromptText"], mask=True
+            )
 
 
 def _parse_log_ts(ts_str):
@@ -788,6 +903,86 @@ def format_text(session_id, user_msg_index, user_msg_id, analysis,
             lines.append(f"    model config: {', '.join(parts)}")
         if traj_info.get("status"):
             lines.append(f"    status: {traj_info['status']}")
+
+        # Outcome summary — abort flags + final status. Always show; the
+        # diagnostic value of seeing "everything false" is high (proves the
+        # run completed cleanly).
+        if traj_info.get("finalStatus") is not None:
+            outcome_parts = [f"finalStatus={traj_info.get('finalStatus')}"]
+            if traj_info.get("promptErrorSource"):
+                outcome_parts.append(f"promptErrorSource={traj_info['promptErrorSource']}")
+            abort_flags = []
+            for k in ("aborted", "externalAbort", "timedOut", "idleTimedOut",
+                      "timedOutDuringCompaction", "timedOutDuringToolExecution"):
+                if traj_info.get(k):
+                    abort_flags.append(k)
+            if abort_flags:
+                outcome_parts.append(f"flags=[{','.join(abort_flags)}]")
+            lines.append(f"    outcome: {' | '.join(outcome_parts)}")
+
+        lc = traj_info.get("lifecycle") or {}
+        if lc:
+            warn = " ← WARN: tool-call leak" if lc.get("active", 0) > 0 else ""
+            lines.append(
+                f"    lifecycle: started={lc.get('started',0)} "
+                f"completed={lc.get('completed',0)} "
+                f"active={lc.get('active',0)}{warn}"
+            )
+            if lc.get("active", 0) > 0 and traj_info.get("toolMetas"):
+                lines.append("      possibly leaked tool calls (toolMetas):")
+                for m in traj_info["toolMetas"][:6]:
+                    lines.append(f"        - {m.get('toolName','?')}")
+
+        cache_obj = traj_info.get("cache")
+        if cache_obj:
+            usage = traj_info.get("usage") or {}
+            total = usage.get("total") or 0
+            cache_read = cache_obj.get("cacheRead") or 0
+            ratio = (cache_read / total * 100) if total else 0.0
+            broke = cache_obj.get("broke")
+            broke_str = f"broke={broke}" if broke is not None else "broke=?"
+            comp = traj_info.get("compactionCount") or 0
+            lines.append(
+                f"    cache: {broke_str} | cacheRead={cache_read:,} / total={total:,} "
+                f"({ratio:.1f}%) | compactionCount={comp}"
+            )
+
+        delivery_active = (
+            traj_info.get("trigger") in ("cron", "user") or
+            traj_info.get("didSendViaMessagingTool") or
+            traj_info.get("messagingTextCount", 0) > 0
+        )
+        if delivery_active:
+            sent = traj_info.get("didSendViaMessagingTool")
+            tc = traj_info.get("messagingTextCount", 0)
+            tg = traj_info.get("messagingTargets") or []
+            lines.append(
+                f"    delivery: didSendViaMessagingTool={sent} "
+                f"texts={tc} targets={len(tg)} "
+                f"successfulCronAdds={traj_info.get('successfulCronAdds', 0)}"
+            )
+
+        plugin_snapshot = traj_info.get("plugin_snapshot")
+        if plugin_snapshot:
+            errored = [p for p in plugin_snapshot if p.get("error") and p.get("activated")]
+            if errored:
+                lines.append(f"    plugin errors (this run): {len(errored)}")
+                for p in errored[:6]:
+                    lines.append(f"      - {p.get('id')}: {p.get('error')}")
+            elif len(plugin_snapshot) > 0:
+                lines.append(
+                    f"    plugin snapshot: {len(plugin_snapshot)} entries, "
+                    "no activated-with-error"
+                )
+                for p in plugin_snapshot[:8]:
+                    tag = "[on]" if p.get("activated") else "[off]"
+                    reason = ""
+                    if not p.get("activated") and p.get("activationReason"):
+                        reason = f" ({p.get('activationReason')})"
+                    lines.append(f"      - {tag} {p.get('id')}{reason}")
+                if len(plugin_snapshot) > 8:
+                    lines.append(f"      ... +{len(plugin_snapshot) - 8} more")
+
         lines.append("")
 
     if system_prompt:
@@ -838,6 +1033,17 @@ def main():
     parser.add_argument("--agent", default=None, help="Limit to specific agent")
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR, help="Gateway log directory")
     parser.add_argument("--no-trajectory", action="store_true", help="Skip trajectory enrichment")
+    parser.add_argument("--include-trajectory-detail", action="store_true",
+                        default=True,
+                        help="Render full trajectory enrichment (default on)")
+    parser.add_argument("--show-tool-metas", action="store_true",
+                        help="Render toolMetas list (sanitized unless --unmask)")
+    parser.add_argument("--show-plugin-snapshot", action="store_true",
+                        help="Render full plugin entries snapshot for this run")
+    parser.add_argument("--mask", action="store_true",
+                        help="Sanitize trajectory free-form fields (assistantTexts, "
+                             "messagingToolSentTexts, finalPromptText, toolMetas[].meta). "
+                             "Default plaintext — see CHANGELOG / README v0.6.0.")
     parser.add_argument("--no-log", action="store_true", help="Skip gateway log enrichment")
     parser.add_argument("--json", action="store_true", help="Output as structured JSON")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output")
@@ -900,6 +1106,10 @@ def main():
         traj_path = find_trajectory_file(session_file)
         if traj_path:
             traj_info = load_trajectory_info(traj_path, analysis["base_epoch_ms"])
+            if traj_info is not None:
+                _apply_traj_redaction(traj_info, mask=args.mask,
+                                      show_tool_metas=args.show_tool_metas,
+                                      show_plugin_snapshot=args.show_plugin_snapshot)
 
     gw_info = None
     if not args.no_log:

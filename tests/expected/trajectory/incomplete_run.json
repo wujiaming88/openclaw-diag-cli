@@ -1,0 +1,60 @@
+{
+  "fixture": "incomplete_run",
+  "runs": [
+    {
+      "aborted": false,
+      "cache_broke": null,
+      "did_send_via_messaging_tool": false,
+      "external_abort": false,
+      "final_status": null,
+      "harness_version": "",
+      "idle_timed_out": false,
+      "incomplete": true,
+      "lifecycle": {
+        "active": 0,
+        "completed": 0,
+        "started": 0
+      },
+      "messaging_text_count": 0,
+      "prompt_error_source": null,
+      "run_id": "run-incomplete",
+      "schema_version_seen": 1,
+      "session_id": "11111111-1111-1111-1111-111111111111",
+      "successful_cron_adds": 0,
+      "system_prompt_chars": 0,
+      "timed_out": false,
+      "tool_metas": [],
+      "tools_schema_chars": 0,
+      "trigger": "user",
+      "usage": {
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    }
+  ],
+  "schema_drift": null,
+  "summary": {
+    "active_leak_runs": 0,
+    "by_abort_flag": {
+      "aborted": 0,
+      "externalAbort": 0,
+      "idleTimedOut": 0,
+      "timedOut": 0,
+      "timedOutDuringCompaction": 0,
+      "timedOutDuringToolExecution": 0
+    },
+    "by_final_status": {
+      "incomplete": 1
+    },
+    "by_trigger": {
+      "user": 1
+    },
+    "incomplete_runs": 1,
+    "schema_drift": null,
+    "schema_version_seen": 1,
+    "total_runs": 1
+  }
+}

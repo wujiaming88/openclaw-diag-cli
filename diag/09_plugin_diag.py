@@ -616,28 +616,33 @@ def section_trajectory_plugins(
         out.item(f"  禁用插件（含 activationReason）: {len(plugin_disabled_with_reason)} 个 "
                  f"({', '.join(p['id'] for p in plugin_disabled_with_reason[:6])})")
 
-    # Drift detection: compare config (configured) with latest plugin state.
-    drift_disabled_active = []   # configured=enabled but trajectory shows disabled
-    drift_active_disabled = []   # trajectory shows enabled but config=disabled
+    # Drift detection: compare config (configured) with the trajectory's own
+    # `enabled` field (NOT `activated`). `activated=false` is a normal per-run
+    # state for plugins that simply weren't reached by any hook this run, while
+    # `enabled=false` reflects the runtime configuration choice. Comparing
+    # against `enabled` is what matches the user's intent of "config drifted
+    # from runtime".
+    drift_disabled_active = []   # configured=enabled but trajectory enabled=false
+    drift_active_disabled = []   # trajectory enabled=true but config=disabled
     for p in last_plugins:
         pid = p.get("id")
         if not pid:
             continue
         cfg_enabled = configured.get(pid)
-        is_active = p.get("activated")
-        if cfg_enabled is True and not is_active:
+        runtime_enabled = p.get("enabled")
+        if cfg_enabled is True and runtime_enabled is False:
             drift_disabled_active.append(p)
-        elif cfg_enabled is False and is_active:
+        elif cfg_enabled is False and runtime_enabled is True:
             drift_active_disabled.append(p)
 
     if drift_disabled_active or drift_active_disabled:
         out.item(f"警告：插件配置 vs trajectory 漂移: "
                  f"{len(drift_disabled_active)+len(drift_active_disabled)} 项")
         for p in drift_disabled_active[:5]:
-            out.item(f"    {p.get('id')}: config 启用但 trajectory activated=false "
+            out.item(f"    {p.get('id')}: config 启用但 trajectory enabled=false "
                      f"(reason={p.get('activationReason') or '?'})")
         for p in drift_active_disabled[:5]:
-            out.item(f"    {p.get('id')}: config 禁用但 trajectory activated=true")
+            out.item(f"    {p.get('id')}: config 禁用但 trajectory enabled=true")
     else:
         out.item("  config vs trajectory 漂移: 无")
 
@@ -674,12 +679,26 @@ def section_trajectory_plugins(
             for p in plugin_errors_now
         ],
         "plugin_drift": {
+            # JSON keys reflect the actual semantics: comparison is between
+            # config `enabled` and trajectory `enabled` (NOT `activated`).
+            # Each entry surfaces both `enabled` and `activated` so consumers
+            # can disambiguate.
             "config_enabled_runtime_disabled": [
-                {"id": p.get("id"), "reason": p.get("activationReason")}
+                {
+                    "id": p.get("id"),
+                    "enabled": p.get("enabled"),
+                    "activated": p.get("activated"),
+                    "reason": p.get("activationReason"),
+                }
                 for p in drift_disabled_active
             ],
-            "config_disabled_runtime_active": [
-                {"id": p.get("id")} for p in drift_active_disabled
+            "config_disabled_runtime_enabled": [
+                {
+                    "id": p.get("id"),
+                    "enabled": p.get("enabled"),
+                    "activated": p.get("activated"),
+                }
+                for p in drift_active_disabled
             ],
         },
         "imported_unused": imported_unused,

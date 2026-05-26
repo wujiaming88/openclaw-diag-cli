@@ -246,17 +246,26 @@ def main() -> int:
 
     out.item(f"扫描了 {len(files)} 个 trajectory 文件，共 {len(all_runs)} 个 run")
 
+    # Always render the standard 3 windows. If user explicitly asks for
+    # `--window all`, ALSO compute and render the all-time window so the
+    # CLI choice is honored (was silently falling back to 7d before).
+    standard_windows = ("24h", "7d", "30d")
+    if args.window == "all":
+        windows_to_compute = standard_windows + ("all",)
+    else:
+        windows_to_compute = standard_windows
+
     windows_payload: Dict[str, Dict] = {}
     out.progress(3, 3, "渲染窗口")
-    for w in ("24h", "7d", "30d"):
+    for w in windows_to_compute:
         runs_w = _filter_window(all_runs, w)
         stats = _window_stats(runs_w)
         windows_payload[w] = stats
 
     # Render the user-selected primary window prominently first, then the
-    # other two for context.
+    # remaining ones for context.
     primary = args.window if args.window in windows_payload else "7d"
-    other = [w for w in ("24h", "7d", "30d") if w != primary]
+    other = [w for w in windows_to_compute if w != primary]
     _render_window(out, f"{primary} (主)", windows_payload[primary])
     for w in other:
         _render_window(out, w, windows_payload[w])

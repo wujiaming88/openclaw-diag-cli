@@ -117,6 +117,10 @@ class Run:
     messaging_texts: List[str] = field(default_factory=list)
     successful_cron_adds: int = 0
     tool_metas: List[Dict[str, Any]] = field(default_factory=list)
+    # Fallback when tool_metas is empty (typical for stuck/aborted runs whose
+    # toolCalls never produced a meta payload): the most recent unmatched
+    # toolCall names extracted from model.completed.messagesSnapshot. v0.6.1.
+    last_tool_call_names: List[str] = field(default_factory=list)
     assistant_texts: List[str] = field(default_factory=list)
     final_prompt_text: Optional[str] = None
     # trace.metadata.prompting.systemPromptReport
@@ -485,6 +489,66 @@ def _merge_event(run: Run, ev: Dict[str, Any], populate_raw: bool) -> None:
             fpt = data.get("finalPromptText")
             if isinstance(fpt, str):
                 run.final_prompt_text = fpt
+            # Extract toolCall names from messagesSnapshot for the
+            # `last_tool_call_names` fallback. Used by run_health when
+            # tool_metas is empty (e.g. stuck/aborted runs whose tools
+            # never finished and therefore never wrote a meta entry).
+            # We collect ALL toolCall.name in order; the consumer caps
+            # display length. Unmatched (no toolResult) ones are kept;
+            # already-matched ones are filtered to surface signal of
+            # what's actually pending. v0.6.1.
+            ms = data.get("messagesSnapshot")
+            if isinstance(ms, list) and ms:
+                tc_seq: List[Dict[str, str]] = []  # [{id, name}]
+                seen_results: set = set()
+                for msg in ms:
+                    if not isinstance(msg, dict):
+                        continue
+                    # Shape B: top-level toolResult message
+                    # ({role: "toolResult", toolCallId|toolUseId|id: "..."}).
+                    # This is the shape used elsewhere in this repo (e.g.
+                    # 07_performance.py reads msg.toolCallId directly).
+                    role = msg.get("role")
+                    if role == "toolResult":
+                        rid = (msg.get("toolCallId") or msg.get("toolUseId")
+                               or msg.get("id"))
+                        if rid:
+                            seen_results.add(_safe_str(rid))
+                        # Note: don't continue — some shapes also have a
+                        # content list mirroring the same id; harmless to
+                        # double-record into a set.
+                    cnt = msg.get("content")
+                    if not isinstance(cnt, list):
+                        continue
+                    for c in cnt:
+                        if not isinstance(c, dict):
+                            continue
+                        ct = c.get("type")
+                        if ct == "toolCall":
+                            tc_seq.append({
+                                "id": _safe_str(c.get("id") or c.get("toolUseId")),
+                                "name": _safe_str(c.get("name")),
+                            })
+                        elif ct == "toolResult":
+                            # Shape A: toolResult inside content list
+                            # ({type: "toolResult", toolUseId: "..."}).
+                            rid = (c.get("toolUseId") or c.get("id")
+                                   or c.get("toolCallId"))
+                            if rid:
+                                seen_results.add(_safe_str(rid))
+                # Prefer unmatched (still-active) toolCalls; if all matched
+                # (i.e. snapshot taken after a normal turn), fall back to the
+                # last few toolCall names regardless.
+                unmatched = [
+                    tc["name"] for tc in tc_seq
+                    if tc["name"] and tc["id"] and tc["id"] not in seen_results
+                ]
+                if unmatched:
+                    run.last_tool_call_names = unmatched[-10:]
+                else:
+                    names = [tc["name"] for tc in tc_seq if tc["name"]]
+                    if names:
+                        run.last_tool_call_names = names[-10:]
         elif etype == "trace.artifacts":
             run.final_status = _safe_str(data.get("finalStatus")) or None
             run.aborted = _safe_bool(data.get("aborted"))

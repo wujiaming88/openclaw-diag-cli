@@ -105,6 +105,72 @@ def gen_fixtures() -> Dict[str, Path]:
     write_fixture(str(p), evs)
     out[name] = p
 
+    # 4b. tool_leak_no_meta_run — the arkclaw scenario: stuck run whose
+    # toolCalls never wrote a meta entry, but messagesSnapshot has the
+    # toolCall.name we can fall back to. v0.6.1 regression fixture.
+    name = "tool_leak_no_meta_run"
+    evs = make_events(
+        run_id="run-leak-no-meta",
+        started_ts=_ts(0), ended_ts=_ts(1505),  # ~25 min, ACP turn ceiling
+        trigger="user", final_status="error",
+        abort_flags={"aborted": True},
+        prompt_error_source="prompt",
+        item_lifecycle={"startedCount": 1, "completedCount": 0, "activeCount": 1},
+        tool_metas=[],  # empty — mirrors arkclaw stuck runs
+        messages_snapshot=[
+            {"role": "user", "content": [
+                {"type": "text", "text": "please open the skill file"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "need to read SKILL.md"},
+                {"type": "toolCall", "id": "call_stuck_read_1", "name": "read",
+                 "input": {"path": "~/skill/SKILL.md"}},
+            ]},
+            # No toolResult — simulates the stuck call never returning.
+        ],
+    )
+    p = FIXTURE_DIR / f"{name}.trajectory.jsonl"
+    write_fixture(str(p), evs)
+    out[name] = p
+
+    # 4c. tool_leak_mixed_shapes_run — fixture with BOTH shape A (toolResult
+    # inside content list) and shape B (top-level role=toolResult with
+    # toolCallId on message). Verifies fallback correctly identifies the
+    # ONE truly-active call rather than treating completed-but-shape-B
+    # results as unmatched. v0.6.1 codex review P2 regression.
+    name = "tool_leak_mixed_shapes_run"
+    evs = make_events(
+        run_id="run-leak-mixed",
+        started_ts=_ts(0), ended_ts=_ts(1700),
+        trigger="user", final_status="error",
+        abort_flags={"aborted": True, "timedOut": True},
+        item_lifecycle={"startedCount": 3, "completedCount": 2, "activeCount": 1},
+        tool_metas=[],  # again empty — forces fallback path
+        messages_snapshot=[
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "tool_completed_a", "name": "exec"},
+            ]},
+            # Shape A toolResult (inside content list)
+            {"role": "user", "content": [
+                {"type": "toolResult", "toolUseId": "tool_completed_a",
+                 "output": "ok"}
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "tool_completed_b", "name": "read"},
+            ]},
+            # Shape B toolResult (top-level message, toolCallId at root)
+            {"role": "toolResult", "toolCallId": "tool_completed_b",
+             "content": [{"type": "text", "text": "file contents"}]},
+            {"role": "assistant", "content": [
+                {"type": "toolCall", "id": "tool_stuck_c", "name": "process"},
+            ]},
+            # No result — this is the active one.
+        ],
+    )
+    p = FIXTURE_DIR / f"{name}.trajectory.jsonl"
+    write_fixture(str(p), evs)
+    out[name] = p
+
     # 5. silent_cron_run — the 5.7 bug pattern
     name = "silent_cron_run"
     evs = make_events(
@@ -215,6 +281,8 @@ def summarize_run(run: traj.Run) -> Dict[str, Any]:
         "messaging_text_count": run.messaging_text_count,
         "successful_cron_adds": run.successful_cron_adds,
         "tool_metas": [m.get("toolName") for m in run.tool_metas],
+        "tool_metas_count": len(run.tool_metas),
+        "last_tool_call_names": list(run.last_tool_call_names),
         "schema_version_seen": run.schema_version_seen,
         "harness_version": run.harness_version,
         "system_prompt_chars": run.system_prompt_chars,
@@ -295,6 +363,17 @@ def main() -> int:
            and by_name["idle_timeout_run"]["summary"]["by_abort_flag"]["timedOut"] == 1)
     expect("tool_leak_run -> active_leak_runs=1",
            by_name["tool_leak_run"]["summary"]["active_leak_runs"] == 1)
+    # v0.6.1: stuck run with empty toolMetas falls back to messagesSnapshot
+    # toolCall names — verify last_tool_call_names is populated.
+    expect("tool_leak_no_meta_run -> tool_metas empty, last_tool_call_names=['read']",
+           by_name["tool_leak_no_meta_run"]["summary"]["active_leak_runs"] == 1
+           and by_name["tool_leak_no_meta_run"]["runs"][0]["tool_metas_count"] == 0
+           and by_name["tool_leak_no_meta_run"]["runs"][0]["last_tool_call_names"] == ["read"])
+    # v0.6.1 codex review P2 regression: mixed shape A + B toolResults.
+    # Both completed calls (exec, read) MUST be filtered out;
+    # only the truly-active call (process) MUST remain in the fallback.
+    expect("tool_leak_mixed_shapes_run -> shape-A and shape-B toolResults both filtered out",
+           by_name["tool_leak_mixed_shapes_run"]["runs"][0]["last_tool_call_names"] == ["process"])
     expect("silent_cron_run -> trigger=cron, final_status=success, did_send=False",
            by_name["silent_cron_run"]["runs"][0]["trigger"] == "cron"
            and by_name["silent_cron_run"]["runs"][0]["final_status"] == "success"

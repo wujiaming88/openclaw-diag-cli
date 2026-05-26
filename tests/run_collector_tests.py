@@ -210,6 +210,22 @@ _add(
          lambda p: _path(p, "data.windows.24h.active_leak_count") >= 1),
     ],
 )
+# v0.6.1: stuck run with empty toolMetas — verify last_tool_call_names
+# fallback is surfaced in the active_leak_samples payload (was rendering
+# as `[?]` in v0.6.0).
+_add(
+    "run_health: tool_leak_no_meta → last_tool_call_names fallback populated",
+    "run_health", ["tool_leak_no_meta_run"],
+    verdict="fail",
+    checks=[
+        ("24h.active_leak_count>=1",
+         lambda p: _path(p, "data.windows.24h.active_leak_count") >= 1),
+        ("first sample tool_metas empty",
+         lambda p: len(_path(p, "data.windows.24h.active_leak_samples")[0]["tool_metas"]) == 0),
+        ("first sample last_tool_call_names == ['read']",
+         lambda p: _path(p, "data.windows.24h.active_leak_samples")[0]["last_tool_call_names"] == ["read"]),
+    ],
+)
 _add(
     "run_health: complete_user → verdict=ok + 7d.error_rate_pct==0",
     "run_health", ["complete_user_run"],

@@ -77,6 +77,7 @@ def make_events(
     harness_version: str = "2026.5.0",
     schema_version: int = 1,
     incomplete: str = "",
+    messages_snapshot: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Build a 7-event run (or fewer if `incomplete` requests it).
 
@@ -198,7 +199,7 @@ def make_events(
         },
         "compactionCount": compaction_count,
         "assistantTexts": assistant_texts or [],
-        "messagesSnapshot": [],
+        "messagesSnapshot": messages_snapshot or [],
     }, ended_ts or started_ts)
 
     if incomplete == "no_artifacts":

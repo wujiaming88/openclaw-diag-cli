@@ -122,6 +122,9 @@ def _window_stats(runs: List[Run]) -> Dict:
                 "active": r.active_count,
                 "started_ts_ms": r.started_ts_ms,
                 "tool_metas": [m.get("toolName") for m in r.tool_metas],
+                # v0.6.1: fallback when tool_metas is empty (stuck/aborted
+                # runs whose toolCalls never wrote a meta entry).
+                "last_tool_call_names": list(r.last_tool_call_names),
             }
             for r in leaks[:5]
         ],
@@ -191,9 +194,22 @@ def _render_window(out: output.Output, label: str, stats: Dict) -> None:
     if leaks:
         out.item(f"  警告：工具调用泄漏 {leaks} 个 run（active_count > 0）")
         for s in stats["active_leak_samples"]:
-            tn = ",".join(s["tool_metas"]) or "?"
+            # v0.6.1: 3-layer fallback for tool name display:
+            #   1. trace.artifacts.toolMetas[].toolName (preferred)
+            #   2. messagesSnapshot.toolCall.name (extracted at parse time)
+            #   3. "?" (no signal at all)
+            tn = (
+                ",".join([t for t in s["tool_metas"] if t])
+                or ",".join(s.get("last_tool_call_names") or [])
+                or "?"
+            )
+            tag = " [snapshot]" if (
+                not [t for t in s["tool_metas"] if t]
+                and s.get("last_tool_call_names")
+            ) else ""
             out.item(f"    {s['sessionId'][:8]}#{s['runId'][:8]} "
-                     f"trigger={s['trigger']} active={s['active']} tools=[{tn}]")
+                     f"trigger={s['trigger']} active={s['active']} "
+                     f"tools=[{tn}]{tag}")
     else:
         out.item("  active_count 泄漏: 0")
 

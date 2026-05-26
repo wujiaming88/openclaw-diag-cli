@@ -10,6 +10,7 @@
       "harness_version": "2026.5.0",
       "idle_timed_out": false,
       "incomplete": false,
+      "last_tool_call_names": [],
       "lifecycle": {
         "active": 2,
         "completed": 3,
@@ -27,6 +28,7 @@
         "exec",
         "exec"
       ],
+      "tool_metas_count": 2,
       "tools_schema_chars": 5000,
       "trigger": "user",
       "usage": {

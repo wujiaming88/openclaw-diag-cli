@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output
+from ocdiag import cli, output, trajectory
 from ocdiag.timeutil import fmt_age, fmt_ts
 from ocdiag.tokens import fmt_tokens, percentile
 
@@ -636,9 +636,131 @@ def section_system_crontab(out: output.Output) -> None:
     out.set_data("system_crontab", entries)
 
 
+def section_cron_trajectory(out: output.Output, sessions_base: str) -> None:
+    """Cron-specific trajectory checks (last 7d).
+
+    Source events:
+      - session.started.data.trigger == "cron"
+      - trace.artifacts.didSendViaMessagingTool / messagingToolSentTargets /
+        messagingToolSentTexts / successfulCronAdds / finalStatus
+      - model.completed.assistantTexts (used as silent-cron heuristic)
+
+    Silent-cron heuristic = trigger=cron + finalStatus=success +
+    didSendViaMessagingTool=False + successfulCronAdds=0 + assistantTexts
+    short or empty. Strong signal of the ArkClaw 5.7 "cron not delivered"
+    pattern.
+    """
+    out.line("")
+    out.line("  ── Trajectory: Cron 投递审计（数据来源 *.trajectory.jsonl） ──")
+    out.line("")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 cron 投递审计")
+        out.set_data("trajectory_cron", {"found": False})
+        return
+    runs = trajectory.collect_runs(
+        files, since_ms=trajectory.ms_ago(7 * 86400 * 1000),
+    )
+    cron_runs = [r for r in runs if r.trigger == "cron"]
+    if not cron_runs:
+        out.item("最近 7d 无 cron-trigger 的 run — 数据空")
+        out.set_data("trajectory_cron", {"found": True, "cron_runs_7d": 0})
+        return
+
+    sent_ok = sum(1 for r in cron_runs if r.did_send_via_messaging_tool)
+    final_success = sum(1 for r in cron_runs if r.final_status == "success")
+    final_error = sum(1 for r in cron_runs if r.final_status == "error")
+    successful_adds = sum(r.successful_cron_adds for r in cron_runs)
+    silent_runs = []
+    for r in cron_runs:
+        if r.final_status != "success":
+            continue
+        if r.did_send_via_messaging_tool:
+            continue
+        if r.successful_cron_adds > 0:
+            continue
+        # Heuristic: assistantTexts empty or trivially short means the agent
+        # did "nothing" but the run was reported successful — classic 5.7
+        # silent-cron pattern.
+        text_len = sum(len(t) for t in r.assistant_texts)
+        if text_len < 64:
+            silent_runs.append((r, text_len))
+
+    success_rate = (final_success / len(cron_runs) * 100) if cron_runs else 0.0
+    send_rate = (sent_ok / len(cron_runs) * 100) if cron_runs else 0.0
+
+    out.item(f"7d cron run: {len(cron_runs)} 个 | success={final_success} "
+             f"error={final_error} | did_send_via_messaging_tool={sent_ok} "
+             f"({send_rate:.1f}%)")
+    out.item(f"  successful_cron_adds 总计: {successful_adds}")
+
+    if silent_runs:
+        out.item(f"FATAL: 静默 cron 检测：{len(silent_runs)} 个 run "
+                 f"（trigger=cron, success=true, didSend=false, adds=0, 文本<64 字）")
+        for r, text_len in silent_runs[:5]:
+            out.item(f"    {r.session_id[:8]}#{r.run_id[:8]} "
+                     f"text_len={text_len} targets={len(r.messaging_targets)}")
+    else:
+        out.item("  静默 cron: 0 — 无可疑投递失败")
+
+    if final_success and success_rate < 95:
+        out.item(f"警告：cron 成功率 {success_rate:.1f}% < 95% 阈值（7d）")
+    else:
+        out.item(f"  cron 成功率: {success_rate:.1f}%（7d）")
+
+    out.set_data("trajectory_cron", {
+        "found": True,
+        "cron_runs_7d": len(cron_runs),
+        "send_rate_pct": round(send_rate, 2),
+        "success_rate_pct": round(success_rate, 2),
+        "successful_cron_adds_7d": successful_adds,
+        "silent_cron_runs": [
+            {
+                "sessionId": r.session_id,
+                "runId": r.run_id,
+                "started_ts_ms": r.started_ts_ms,
+                "text_len": text_len,
+                "messaging_targets": len(r.messaging_targets),
+            }
+            for r, text_len in silent_runs[:20]
+        ],
+    })
+
+    # Delivery audit (cross-trigger), absorbed from delivery_audit per
+    # Decision #2.
+    out.line("")
+    out.line("  ── Trajectory: Delivery Audit（跨 trigger） ──")
+    out.line("")
+    by_trigger_send: dict = {}
+    for r in runs:
+        s = by_trigger_send.setdefault(r.trigger, {
+            "total": 0, "did_send": 0, "non_empty_text": 0,
+        })
+        s["total"] += 1
+        if r.did_send_via_messaging_tool:
+            s["did_send"] += 1
+        if any(t.strip() for t in r.assistant_texts):
+            s["non_empty_text"] += 1
+
+    for trig in sorted(by_trigger_send.keys(),
+                       key=lambda x: -by_trigger_send[x]["total"]):
+        s = by_trigger_send[trig]
+        send_pct = (s["did_send"] / s["total"] * 100) if s["total"] else 0.0
+        out.item(f"  {trig}: {s['total']} run | did_send_via_messaging_tool="
+                 f"{s['did_send']} ({send_pct:.0f}%) | non_empty_assistant="
+                 f"{s['non_empty_text']}")
+
+    heartbeat = by_trigger_send.get("heartbeat", {})
+    if heartbeat.get("did_send", 0) > 0:
+        out.item(f"警告：heartbeat 触发但出现 did_send_via_messaging_tool=true "
+                 f"{heartbeat['did_send']} 次（异常 — heartbeat 通常不主动发消息）")
+
+    out.set_data("trajectory_delivery_audit", by_trigger_send)
+
+
 def main() -> int:
     parser = cli.build_common_parser(
-        description="模块 6：定时任务采集",
+        description="模块 6：定时任务采集（含 trajectory 投递审计）",
     )
     args = parser.parse_args()
 
@@ -653,6 +775,7 @@ def main() -> int:
     section_jobs(out, jobs_file, state_file, runs_dir)
     section_heartbeat(out, args)
     section_system_crontab(out)
+    section_cron_trajectory(out, args.sessions_base)
 
     return out.done()
 

@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output
+from ocdiag import cli, output, trajectory
 from ocdiag.sensitive import is_sensitive_key, mask
 
 
@@ -129,7 +129,59 @@ def main() -> int:
         out.item(line)
     out.set_data("flattened", flat)
 
+    out.line("")
+    out.line("  ── Trajectory: 最近 run 的 effective runtime config ──")
+    out.line("")
+    section_trajectory_runtime_config(out, args.sessions_base)
+
     return out.done()
+
+
+def section_trajectory_runtime_config(out: output.Output, sessions_base: str) -> None:
+    """Show ``trace.metadata.config.runtime`` from the most recent trajectory.
+
+    Informational only — no verdict change. Tracks
+    ``skills.snapshotVersion`` over the last 50 runs to flag rapid churn.
+    """
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 effective runtime config")
+        return
+    runs = trajectory.collect_runs(files)
+    runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
+    if not runs:
+        out.item("最近无 trajectory run — 跳过")
+        return
+    latest = runs[0]
+    rt_cfg = latest.runtime_config or {}
+    out.item(f"最新 run（{latest.session_id[:8]}#{latest.run_id[:8]}）的 runtime config:")
+    if not rt_cfg:
+        out.item("  （trace.metadata.config.runtime 为空）")
+    else:
+        for k in sorted(rt_cfg.keys()):
+            v = rt_cfg[k]
+            sv = str(v)
+            if len(sv) > 200:
+                sv = sv[:200] + "..."
+            out.item(f"    {k} = {sv}")
+
+    snapshots: dict = {}
+    for r in runs[:50]:
+        sv = r.skills_snapshot_version
+        if sv is None:
+            continue
+        snapshots[sv] = snapshots.get(sv, 0) + 1
+    if len(snapshots) > 1:
+        out.item(f"  skills.snapshotVersion 漂移（最近 50 run 中 {len(snapshots)} 个不同版本）:")
+        for sv, cnt in sorted(snapshots.items(), key=lambda x: -x[1])[:5]:
+            out.item(f"    {sv}: {cnt} 个 run")
+    elif snapshots:
+        sv = next(iter(snapshots))
+        out.item(f"  skills.snapshotVersion: {sv}（最近 50 run 一致）")
+
+    out.set_data("trajectory_runtime_config", rt_cfg)
+    out.set_data("skills_snapshot_versions",
+                 [{"snapshotVersion": k, "count": v} for k, v in snapshots.items()])
 
 
 if __name__ == "__main__":

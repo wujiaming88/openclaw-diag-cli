@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output
+from ocdiag import cli, output, trajectory
 from ocdiag.jsonlog import parse_name
 from ocdiag.sensitive import sanitize_text
 from ocdiag.timeutil import fmt_hms
@@ -559,8 +559,131 @@ def main() -> int:
     section_hooks(out, scan)
     section_channels(out, scan)
     section_deps(out, args.config, unmask=args.unmask)
+    section_trajectory_plugins(out, args.sessions_base, configured)
 
     return out.done()
+
+
+def section_trajectory_plugins(
+    out: output.Output, sessions_base: str, configured: dict,
+) -> None:
+    """Trajectory-derived plugin snapshot + drift detection.
+
+    Source events: ``trace.metadata.plugins.entries`` and
+    ``trace.metadata.plugins.importedRuntimePluginIds`` from the most-recent
+    10 runs across all trajectory files.
+    """
+    out.subsection("9.6 Trajectory: 插件状态快照 + 漂移检测")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 trajectory 插件分析")
+        out.set_data("trajectory_plugins", {"found": False})
+        return
+    runs = trajectory.collect_runs(files)
+    runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
+    recent = [r for r in runs[:30] if r.plugin_entries]
+    if not recent:
+        out.item("最近 trajectory 中无 plugin metadata（trigger 都用了 ext-only?）")
+        out.set_data("trajectory_plugins", {"found": True, "samples": 0})
+        return
+
+    latest = recent[0]
+    last_plugins = latest.plugin_entries
+    # Real plugin errors = activated=True but `error` field still set. The
+    # `error` field doubles as activation-reason for *disabled* plugins
+    # ("not in allowlist", "bundled (disabled by default)"); those are
+    # informational, not failures. Only count real activation-time errors.
+    plugin_errors_now = [
+        p for p in last_plugins
+        if p.get("error") and p.get("activated")
+    ]
+    plugin_disabled_with_reason = [
+        p for p in last_plugins
+        if p.get("error") and not p.get("activated")
+    ]
+    out.item(f"最新 run 的插件状态（{latest.session_id[:8]}#{latest.run_id[:8]}）")
+    out.item(f"  共 {len(last_plugins)} 个插件 entries | "
+             f"importedRuntimePluginIds={len(latest.imported_runtime_plugin_ids)}")
+    if plugin_errors_now:
+        out.item(f"FATAL: 最新 run 中有 {len(plugin_errors_now)} 个插件 activated 但 error 非空:")
+        for p in plugin_errors_now[:10]:
+            err = p.get("error")
+            out.item(f"    {p['id']}: error={err} "
+                     f"(source={p.get('activationSource')})")
+    else:
+        out.item("  最新 run: 0 个 activated 插件出错")
+    if plugin_disabled_with_reason:
+        out.item(f"  禁用插件（含 activationReason）: {len(plugin_disabled_with_reason)} 个 "
+                 f"({', '.join(p['id'] for p in plugin_disabled_with_reason[:6])})")
+
+    # Drift detection: compare config (configured) with latest plugin state.
+    drift_disabled_active = []   # configured=enabled but trajectory shows disabled
+    drift_active_disabled = []   # trajectory shows enabled but config=disabled
+    for p in last_plugins:
+        pid = p.get("id")
+        if not pid:
+            continue
+        cfg_enabled = configured.get(pid)
+        is_active = p.get("activated")
+        if cfg_enabled is True and not is_active:
+            drift_disabled_active.append(p)
+        elif cfg_enabled is False and is_active:
+            drift_active_disabled.append(p)
+
+    if drift_disabled_active or drift_active_disabled:
+        out.item(f"警告：插件配置 vs trajectory 漂移: "
+                 f"{len(drift_disabled_active)+len(drift_active_disabled)} 项")
+        for p in drift_disabled_active[:5]:
+            out.item(f"    {p.get('id')}: config 启用但 trajectory activated=false "
+                     f"(reason={p.get('activationReason') or '?'})")
+        for p in drift_active_disabled[:5]:
+            out.item(f"    {p.get('id')}: config 禁用但 trajectory activated=true")
+    else:
+        out.item("  config vs trajectory 漂移: 无")
+
+    # Imported but not in entries (loaded into runtime but never exposed).
+    entry_ids = {p.get("id") for p in last_plugins}
+    imported_unused = [
+        pid for pid in latest.imported_runtime_plugin_ids
+        if pid and pid not in entry_ids
+    ]
+    if len(imported_unused) > 5:
+        out.item(f"警告：imported 但未出现在 entries 的插件: {len(imported_unused)} 个")
+    elif imported_unused:
+        out.item(f"  imported 但未在 entries 中: {len(imported_unused)} 个 "
+                 f"({', '.join(imported_unused[:5])})")
+    else:
+        out.item("  imported_runtime_plugin_ids: 全部在 entries 中")
+
+    out.set_data("trajectory_plugins", {
+        "found": True,
+        "samples": len(recent),
+        "latest_run": {
+            "sessionId": latest.session_id,
+            "runId": latest.run_id,
+            "ts_ms": latest.started_ts_ms,
+        },
+        "plugin_count_latest": len(last_plugins),
+        "plugin_errors_recent": [
+            {
+                "id": p.get("id"),
+                "error": p.get("error"),
+                "activated": p.get("activated"),
+                "activationReason": p.get("activationReason"),
+            }
+            for p in plugin_errors_now
+        ],
+        "plugin_drift": {
+            "config_enabled_runtime_disabled": [
+                {"id": p.get("id"), "reason": p.get("activationReason")}
+                for p in drift_disabled_active
+            ],
+            "config_disabled_runtime_active": [
+                {"id": p.get("id")} for p in drift_active_disabled
+            ],
+        },
+        "imported_unused": imported_unused,
+    })
 
 
 if __name__ == "__main__":

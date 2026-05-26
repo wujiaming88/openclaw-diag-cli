@@ -16,7 +16,7 @@ from typing import List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output, recent_logs
+from ocdiag import cli, output, recent_logs, trajectory
 
 
 _ERR_RE = re.compile(r'"logLevelName"\s*:\s*"(ERROR|FATAL)"')
@@ -238,7 +238,7 @@ def main() -> int:
         out.item("Journalctl ERROR: 0 条 — 系统级进程错误")
         out.set_data("journalctl_errors", 0)
 
-    out.progress(3, 3, "Session 错误")
+    out.progress(3, 4, "Session 错误")
     recent_session = find_recent_session(args.sessions_base)
     if recent_session:
         counts = tool_errors_from_session(recent_session)
@@ -252,7 +252,164 @@ def main() -> int:
     else:
         out.item("未找到 Session 文件，跳过工具调用检查")
 
+    out.progress(4, 4, "Trajectory 错误信号 (7d)")
+    trajectory_error_dimension(out, args.sessions_base)
+
     return out.done()
+
+
+def trajectory_error_dimension(out: output.Output, sessions_base: str) -> None:
+    """Surface run-level error signal from trajectory data (7d window).
+
+    Source events: ``trace.artifacts`` (abort flags, promptErrorSource,
+    finalStatus, itemLifecycle, toolMetas, compactionCount). Different
+    audience from session-jsonl based collectors: this is run-level (one
+    record per agent invocation) rather than message-level.
+    """
+    out.line("")
+    out.line("  ── Trajectory: 7d 内的 Run 错误信号 ──")
+    out.line("")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 run 错误信号")
+        out.set_data("trajectory_errors", {"found": False})
+        return
+
+    runs = trajectory.collect_runs(
+        files, since_ms=trajectory.ms_ago(7 * 86400 * 1000),
+    )
+    runs_24h = [
+        r for r in runs
+        if r.started_ts_ms and r.started_ts_ms >= trajectory.ms_ago(86400 * 1000)
+    ]
+    if not runs:
+        out.item("最近 7d 无 trajectory run")
+        out.set_data("trajectory_errors", {"found": True, "runs_7d": 0})
+        return
+
+    abort_breakdown = {
+        "aborted": 0, "externalAbort": 0, "timedOut": 0,
+        "idleTimedOut": 0, "timedOutDuringCompaction": 0,
+        "timedOutDuringToolExecution": 0,
+    }
+    abort_breakdown_24h = {k: 0 for k in abort_breakdown}
+    pes_dist = {}
+    leak_runs = []
+    error_runs = []
+    compaction_runs_24h = 0
+    for r in runs:
+        flags = (
+            ("aborted", r.aborted),
+            ("externalAbort", r.external_abort),
+            ("timedOut", r.timed_out),
+            ("idleTimedOut", r.idle_timed_out),
+            ("timedOutDuringCompaction", r.timed_out_during_compaction),
+            ("timedOutDuringToolExecution", r.timed_out_during_tool_execution),
+        )
+        is_24h = (r.started_ts_ms and
+                  r.started_ts_ms >= trajectory.ms_ago(86400 * 1000))
+        for name, val in flags:
+            if val:
+                abort_breakdown[name] += 1
+                if is_24h:
+                    abort_breakdown_24h[name] += 1
+        if r.prompt_error_source:
+            pes_dist[r.prompt_error_source] = pes_dist.get(r.prompt_error_source, 0) + 1
+        if r.active_count > 0:
+            leak_runs.append(r)
+        if r.final_status == "error":
+            error_runs.append(r)
+        if is_24h and r.compaction_count > 0:
+            compaction_runs_24h += 1
+
+    abort_total_24h = sum(abort_breakdown_24h.values())
+    leak_count = len(leak_runs)
+
+    out.item(f"窗口: 最近 7 天，共 {len(runs)} 个 run（24h 内 {len(runs_24h)} 个）")
+    nonzero_aborts = {k: v for k, v in abort_breakdown.items() if v}
+    if nonzero_aborts:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(nonzero_aborts.items(),
+                                                       key=lambda x: -x[1]))
+        if abort_total_24h > 10:
+            out.item(f"FATAL: 24h abort/timeout 事件: {abort_total_24h} 次（>10 阈值）")
+        elif abort_total_24h > 0:
+            out.item(f"警告：24h abort/timeout 事件: {abort_total_24h} 次")
+        else:
+            out.item(f"24h abort/timeout: 0 条")
+        out.item(f"  abort 分类（7d）: {parts}")
+    else:
+        out.item("abort/timeout: 0 条 — 7d 内无 abort 事件")
+
+    if pes_dist:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(pes_dist.items(),
+                                                       key=lambda x: -x[1]))
+        out.item(f"  promptErrorSource: {parts}")
+
+    if leak_count:
+        out.item(f"FATAL: 工具调用泄漏 (active_count>0): {leak_count} 个 run（7d）")
+        for r in sorted(leak_runs,
+                        key=lambda x: x.started_ts_ms, reverse=True)[:3]:
+            tn = ",".join(m.get("toolName", "?") for m in r.tool_metas[:6])
+            out.item(f"    {r.session_id[:8]}#{r.run_id[:8]} trigger={r.trigger} "
+                     f"active={r.active_count} status={r.final_status} tools=[{tn}]")
+    else:
+        out.item("工具调用泄漏: 0 — active_count 无残留")
+
+    failing_tools = {}
+    for r in error_runs:
+        for m in r.tool_metas:
+            tn = m.get("toolName")
+            if tn:
+                failing_tools[tn] = failing_tools.get(tn, 0) + 1
+    if failing_tools:
+        ranked = sorted(failing_tools.items(), key=lambda x: -x[1])[:10]
+        parts = ", ".join(f"{n}:{c}" for n, c in ranked)
+        out.item(f"  最常失败工具（7d, error final_status）: {parts}")
+
+    # Recent abort/error samples
+    samples = [r for r in runs if (
+        r.aborted or r.external_abort or r.timed_out
+        or r.idle_timed_out or r.final_status == "error"
+    )]
+    samples.sort(key=lambda x: x.started_ts_ms, reverse=True)
+    sample_payload = []
+    for r in samples[:5]:
+        causes = []
+        if r.aborted: causes.append("aborted")
+        if r.external_abort: causes.append("externalAbort")
+        if r.timed_out: causes.append("timedOut")
+        if r.idle_timed_out: causes.append("idleTimedOut")
+        if r.timed_out_during_compaction: causes.append("timedOutDuringCompaction")
+        if r.timed_out_during_tool_execution: causes.append("timedOutDuringToolExecution")
+        if r.final_status == "error" and not causes:
+            causes = ["final_status=error"]
+        out.item(f"    {r.session_id[:8]}#{r.run_id[:8]} trigger={r.trigger} "
+                 f"causes=[{','.join(causes)}]")
+        sample_payload.append({
+            "sessionId": r.session_id, "runId": r.run_id,
+            "trigger": r.trigger, "causes": causes,
+            "started_ts_ms": r.started_ts_ms,
+        })
+
+    compaction_rate_24h = (compaction_runs_24h / len(runs_24h) * 100) if runs_24h else 0.0
+    if len(runs_24h) >= 5 and compaction_rate_24h > 20:
+        out.item(f"警告：24h compaction 率偏高: {compaction_rate_24h:.1f}% "
+                 f"({compaction_runs_24h}/{len(runs_24h)})")
+
+    out.set_data("trajectory_errors", {
+        "found": True,
+        "runs_7d": len(runs),
+        "runs_24h": len(runs_24h),
+        "abort_breakdown_7d": abort_breakdown,
+        "abort_breakdown_24h": abort_breakdown_24h,
+        "abort_total_24h": abort_total_24h,
+        "prompt_error_sources": pes_dist,
+        "tool_leak_count": leak_count,
+        "top_failing_tools": dict(sorted(failing_tools.items(),
+                                         key=lambda x: -x[1])[:10]),
+        "compaction_rate_24h_pct": round(compaction_rate_24h, 2),
+        "recent_error_samples": sample_payload,
+    })
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -14,7 +15,7 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output, paths
+from ocdiag import cli, output, paths, trajectory
 from ocdiag.sensitive import safe_val, sanitize_text
 
 
@@ -316,7 +317,78 @@ def main() -> int:
         except OSError as e:
             out.item(f"读取失败: {e}")
 
+    out.line("")
+    out.line("  ── Trajectory: 历史版本/Node 漂移（14d） ──")
+    out.line("")
+    section_trajectory_versions(out, args.sessions_base)
+
     return out.done()
+
+
+def section_trajectory_versions(out: output.Output, sessions_base: str) -> None:
+    """Surface harness/node-version drift across the last 14 days of runs.
+
+    Source events: ``trace.metadata.harness.version`` /
+    ``trace.metadata.harness.runtime.node`` / ``trace.metadata.harness.invocation``.
+    """
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过版本漂移分析")
+        out.set_data("version_history", [])
+        return
+    runs = trajectory.collect_runs(
+        files, since_ms=trajectory.ms_ago(14 * 86400 * 1000),
+    )
+    if not runs:
+        out.item("最近 14d 无 trajectory run")
+        return
+
+    version_seen: dict = {}   # harness.version -> [count, last_ts_ms]
+    node_seen: dict = {}
+    invocation_seen: set = set()
+    for r in runs:
+        v = r.harness_version or "?"
+        s = version_seen.setdefault(v, [0, 0])
+        s[0] += 1
+        if r.started_ts_ms > s[1]:
+            s[1] = r.started_ts_ms
+        n = r.harness_node or "?"
+        ns = node_seen.setdefault(n, [0, 0])
+        ns[0] += 1
+        if r.started_ts_ms > ns[1]:
+            ns[1] = r.started_ts_ms
+        if r.invocation:
+            invocation_seen.add(tuple(r.invocation))
+
+    out.item(f"OpenClaw harness.version (14d, {len(runs)} run):")
+    for ver, (cnt, ts) in sorted(version_seen.items(), key=lambda x: -x[1][0]):
+        ts_str = ""
+        if ts:
+            ts_str = f" 最后出现 {datetime.datetime.fromtimestamp(ts/1000).strftime('%Y-%m-%d %H:%M')}"
+        out.item(f"    {ver}: {cnt} 个 run{ts_str}")
+    if len(version_seen) > 1:
+        out.item(f"警告：14d 内出现 {len(version_seen)} 个不同 OpenClaw 版本（升级或回滚）")
+
+    out.item("Node runtime 版本:")
+    for ver, (cnt, _) in sorted(node_seen.items(), key=lambda x: -x[1][0]):
+        out.item(f"    {ver}: {cnt} 个 run")
+    if len(node_seen) > 1:
+        out.item(f"警告：14d 内出现 {len(node_seen)} 个不同 Node 版本")
+
+    if len(invocation_seen) > 1:
+        out.item(f"警告：14d 内出现 {len(invocation_seen)} 种不同的 invocation 参数")
+        for inv in list(invocation_seen)[:5]:
+            out.item(f"    {' '.join(inv)}")
+
+    out.set_data("version_history", [
+        {"version": v, "count": c, "last_ts_ms": t}
+        for v, (c, t) in sorted(version_seen.items(), key=lambda x: -x[1][0])
+    ])
+    out.set_data("node_version_history", [
+        {"node": n, "count": c, "last_ts_ms": t}
+        for n, (c, t) in sorted(node_seen.items(), key=lambda x: -x[1][0])
+    ])
+    out.set_data("invocation_variants", [list(inv) for inv in invocation_seen])
 
 
 if __name__ == "__main__":

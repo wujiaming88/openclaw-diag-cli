@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output, recent_logs
+from ocdiag import cli, output, recent_logs, trajectory
 from ocdiag.jsonlog import get_log_subsystem, parse_log_msg
 
 
@@ -673,7 +673,52 @@ def main() -> int:
         out.item("Channel WS: 未找到应用日志文件")
         out.item("Gateway 错误码: 未找到应用日志文件")
 
+    section_trajectory_run_frequency(out, args.sessions_base)
+
     return out.done()
+
+
+def section_trajectory_run_frequency(
+    out: output.Output, sessions_base: str,
+) -> None:
+    """24h run-frequency histogram + invocation extraction (informational).
+
+    Source events: ``session.started.ts`` and
+    ``trace.metadata.harness.invocation``.
+    """
+    out.line("")
+    out.line("  ── Trajectory: 24h Run 频率（每小时 run 数） ──")
+    out.line("")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 run 频率分析")
+        return
+    runs_24h = trajectory.collect_runs(
+        files, since_ms=trajectory.ms_ago(24 * 3600 * 1000),
+    )
+    if not runs_24h:
+        out.item("最近 24h 无 trajectory run")
+        return
+
+    histogram: dict = {}
+    for r in runs_24h:
+        if not r.started_ts_ms:
+            continue
+        # Bucket by hour of day (local time).
+        try:
+            t = datetime.fromtimestamp(r.started_ts_ms / 1000)
+            key = t.strftime("%Y-%m-%d %H")
+            histogram[key] = histogram.get(key, 0) + 1
+        except (ValueError, OSError):
+            continue
+    out.item(f"24h 内共 {len(runs_24h)} 个 run，分布在 {len(histogram)} 个小时桶")
+    for hour, cnt in sorted(histogram.items())[-12:]:
+        bar = "▇" * min(40, cnt)
+        out.item(f"    {hour}:00  {cnt:>3} {bar}")
+
+    out.set_data("trajectory_run_frequency_24h", [
+        {"hour": h, "count": c} for h, c in sorted(histogram.items())
+    ])
 
 
 if __name__ == "__main__":

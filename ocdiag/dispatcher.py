@@ -34,6 +34,7 @@ STATE_COLLECTORS = [
     ("sessions",       "Session 总览、活跃度、Stuck 探测",                          "diag/08_sessions.py"),
     ("plugin_diag",    "插件状态一致性、ERROR/WARN、Hook、Channel、外部 DNS",       "diag/09_plugin_diag.py"),
     ("shell_history",  "Shell 历史中的高危命令与最近操作",                          "diag/10_shell_history.py"),
+    ("run_health",     "Run 健康度（trajectory: 24h/7d/30d 多窗口）",               "diag/11_run_health.py"),
 ]
 
 # Object inspectors: take a session uuid (or other identifier) and inspect it.

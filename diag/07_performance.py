@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output
+from ocdiag import cli, output, trajectory
 from ocdiag.timeutil import parse_msg_ts, parse_obj_ts
 from ocdiag.tokens import fmt_tokens, pct
 
@@ -742,9 +742,191 @@ def render(out: output.Output, data, file_count):
     out.set_data("session_top5", session_top_payload)
 
 
+def render_trajectory_perf(out: output.Output, sessions_base: str) -> None:
+    """Trajectory-derived perf signal (last 100 runs).
+
+    Source events:
+      - trace.artifacts.usage / promptCache.observation.broke / compactionCount
+      - session.started / session.ended (wall duration per trigger)
+
+    Cache health = % of recent runs with cache_broke=True. Compaction rate
+    = % with compactionCount>0. Per-trigger latency P50/P95 splits user vs
+    cron vs heartbeat (the three load profiles differ wildly in practice).
+    """
+    out.subsection("Trajectory: Cache 健康 + Compaction（最近 100 run）")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 cache/compaction 分析")
+        out.set_data("trajectory_cache_health", {"found": False})
+        return
+    runs = trajectory.collect_runs(files)
+    runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
+    recent = runs[:100]
+    if not recent:
+        out.item("（无 run 数据）")
+        return
+
+    broke_known = [r for r in recent if r.cache_broke is not None]
+    broke = sum(1 for r in broke_known if r.cache_broke)
+    broke_pct = (broke / len(broke_known) * 100) if broke_known else 0.0
+
+    cache_total = sum(r.usage_total for r in recent)
+    cache_read = sum(r.usage_cache_read for r in recent)
+    ratio = (cache_read / cache_total * 100) if cache_total else 0.0
+
+    compaction_runs = [r for r in recent if r.compaction_count > 0]
+    compaction_max = max((r.compaction_count for r in recent), default=0)
+    compaction_rate = (len(compaction_runs) / len(recent) * 100) if recent else 0.0
+
+    out.item(f"样本: 最近 {len(recent)} 个 run")
+    out.item(f"  cache_broke=true: {broke}/{len(broke_known)} ({broke_pct:.1f}%)")
+    if cache_total:
+        out.item(f"  cacheRead/total: {ratio:.1f}% "
+                 f"({fmt_tokens(cache_read)}/{fmt_tokens(cache_total)})")
+    out.item(f"  compaction 触发: {len(compaction_runs)} 个 run "
+             f"({compaction_rate:.1f}%) | max compactionCount={compaction_max}")
+    if ratio > 0 and ratio < 30:
+        out.item(f"警告：cache 命中率偏低 ({ratio:.1f}% < 30%)")
+    if compaction_rate > 20:
+        out.item(f"警告：compaction 率偏高 ({compaction_rate:.1f}% > 20%)")
+
+    # Per-trigger wall latency (session.started → session.ended).
+    by_trig: dict = {}
+    for r in recent:
+        d = r.duration_ms
+        if d is None or d < 0:
+            continue
+        by_trig.setdefault(r.trigger, []).append(d / 1000.0)
+    latency_payload: dict = {}
+    if by_trig:
+        out.item("  per-trigger wall 耗时:")
+        for trig in sorted(by_trig.keys()):
+            durs = sorted(by_trig[trig])
+            p50 = durs[len(durs) // 2]
+            p95 = durs[int(0.95 * (len(durs) - 1))]
+            mx = durs[-1]
+            avg = sum(durs) / len(durs)
+            out.item(f"    {trig}: n={len(durs)} avg={avg:.1f}s "
+                     f"P50={p50:.1f}s P95={p95:.1f}s Max={mx:.1f}s")
+            latency_payload[trig] = {
+                "count": len(durs),
+                "avg_s": round(avg, 3),
+                "p50_s": round(p50, 3),
+                "p95_s": round(p95, 3),
+                "max_s": round(mx, 3),
+            }
+
+    out.set_data("trajectory_cache_health", {
+        "found": True,
+        "samples": len(recent),
+        "cache_broke_pct": round(broke_pct, 2),
+        "cache_broke_count": broke,
+        "cache_read_total_ratio_pct": round(ratio, 2),
+        "compaction_rate_pct": round(compaction_rate, 2),
+        "compaction_runs": len(compaction_runs),
+        "compaction_max": compaction_max,
+        "per_trigger_latency": latency_payload,
+    })
+
+
+def render_prompt_budget(out: output.Output, sessions_base: str) -> None:
+    """Absorbed `prompt_budget` analyzer (Decision #2).
+
+    Source events: ``trace.metadata.prompting.systemPromptReport`` (chars,
+    skills.entries[].blockChars, tools.entries[].schemaChars,
+    bootstrapTruncation, injectedWorkspaceFiles).
+    """
+    out.subsection("System Prompt 预算（来源: trace.metadata.prompting）")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现 trajectory 文件 — 跳过 prompt budget")
+        out.set_data("trajectory_prompt_budget", {"found": False})
+        return
+    runs = trajectory.collect_runs(files)
+    runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
+    sample = [r for r in runs[:50] if r.system_prompt_chars > 0]
+    if not sample:
+        out.item("（最近 50 run 无 systemPromptReport 数据）")
+        return
+
+    avg_total = sum(r.system_prompt_chars for r in sample) / len(sample)
+    avg_proj = sum(r.system_prompt_project_chars for r in sample) / len(sample)
+    avg_nonproj = sum(r.system_prompt_non_project_chars for r in sample) / len(sample)
+    avg_skills = sum(r.skills_prompt_chars for r in sample) / len(sample)
+    avg_tools = sum(r.tools_schema_chars for r in sample) / len(sample)
+    truncation_runs = [r for r in sample if r.bootstrap_truncated_files > 0]
+
+    # Aggregate top skills/tools — take latest run as the canonical snapshot.
+    latest = sample[0]
+    top_skills = latest.skills_top_entries[:10]
+    top_tools = latest.tools_top_entries[:10]
+
+    out.item(f"样本: 最近 {len(sample)} 个 run（含 systemPromptReport）")
+    out.item(f"  avg systemPrompt chars: {int(avg_total):,}")
+    out.item(f"    project={int(avg_proj):,} | non-project={int(avg_nonproj):,}")
+    out.item(f"  avg skills.promptChars: {int(avg_skills):,}")
+    out.item(f"  avg tools.schemaChars:  {int(avg_tools):,}")
+
+    # Verdict thresholds (from plan):
+    skill_warn = [s for s in top_skills if s["blockChars"] > 5000]
+    skill_fail = [s for s in top_skills if s["blockChars"] > 10000]
+    tool_warn = [t for t in top_tools if t["schemaChars"] > 8000]
+    tool_fail = [t for t in top_tools if t["schemaChars"] > 15000]
+
+    if top_skills:
+        out.item("  Top skills (blockChars):")
+        for s in top_skills:
+            tag = ""
+            if s["blockChars"] > 10000:
+                tag = "  FATAL: 超 10000 字符"
+            elif s["blockChars"] > 5000:
+                tag = "  警告：超 5000 字符"
+            out.item(f"    {s['name']}: {s['blockChars']:,} chars{tag}")
+    if top_tools:
+        out.item("  Top tools (schemaChars):")
+        for t in top_tools:
+            tag = ""
+            if t["schemaChars"] > 15000:
+                tag = "  FATAL: 超 15000 字符"
+            elif t["schemaChars"] > 8000:
+                tag = "  警告：超 8000 字符"
+            out.item(f"    {t['name']}: {t['schemaChars']:,} chars "
+                     f"(properties={t['propertiesCount']}){tag}")
+    if latest.injected_workspace_files:
+        out.item(f"  注入的工作区文件 (最近 run, {len(latest.injected_workspace_files)} 个):")
+        for f in latest.injected_workspace_files[:8]:
+            tag = " [TRUNCATED]" if f.get("truncated") else ""
+            tag_miss = " [MISSING]" if f.get("missing") else ""
+            out.item(f"    {f['name']}: raw={f.get('rawChars'):,} "
+                     f"injected={f.get('injectedChars'):,}{tag}{tag_miss}")
+
+    if truncation_runs:
+        out.item(f"警告：bootstrap 被截断的 run: {len(truncation_runs)} 个 / {len(sample)}")
+    else:
+        out.item("  bootstrap 截断: 0 个 run（健康）")
+
+    out.set_data("trajectory_prompt_budget", {
+        "found": True,
+        "samples": len(sample),
+        "avg_chars": int(avg_total),
+        "avg_project_chars": int(avg_proj),
+        "avg_non_project_chars": int(avg_nonproj),
+        "avg_skills_prompt_chars": int(avg_skills),
+        "avg_tools_schema_chars": int(avg_tools),
+        "skills_top": top_skills,
+        "tools_top": top_tools,
+        "skill_over_5000_count": len(skill_warn),
+        "skill_over_10000_count": len(skill_fail),
+        "tool_over_8000_count": len(tool_warn),
+        "tool_over_15000_count": len(tool_fail),
+        "bootstrap_truncated_runs": len(truncation_runs),
+        "injected_workspace_files_latest": latest.injected_workspace_files,
+    })
+
+
 def main() -> int:
     parser = cli.build_common_parser(
-        description="模块 7：模型与性能数据",
+        description="模块 7：模型与性能数据（含 trajectory cache + prompt budget）",
     )
     args = parser.parse_args()
     out = output.init("performance", json_mode=args.json, no_color=args.no_color)
@@ -753,11 +935,16 @@ def main() -> int:
     session_files = collect_session_files(args.sessions_base, limit=20)
     if not session_files:
         out.item("未找到 Session 文件")
+        # Still try trajectory — it's an independent data source.
+        render_trajectory_perf(out, args.sessions_base)
+        render_prompt_budget(out, args.sessions_base)
         return out.done()
 
     out.progress(1, 6, "Session 扫描")
     data = analyze_sessions(session_files)
     render(out, data, len(session_files))
+    render_trajectory_perf(out, args.sessions_base)
+    render_prompt_budget(out, args.sessions_base)
     return out.done()
 
 

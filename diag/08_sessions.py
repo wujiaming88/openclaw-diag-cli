@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from ocdiag import cli, output
+from ocdiag import cli, output, trajectory
 from ocdiag.timeutil import fmt_duration, parse_msg_ts, parse_obj_ts
 from ocdiag.tokens import fmt_tokens, human_size, pct
 
@@ -451,9 +451,131 @@ def stuck_dimension(out: output.Output, log_dir: str) -> None:
     out.set_data("stuck_sessions", stuck_payload)
 
 
+def trajectory_dimension(out: output.Output, sessions_base: str) -> None:
+    """Trajectory-derived run health (v0.6.0).
+
+    Aggregates run-level signal — trigger distribution, incomplete-run rate,
+    tool-call leaks, per-trajectory run density — across every trajectory
+    file under ``sessions_base``. Source events: session.started (trigger),
+    trace.artifacts (itemLifecycle, finalStatus). Streams via
+    ``ocdiag.trajectory`` so file size / count is bounded by stdlib JSONL.
+    """
+    out.line("")
+    out.line("  ── Trajectory: Run 健康度（数据来源 *.trajectory.jsonl） ──")
+    out.line("")
+    files = trajectory.discover_trajectory_files(sessions_base)
+    if not files:
+        out.item("未发现任何 trajectory 文件 — OpenClaw 2026.5.x 之前版本不会生成")
+        out.set_data("trajectory", {"found": False, "checked": sessions_base})
+        return
+
+    summaries = trajectory.collect_summaries(files)
+    runs_total = sum(s["total_runs"] for s in summaries)
+    incomplete_total = sum(s["incomplete_runs"] for s in summaries)
+    largest_bytes = max((s["size_bytes"] for s in summaries), default=0)
+    largest_mb = largest_bytes / (1024 * 1024)
+    triggers: dict = {}
+    statuses: dict = {}
+    aborts: dict = {}
+    for s in summaries:
+        for k, v in s["by_trigger"].items():
+            triggers[k] = triggers.get(k, 0) + v
+        for k, v in s["by_final_status"].items():
+            statuses[k] = statuses.get(k, 0) + v
+        for k, v in s["by_abort_flag"].items():
+            aborts[k] = aborts.get(k, 0) + v
+
+    if runs_total == 0:
+        out.item(f"扫描了 {len(files)} 个 trajectory 文件，但未发现任何 run 数据")
+        out.set_data("trajectory", {
+            "found": True, "files": len(files), "runs_total": 0,
+        })
+        return
+
+    out.item(f"trajectory 文件: {len(files)} 个 | run 总数: {runs_total} | "
+             f"最大单文件: {largest_mb:.1f}MB")
+    if triggers:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(triggers.items(),
+                                                       key=lambda x: -x[1]))
+        out.item(f"  by trigger: {parts}")
+    if statuses:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(statuses.items(),
+                                                       key=lambda x: -x[1]))
+        out.item(f"  by final_status: {parts}")
+    incomplete_pct = (incomplete_total / runs_total * 100) if runs_total else 0.0
+    if incomplete_pct > 5:
+        out.item(f"  警告：incomplete-run 比例: {incomplete_pct:.1f}% "
+                 f"({incomplete_total}/{runs_total}) — 比例偏高，可能存在 crash/kill")
+    else:
+        out.item(f"  incomplete-run 比例: {incomplete_pct:.1f}% ({incomplete_total}/{runs_total})")
+    if largest_mb > 50:
+        out.item(f"  警告：单文件最大 {largest_mb:.1f}MB（>50MB 阈值）— 长会话过载")
+
+    nonzero_aborts = {k: v for k, v in aborts.items() if v}
+    if nonzero_aborts:
+        parts = ", ".join(f"{k}={v}" for k, v in sorted(nonzero_aborts.items(),
+                                                       key=lambda x: -x[1]))
+        out.item(f"  abort flags: {parts}")
+
+    # Find tool-call leaks (active_count > 0). Walk full Run dataclass for
+    # the leaks alone — for large datasets we'd want to filter inside
+    # collect_summaries, but the leak count is already in summary.
+    leak_total = sum(s["active_leak_runs"] for s in summaries)
+    out.set_data("trajectory", {
+        "found": True,
+        "files": len(files),
+        "runs_total": runs_total,
+        "runs_by_trigger": triggers,
+        "runs_by_final_status": statuses,
+        "abort_breakdown": nonzero_aborts,
+        "incomplete_runs": incomplete_total,
+        "incomplete_pct": round(incomplete_pct, 2),
+        "largest_trajectory_mb": round(largest_mb, 2),
+        "runs_with_active_leaks": leak_total,
+    })
+
+    if leak_total == 0:
+        out.item("  active_count 工具调用泄漏: 0")
+        return
+
+    # Re-scan only the files known to contain leaks (typically very few) to
+    # surface up to 5 sample runs.
+    leak_files = [s["path"] for s in summaries if s["active_leak_runs"] > 0]
+    leak_samples = []
+    for path in leak_files:
+        for run in trajectory.iter_runs(path):
+            if run.active_count > 0:
+                leak_samples.append(run)
+    leak_samples.sort(key=lambda r: r.started_ts_ms, reverse=True)
+    silent_leak_with_success = sum(
+        1 for r in leak_samples
+        if r.final_status == "success" and r.active_count > 0
+    )
+    if silent_leak_with_success:
+        out.item(f"  FATAL: 工具调用泄漏（active_count>0 且 final_status=success）: "
+                 f"{silent_leak_with_success} 个")
+    else:
+        out.item(f"  警告：工具调用泄漏 (active_count>0): {leak_total} 个 run")
+    sample_payload = []
+    for r in leak_samples[:5]:
+        tool_names = ",".join(m.get("toolName", "?") for m in r.tool_metas[:6])
+        out.item(f"    {r.session_id[:8]}#{r.run_id[:8]} trigger={r.trigger} "
+                 f"active={r.active_count} status={r.final_status} tools=[{tool_names}]")
+        sample_payload.append({
+            "sessionId": r.session_id,
+            "runId": r.run_id,
+            "trigger": r.trigger,
+            "active": r.active_count,
+            "started_ts_ms": r.started_ts_ms,
+            "final_status": r.final_status,
+            "tool_names": [m.get("toolName") for m in r.tool_metas],
+        })
+    out.set_data("trajectory_top_leak_runs", sample_payload)
+
+
 def main() -> int:
     parser = cli.build_common_parser(
-        description="模块 8：Session 数据采集 + Stuck 探测",
+        description="模块 8：Session 数据采集 + Stuck 探测 + Trajectory run 健康度",
     )
     args = parser.parse_args()
     out = output.init("sessions", json_mode=args.json, no_color=args.no_color)
@@ -461,6 +583,7 @@ def main() -> int:
 
     session_data_dimension(out, args.sessions_base)
     stuck_dimension(out, args.log_dir)
+    trajectory_dimension(out, args.sessions_base)
 
     return out.done()
 

@@ -15,6 +15,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from .. import sessions
 from ..core.context import DiagContext
+from ..core.errors import DiagError
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 from ..extracting import (
@@ -101,12 +102,22 @@ class ExtractInspector:
         session_id: Optional[str] = kwargs.get("session_id")
         if not session_id:
             report.error = "missing session_id"
+            report.diag_error = DiagError(
+                code="MISSING_ARGUMENT",
+                message="missing session_id",
+                hint="usage: openclaw-diag extract <session-uuid>",
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
         ok, msg = sessions.is_valid_query(session_id)
         if not ok:
             report.error = msg
+            report.diag_error = DiagError(
+                code="INVALID_QUERY",
+                message=msg,
+                details={"query": session_id},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
@@ -136,12 +147,25 @@ class ExtractInspector:
                 f"前缀 '{session_id}' 匹配多个 session: "
                 + ", ".join(candidates)
             )
+            report.diag_error = DiagError(
+                code="AMBIGUOUS_SESSION",
+                message=report.error,
+                hint="provide a longer prefix or the full uuid",
+                details={"query": session_id, "matches": candidates},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
         if not files:
             recent = sessions.recent_session_ids(str(ctx.sessions_base), limit=5)
+            hint_msg = f"recent sessions: {', '.join(recent)}" if recent else None
             hint = f"; recent: {', '.join(recent)}" if recent else ""
             report.error = f"找不到 session '{session_id}'{hint}"
+            report.diag_error = DiagError(
+                code="SESSION_NOT_FOUND",
+                message=f"找不到 session '{session_id}'",
+                hint=hint_msg,
+                details={"query": session_id},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
@@ -182,6 +206,11 @@ class ExtractInspector:
 
         if not selected:
             report.error = "no extractable files (only lock entries present)"
+            report.diag_error = DiagError(
+                code="FILE_READ_ERROR",
+                message=report.error,
+                details={"query": session_id},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.1.0 — format modes, structured errors, skill auto-install (2026-06-02)
+
+### Added
+- `--format pretty|json|ndjson` flag (TTY-friendly default, `ndjson` for streaming pipelines).
+- JSON envelope: `{ok, data:{module, verdict, summary, sections, ...}, error}`.
+- Structured `DiagError` payload: `{code, message, retryable, hint, details}`.
+- Exit codes: `0` ok, `1` warn/fail, `2` input error, `3` runtime error.
+- `examples` subcommand and per-subcommand help epilogs.
+- `skill/SKILL.md` (skill-creator standard).
+- `skill/install.py` auto-deploys to OpenClaw / Claude Code / Codex / Cursor.
+- `openclaw-diag skill-install` subcommand and npm `postinstall` hook.
+
+### Changed
+- `--json` is now an alias for `--format json` (backward compatible).
+- Inspectors (`trace`, `extract`) emit structured `DiagError` codes
+  (`SESSION_NOT_FOUND`, `AMBIGUOUS_SESSION`, `INVALID_QUERY`, …).
+
 ## v0.6.1 — stuck-run tool name fallback (2026-05-26)
 
 ### Fixed

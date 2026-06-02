@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from .. import sessions, trajectory as traj_mod
 from ..core.context import DiagContext
+from ..core.errors import DiagError
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 
@@ -382,12 +383,22 @@ class TraceInspector:
         session_id: Optional[str] = kwargs.get("session_id")
         if not session_id:
             report.error = "missing session_id"
+            report.diag_error = DiagError(
+                code="MISSING_ARGUMENT",
+                message="missing session_id",
+                hint="usage: openclaw-diag trace <session-uuid>",
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
         ok, msg = sessions.is_valid_query(session_id)
         if not ok:
             report.error = msg
+            report.diag_error = DiagError(
+                code="INVALID_QUERY",
+                message=msg,
+                details={"query": session_id},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
@@ -402,12 +413,26 @@ class TraceInspector:
                 f"前缀 '{session_id}' 匹配多个 session: "
                 + ", ".join(candidates)
             )
+            report.diag_error = DiagError(
+                code="AMBIGUOUS_SESSION",
+                message=report.error,
+                hint="provide a longer prefix or the full uuid",
+                details={"query": session_id, "matches": candidates},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
         if not files:
             recent = sessions.recent_session_ids(str(ctx.sessions_base), limit=5)
-            hint = f"; recent: {', '.join(recent)}" if recent else ""
-            report.error = f"找不到 session '{session_id}'{hint}"
+            hint_msg = f"recent sessions: {', '.join(recent)}" if recent else None
+            report.error = f"找不到 session '{session_id}'" + (
+                f"; recent: {', '.join(recent)}" if recent else ""
+            )
+            report.diag_error = DiagError(
+                code="SESSION_NOT_FOUND",
+                message=f"找不到 session '{session_id}'",
+                hint=hint_msg,
+                details={"query": session_id},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
@@ -419,12 +444,22 @@ class TraceInspector:
         records = load_records(session_file)
         if not records:
             report.error = f"session file is empty: {session_file}"
+            report.diag_error = DiagError(
+                code="FILE_READ_ERROR",
+                message=f"session file is empty: {session_file}",
+                details={"path": session_file},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
         user_msgs = find_user_messages(records) or find_first_message(records)
         if not user_msgs:
             report.error = "no message records in session"
+            report.diag_error = DiagError(
+                code="FILE_READ_ERROR",
+                message="no message records in session",
+                details={"path": session_file},
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 

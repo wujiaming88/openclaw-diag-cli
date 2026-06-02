@@ -87,10 +87,11 @@ def _run_collector_smoke(mid: str):
             report.verdict in (Verdict.OK, Verdict.WARN, Verdict.FAIL),
         )
         env = to_envelope(report)
-        _check(f"{mid}: envelope has module", env["module"] == mid)
+        _check(f"{mid}: envelope ok=True", env["ok"] is True)
+        _check(f"{mid}: envelope.data has module", env["data"]["module"] == mid)
         _check(
             f"{mid}: envelope summary keys",
-            set(env["summary"].keys()) == {"pass", "warn", "fail", "total"},
+            set(env["data"]["summary"].keys()) == {"pass", "warn", "fail", "total"},
         )
         json.dumps(env, ensure_ascii=False)  # must serialize cleanly
         _check(f"{mid}: envelope JSON-serializable", True)

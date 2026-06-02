@@ -1,16 +1,29 @@
 """Structured JSON renderer for v2 Reports.
 
-Envelope:
+Envelope (v1.1+):
     {
-      "module": "<id>",
-      "status": "ok" | "error",          # legacy 2-state
-      "verdict": "ok" | "warn" | "fail",  # new 3-state
-      "summary": {"pass": N, "warn": N, "fail": N, "total": N},
-      "elapsed_ms": int,
-      "sections": [...],
-      "data": {...},
-      "error": "..."  # only when present
+      "ok": bool,
+      "data": {
+        "module": "<id>",
+        "verdict": "ok" | "warn" | "fail",
+        "summary": {"pass": N, "warn": N, "fail": N, "total": N},
+        "elapsed_ms": int,
+        "sections": [...],
+        "data": {...},
+        "status": "ok" | "error"           # legacy 2-state, kept for compat
+      } | null,
+      "error": {
+        "code": "...",
+        "message": "...",
+        "retryable": bool,
+        "hint": "...",
+        "details": {...}
+      } | null
     }
+
+When ``report.error`` is set, ``data`` is null and ``error`` is populated.
+``error`` falls back to a generic ``RUNTIME_ERROR`` envelope when only the
+legacy string error is available (no structured ``DiagError``).
 """
 
 from __future__ import annotations
@@ -19,6 +32,7 @@ import json
 import sys
 from typing import Any, Dict, List, Optional, TextIO
 
+from ..core.errors import DiagError
 from ..core.types import Check, Report, Section, Verdict
 
 
@@ -45,27 +59,42 @@ def _section_to_dict(s: Section) -> Dict[str, Any]:
     }
 
 
+def _format_error(report: Report) -> Dict[str, Any]:
+    if report.diag_error is not None:
+        return report.diag_error.to_dict()
+    # Fall back to a generic RUNTIME_ERROR envelope.
+    return DiagError(
+        code="RUNTIME_ERROR",
+        message=report.error or "unknown error",
+        retryable=False,
+    ).to_dict()
+
+
 def to_envelope(report: Report) -> Dict[str, Any]:
+    if report.error:
+        return {
+            "ok": False,
+            "data": None,
+            "error": _format_error(report),
+        }
+
     verdict = report.verdict
     legacy_status = "error" if verdict == Verdict.FAIL else "ok"
-    payload: Dict[str, Any] = {
+    data: Dict[str, Any] = {
         "module": report.module_id,
-        "status": legacy_status,
         "verdict": verdict.value,
         "summary": report.summary,
         "elapsed_ms": int(report.elapsed_ms),
         "sections": [_section_to_dict(s) for s in report.sections],
         "data": report.data,
+        "status": legacy_status,
     }
-    if report.error:
-        payload["error"] = report.error
-    return payload
+    return {"ok": True, "data": data, "error": None}
 
 
 class JsonRenderer:
-    def __init__(self, stream: Optional[TextIO] = None, ndjson: bool = False):
+    def __init__(self, stream: Optional[TextIO] = None):
         self.stream = stream or sys.stdout
-        self.ndjson = ndjson
 
     def render(self, report: Report) -> str:
         return json.dumps(to_envelope(report), ensure_ascii=False)

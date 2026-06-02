@@ -151,7 +151,12 @@ def _stage_env(
 def _run_collector(
     module: str, env: Dict[str, str], timeout: float = 20.0,
 ) -> Tuple[int, Dict[str, Any], str]:
-    """Spawn the collector and parse its stdout JSON envelope."""
+    """Spawn the collector and parse its stdout JSON envelope.
+
+    Returns the unwrapped report dict (envelope's ``data`` field) so test
+    expressions like ``data.windows.24h…`` continue to work against the
+    v1.1+ ``{ok, data, error}`` envelope.
+    """
     cmd = [sys.executable, str(OCDIAG), module, "--json", "--no-color"]
     r = subprocess.run(
         cmd, env=env, capture_output=True, text=True, timeout=timeout,
@@ -161,12 +166,19 @@ def _run_collector(
         raise RuntimeError(
             f"empty stdout (rc={r.returncode}, stderr: {r.stderr[:300]!r})"
         )
-    # Single-module invocation prints exactly one JSON envelope on stdout.
     last_line = out.splitlines()[-1]
     try:
-        payload = json.loads(last_line)
+        envelope = json.loads(last_line)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"stdout not JSON ({e}): {out[:500]!r}")
+    # Unwrap v1.1+ envelope for test backward compat.
+    if isinstance(envelope, dict) and "ok" in envelope and "data" in envelope:
+        if envelope["ok"] and isinstance(envelope["data"], dict):
+            payload = envelope["data"]
+        else:
+            payload = envelope
+    else:
+        payload = envelope
     return r.returncode, payload, r.stderr
 
 

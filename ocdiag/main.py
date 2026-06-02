@@ -19,12 +19,40 @@ from typing import List, Optional
 from . import __version__, paths
 from .core import registry
 from .core.context import DiagContext
+from .core.errors import (
+    EXIT_INPUT_ERROR,
+    EXIT_OK,
+    EXIT_RUNTIME_ERROR,
+    EXIT_WARN_OR_FAIL,
+    DiagError,
+    exit_code_for,
+)
 from .core.types import Report, Verdict
 from .render.human import HumanRenderer
-from .render.json_renderer import JsonRenderer, to_envelope
+from .render.json_renderer import JsonRenderer
+from .render.ndjson import NdjsonRenderer
+
+
+_FORMAT_CHOICES = ("pretty", "json", "ndjson")
+
+
+def _resolve_format(args) -> str:
+    """Resolve effective output format from --format / --json flags.
+
+    --format X      → X
+    --json          → json (backward compat)
+    neither         → pretty
+    """
+    fmt = getattr(args, "format", None)
+    if fmt:
+        return fmt
+    if getattr(args, "json", False):
+        return "json"
+    return "pretty"
 
 
 def _build_context(args) -> DiagContext:
+    fmt = _resolve_format(args)
     return DiagContext(
         openclaw_home=Path(args.openclaw_home),
         config_path=Path(args.config),
@@ -32,7 +60,7 @@ def _build_context(args) -> DiagContext:
         sessions_base=Path(args.sessions_base),
         unmask=getattr(args, "unmask", False),
         no_color=getattr(args, "no_color", False),
-        json_mode=getattr(args, "json", False),
+        json_mode=fmt != "pretty",
     )
 
 
@@ -41,26 +69,49 @@ def _common_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log-dir", default=paths.LOG_DIR)
     p.add_argument("--sessions-base", default=paths.SESSIONS_BASE)
     p.add_argument("--openclaw-home", default=paths.OPENCLAW_HOME)
-    p.add_argument("--json", action="store_true")
+    p.add_argument(
+        "--format",
+        choices=list(_FORMAT_CHOICES),
+        default=None,
+        help="Output format (pretty|json|ndjson). Default: pretty.",
+    )
+    p.add_argument("--json", action="store_true", help="Alias for --format json.")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--unmask", action="store_true")
 
 
-def _render(report: Report, ctx: DiagContext) -> None:
-    if ctx.json_mode:
+def _render(report: Report, args) -> None:
+    fmt = _resolve_format(args)
+    if fmt == "json":
         JsonRenderer().write(report)
+    elif fmt == "ndjson":
+        NdjsonRenderer().write(report)
     else:
-        HumanRenderer(no_color=ctx.no_color).write(report)
+        HumanRenderer(no_color=getattr(args, "no_color", False)).write(report)
 
 
 def _exit_code(report: Report) -> int:
-    return 1 if report.verdict == Verdict.FAIL else 0
+    """Map a Report to a process exit code.
+
+    0 — OK (verdict ok)
+    1 — verdict warn or fail (no structured error)
+    2 — input error (DiagError with input-class code)
+    3 — runtime error (DiagError with runtime-class code, or unstructured error)
+    """
+    if report.diag_error is not None:
+        return exit_code_for(report.diag_error)
+    if report.error:
+        return EXIT_RUNTIME_ERROR
+    if report.verdict == Verdict.OK:
+        return EXIT_OK
+    return EXIT_WARN_OR_FAIL
 
 
 def cmd_list(args) -> int:
     state = registry.all_state()
     inspectors = registry.all_inspectors()
-    if args.json:
+    fmt = _resolve_format(args)
+    if fmt != "pretty":
         payload = {
             "state_collectors": [
                 {"id": c.id, "label": c.title} for c in state
@@ -85,6 +136,39 @@ def cmd_list(args) -> int:
     print("  其它命令：")
     print("    all              一次跑完所有扫描类")
     print("    doctor           检查 Node / Python / openclaw-diag / OpenClaw 环境")
+    print("    examples         打印常用使用示例")
+    return 0
+
+
+def cmd_examples() -> int:
+    print("""openclaw-diag — 常用场景
+
+  # 全面体检
+  openclaw-diag all
+
+  # JSON 输出（Agent / 脚本）
+  openclaw-diag all --format json
+
+  # 查 Gateway 状态
+  openclaw-diag gateway
+
+  # 追踪一条消息的完整生命周期
+  openclaw-diag trace <uuid>
+  openclaw-diag trace abc12345 --msg-index 0
+
+  # 导出 session 对话内容
+  openclaw-diag extract <uuid>
+  openclaw-diag extract abc12345 --summary
+
+  # 模型性能
+  openclaw-diag performance
+
+  # 定时任务状态
+  openclaw-diag cron_jobs
+
+  # jq 快速看 verdict
+  openclaw-diag all --format json | jq '.data.verdict'
+""")
     return 0
 
 
@@ -103,7 +187,8 @@ def cmd_all(args, skip_ids: List[str]) -> int:
     ctx = _build_context(args)
     state = [c for c in registry.all_state() if c.id not in skip_ids]
     rc_overall = 0
-    if args.json:
+    fmt = _resolve_format(args)
+    if fmt != "pretty":
         for c in state:
             t0 = time.time()
             try:
@@ -111,12 +196,17 @@ def cmd_all(args, skip_ids: List[str]) -> int:
             except BaseException as e:  # noqa: BLE001
                 report = Report(module_id=c.id, title=c.title)
                 report.error = f"{type(e).__name__}: {e}"
+                report.diag_error = DiagError(
+                    code="RUNTIME_ERROR",
+                    message=f"{type(e).__name__}: {e}",
+                )
                 report.elapsed_ms = (time.time() - t0) * 1000
-                rc_overall = 2
+                rc_overall = EXIT_RUNTIME_ERROR
                 traceback.print_exc(file=sys.stderr)
-            _render(report, ctx)
-            if _exit_code(report) != 0 and rc_overall == 0:
-                rc_overall = _exit_code(report)
+            _render(report, args)
+            rc = _exit_code(report)
+            if rc != 0 and rc > rc_overall:
+                rc_overall = rc
         return rc_overall
 
     total = len(state)
@@ -133,17 +223,22 @@ def cmd_all(args, skip_ids: List[str]) -> int:
         except BaseException as e:  # noqa: BLE001
             report = Report(module_id=c.id, title=c.title)
             report.error = f"{type(e).__name__}: {e}"
+            report.diag_error = DiagError(
+                code="RUNTIME_ERROR",
+                message=f"{type(e).__name__}: {e}",
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             traceback.print_exc(file=sys.stderr)
-            rc_overall = 2
-        _render(report, ctx)
+            rc_overall = EXIT_RUNTIME_ERROR
+        _render(report, args)
         elapsed = report.elapsed_ms / 1000.0
         print(
             f"[{n}/{total}] {c.title} ({c.id}) ... done ({elapsed:.1f}s)",
             flush=True, file=sys.stderr,
         )
-        if _exit_code(report) != 0 and rc_overall == 0:
-            rc_overall = _exit_code(report)
+        rc = _exit_code(report)
+        if rc != 0 and rc > rc_overall:
+            rc_overall = rc
     return rc_overall
 
 
@@ -151,7 +246,7 @@ def cmd_run_collector(args, mid: str) -> int:
     c = registry.get(mid)
     if c is None:
         print(f"Error: 未知 collector '{mid}'", file=sys.stderr)
-        return 2
+        return EXIT_INPUT_ERROR
     ctx = _build_context(args)
     t0 = time.time()
     try:
@@ -159,14 +254,38 @@ def cmd_run_collector(args, mid: str) -> int:
     except BaseException as e:  # noqa: BLE001
         report = Report(module_id=c.id, title=c.title)
         report.error = f"{type(e).__name__}: {e}"
+        report.diag_error = DiagError(
+            code="RUNTIME_ERROR",
+            message=f"{type(e).__name__}: {e}",
+        )
         report.elapsed_ms = (time.time() - t0) * 1000
         traceback.print_exc(file=sys.stderr)
-    _render(report, ctx)
+    _render(report, args)
     return _exit_code(report)
 
 
+_TRACE_EPILOG = """示例:
+  openclaw-diag trace 7e9f3b31                    # 该 session 最后一条用户消息
+  openclaw-diag trace 7e9f3b31 --msg-index 0      # 第一条
+  openclaw-diag trace 7e9f3b31 --msg-match deploy # 按内容匹配
+  openclaw-diag trace 7e9f3b31 --format json      # JSON 输出
+"""
+
+_EXTRACT_EPILOG = """示例:
+  openclaw-diag extract 7e9f3b31              # 默认导出 active 文件
+  openclaw-diag extract 7e9f3b31 --summary    # 只看统计
+  openclaw-diag extract 7e9f3b31 --all        # 含 reset / deleted / backup
+  openclaw-diag extract 7e9f3b31 --format json
+"""
+
+
 def _build_trace_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="openclaw-diag trace", add_help=True)
+    p = argparse.ArgumentParser(
+        prog="openclaw-diag trace",
+        add_help=True,
+        epilog=_TRACE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
     p.add_argument("--msg-index", type=int, default=None,
                    help="Nth user message (0-based)")
@@ -184,7 +303,12 @@ def _build_trace_parser() -> argparse.ArgumentParser:
 
 
 def _build_extract_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="openclaw-diag extract", add_help=True)
+    p = argparse.ArgumentParser(
+        prog="openclaw-diag extract",
+        add_help=True,
+        epilog=_EXTRACT_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
     p.add_argument("--summary", action="store_true",
                    help="Per-file record-count summary, no record dump")
@@ -203,7 +327,7 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
     inspector = registry.get(head)
     if inspector is None or inspector.kind != "inspector":
         print(f"Error: 未知 inspector '{head}'", file=sys.stderr)
-        return 2
+        return EXIT_INPUT_ERROR
     if head == "trace":
         parser = _build_trace_parser()
         ns = parser.parse_args(rest)
@@ -233,7 +357,7 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
         }
     else:
         print(f"Error: inspector '{head}' has no argument schema", file=sys.stderr)
-        return 2
+        return EXIT_INPUT_ERROR
 
     ctx = _build_context(ns)
     t0 = time.time()
@@ -242,12 +366,21 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
     except BaseException as e:  # noqa: BLE001
         report = Report(module_id=inspector.id, title=inspector.title)
         report.error = f"{type(e).__name__}: {e}"
+        report.diag_error = DiagError(
+            code="RUNTIME_ERROR",
+            message=f"{type(e).__name__}: {e}",
+        )
         report.elapsed_ms = (time.time() - t0) * 1000
         traceback.print_exc(file=sys.stderr)
-    _render(report, ctx)
+    _render(report, ns)
 
-    # Extract: dump records to stdout after summary (unless --summary or --list)
-    if head == "extract" and not report.error:
+    # Extract: dump records to stdout after summary in pretty mode
+    # (json/ndjson modes already include the records under report.data).
+    if (
+        head == "extract"
+        and not report.error
+        and _resolve_format(ns) == "pretty"
+    ):
         _dump_extract_records(report, ctx)
 
     return _exit_code(report)
@@ -267,7 +400,7 @@ def _dump_extract_records(report: Report, ctx: DiagContext) -> None:
             continue
         path = entry.get("path", "")
         state = entry.get("state", "")
-        sep = "\u2500" * 76
+        sep = "─" * 76
         print(f"\n{sep}")
         print(f"  Records: {os.path.basename(path)} [{state}]")
         print(f"{sep}\n")
@@ -299,12 +432,13 @@ def _print_help() -> None:
     print("用法：")
     print("  openclaw-diag <id> [args...]      跑单个诊断")
     print("  openclaw-diag all [--skip a,b]    跑全部 state collectors")
-    print("  openclaw-diag list [--json]       列出所有诊断")
+    print("  openclaw-diag list [--format X]   列出所有诊断")
     print("  openclaw-diag doctor              检查环境")
     print("  openclaw-diag trace <uuid>        追踪一条用户消息")
     print("  openclaw-diag extract <uuid>      导出 session 为可读格式")
+    print("  openclaw-diag examples            打印常用示例")
     print()
-    print("通用 flag：--json --no-color --unmask")
+    print("通用 flag：--format pretty|json|ndjson  --json (alias)  --no-color  --unmask")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -321,9 +455,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     _common_arguments(parser)
 
     if head == "list":
-        # only --json matters for `list`
+        # --json / --format matter for `list`
         args, _ = parser.parse_known_args(rest)
         return cmd_list(args)
+
+    if head == "examples":
+        return cmd_examples()
 
     if head == "doctor":
         # Pull --node-version out before argparse so the v2 doctor collector
@@ -358,7 +495,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print(f"Error: 未知命令 '{head}'", file=sys.stderr)
     print("运行 `openclaw-diag list` 查看全部诊断。", file=sys.stderr)
-    return 2
+    return EXIT_INPUT_ERROR
 
 
 if __name__ == "__main__":

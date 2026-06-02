@@ -2,7 +2,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from .errors import DiagError
 
 
 class Verdict(Enum):
@@ -72,6 +75,7 @@ class Report:
     sections: List[Section] = field(default_factory=list)
     elapsed_ms: float = 0.0
     error: Optional[str] = None
+    diag_error: Optional["DiagError"] = None
     data: Dict[str, Any] = field(default_factory=dict)
 
     @property

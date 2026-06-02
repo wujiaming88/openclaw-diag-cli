@@ -66,22 +66,26 @@ def test_human_renderer_clean_run():
 def test_json_envelope_fields():
     r = _make_report()
     env = to_envelope(r)
-    _check("envelope module", env["module"] == "demo")
-    _check("envelope verdict=fail (because of fail check)",
-           env["verdict"] == "fail")
-    _check("envelope legacy status=error", env["status"] == "error")
-    _check("envelope summary",
-           env["summary"] == {"pass": 1, "warn": 1, "fail": 1, "total": 3},
-           repr(env["summary"]))
-    _check("envelope elapsed_ms is int", isinstance(env["elapsed_ms"], int))
-    _check("envelope sections list length", len(env["sections"]) == 2)
+    _check("envelope ok=True (no error)", env["ok"] is True)
+    _check("envelope error=None (no error)", env["error"] is None)
+    data = env["data"]
+    _check("envelope data.module", data["module"] == "demo")
+    _check("envelope data.verdict=fail (because of fail check)",
+           data["verdict"] == "fail")
+    _check("envelope data.status=error (legacy)", data["status"] == "error")
+    _check("envelope data.summary",
+           data["summary"] == {"pass": 1, "warn": 1, "fail": 1, "total": 3},
+           repr(data["summary"]))
+    _check("envelope data.elapsed_ms is int",
+           isinstance(data["elapsed_ms"], int))
+    _check("envelope data.sections list length", len(data["sections"]) == 2)
     _check("envelope first section verdict",
-           env["sections"][0]["verdict"] == "warn")
+           data["sections"][0]["verdict"] == "warn")
     _check("envelope second section verdict",
-           env["sections"][1]["verdict"] == "fail")
+           data["sections"][1]["verdict"] == "fail")
     _check("envelope check has data field",
-           env["sections"][0]["checks"][1]["data"] == {"k": 1})
-    _check("envelope data passthrough", env["data"] == {"meta": "x"})
+           data["sections"][0]["checks"][1]["data"] == {"k": 1})
+    _check("envelope data.data passthrough", data["data"] == {"meta": "x"})
 
 
 def test_json_renderer_emits_one_line_per_report():
@@ -91,15 +95,72 @@ def test_json_renderer_emits_one_line_per_report():
     out = buf.getvalue()
     _check("json output ends with newline", out.endswith("\n"))
     parsed = json.loads(out.strip())
-    _check("json roundtrip valid", parsed["module"] == "demo")
+    _check("json roundtrip ok flag", parsed["ok"] is True)
+    _check("json roundtrip data.module", parsed["data"]["module"] == "demo")
 
 
 def test_json_warn_keeps_legacy_status_ok():
     r = Report(module_id="m", title="t")
     r.section("x").warn("a", "warn")
     env = to_envelope(r)
-    _check("WARN sets verdict=warn", env["verdict"] == "warn")
-    _check("WARN keeps legacy status=ok", env["status"] == "ok")
+    _check("WARN sets verdict=warn", env["data"]["verdict"] == "warn")
+    _check("WARN keeps legacy status=ok", env["data"]["status"] == "ok")
+
+
+def test_json_error_envelope():
+    from ocdiag.core.errors import DiagError
+    r = Report(module_id="m", title="t")
+    r.error = "found nothing"
+    r.diag_error = DiagError(
+        code="SESSION_NOT_FOUND",
+        message="found nothing",
+        hint="try a longer prefix",
+        details={"query": "abc"},
+    )
+    env = to_envelope(r)
+    _check("error envelope ok=False", env["ok"] is False)
+    _check("error envelope data is None", env["data"] is None)
+    _check("error envelope error.code", env["error"]["code"] == "SESSION_NOT_FOUND")
+    _check("error envelope error.hint", env["error"]["hint"] == "try a longer prefix")
+    _check("error envelope error.details",
+           env["error"]["details"] == {"query": "abc"})
+
+
+def test_json_error_envelope_unstructured_fallback():
+    r = Report(module_id="m", title="t")
+    r.error = "boom"
+    env = to_envelope(r)
+    _check("fallback ok=False", env["ok"] is False)
+    _check("fallback code=RUNTIME_ERROR",
+           env["error"]["code"] == "RUNTIME_ERROR")
+    _check("fallback message", env["error"]["message"] == "boom")
+
+
+def test_ndjson_renderer_one_line_per_section():
+    from ocdiag.render.ndjson import NdjsonRenderer
+    r = _make_report()
+    buf = io.StringIO()
+    NdjsonRenderer(stream=buf).write(r)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    _check("ndjson emits 2 lines", len(lines) == 2)
+    objs = [json.loads(ln) for ln in lines]
+    _check("ndjson first line is section", objs[0]["section"] == "first")
+    _check("ndjson second line verdict=fail", objs[1]["verdict"] == "fail")
+
+
+def test_ndjson_error_emits_single_line():
+    from ocdiag.core.errors import DiagError
+    from ocdiag.render.ndjson import NdjsonRenderer
+    r = Report(module_id="m", title="t")
+    r.error = "x"
+    r.diag_error = DiagError(code="INVALID_QUERY", message="x")
+    buf = io.StringIO()
+    NdjsonRenderer(stream=buf).write(r)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    _check("ndjson error emits one line", len(lines) == 1)
+    obj = json.loads(lines[0])
+    _check("ndjson error has ok=False", obj["ok"] is False)
+    _check("ndjson error has code", obj["error"]["code"] == "INVALID_QUERY")
 
 
 def main():
@@ -109,6 +170,10 @@ def main():
     test_json_envelope_fields()
     test_json_renderer_emits_one_line_per_report()
     test_json_warn_keeps_legacy_status_ok()
+    test_json_error_envelope()
+    test_json_error_envelope_unstructured_fallback()
+    test_ndjson_renderer_one_line_per_section()
+    test_ndjson_error_emits_single_line()
     print()
     if _failures:
         print(f"FAILED: {len(_failures)} test(s)")

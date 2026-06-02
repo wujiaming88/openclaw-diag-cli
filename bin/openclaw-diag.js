@@ -166,6 +166,16 @@ function main() {
     return;
   }
 
+  if (head === 'skill-install') {
+    const skillScript = path.join(REPO_ROOT, 'skill', 'install.py');
+    if (!fs.existsSync(skillScript)) {
+      console.error(`Error: skill installer not found at ${skillScript}`);
+      process.exit(1);
+    }
+    const r = spawnSync(py.cmd, [skillScript, ...argv.slice(1)], { stdio: 'inherit' });
+    process.exit(r.status == null ? 1 : r.status);
+  }
+
   // Pass everything else (flat ids, `all`, `list`, `run` alias, unknown) to dispatcher.
   spawnDispatcher(py.cmd, argv);
 }

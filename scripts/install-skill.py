@@ -19,7 +19,7 @@ import shutil
 import sys
 from pathlib import Path
 
-SKILL_DIR = Path(__file__).resolve().parent.parent  # skill/openclaw-diag/
+SKILL_DIR = Path(__file__).resolve().parent.parent / "skill" / "openclaw-diag"  # skill/openclaw-diag/
 SKILL_MD = SKILL_DIR / "SKILL.md"
 
 

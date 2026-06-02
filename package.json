@@ -35,7 +35,7 @@
     "CHANGELOG.md",
     "LICENSE",
     "skill/openclaw-diag/SKILL.md",
-    "skill/openclaw-diag/scripts/install.py"
+    "scripts/install-skill.py"
   ],
   "engines": {
     "node": ">=18"

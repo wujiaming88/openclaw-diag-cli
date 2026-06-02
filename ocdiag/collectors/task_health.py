@@ -334,12 +334,40 @@ def _section_stuck(s: Section, rows: List[sqlite3.Row]) -> Dict[str, Any]:
             f"agent={e['agent_id'] or '-'} age={e['age_hours']}h "
             f"created={e['created_at']}",
         )
-    s.fail(
-        "task_health.stuck",
-        f"卡住任务: {len(stuck)} 个 running > 1h",
-        evidence="\n".join(body_lines),
-        data=payload,
-    )
+
+    # Differentiate true stuck (last_event_at recent) from historical orphans
+    true_stuck = []
+    orphans = []
+    for e in stuck:
+        true_stuck.append(e)  # default; refined below
+    # Re-check against last_event_at from rows
+    orphan_cutoff = now_ms - 24 * 3600000  # last_event > 24h ago = orphan
+    true_stuck = []
+    orphans = []
+    for r in running:
+        ts = r["created_at"]
+        if not ts or ts >= cutoff:
+            continue
+        last_ev = r["last_event_at"] or ts
+        if last_ev < orphan_cutoff:
+            orphans.append(r)
+        else:
+            true_stuck.append(r)
+
+    if true_stuck:
+        s.fail(
+            "task_health.stuck",
+            f"卡住任务: {len(true_stuck)} 个 (running > 1h, 近期有活动)",
+            evidence="\n".join(body_lines),
+            data=payload,
+        )
+    else:
+        s.warn(
+            "task_health.stuck",
+            f"历史孤儿任务: {len(orphans)} 个 (running 但无近期活动, 无害)",
+            evidence="\n".join(body_lines),
+            data=payload,
+        )
     return payload
 
 

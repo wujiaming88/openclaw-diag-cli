@@ -124,7 +124,7 @@ def _analyze_session_file(fpath: str) -> dict:
                     stop = msg.get("stopReason") or ""
                     if stop and stop not in NORMAL_STOPS:
                         label = (
-                            obj_ts.strftime("%Y-%m-%d %H:%M:%S")
+                            obj_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                             if obj_ts else "?"
                         )
                         detail = (
@@ -147,7 +147,7 @@ def _analyze_session_file(fpath: str) -> dict:
                     if is_err:
                         tool_errors += 1
                         label = (
-                            obj_ts.strftime("%Y-%m-%d %H:%M:%S")
+                            obj_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                             if obj_ts else "?"
                         )
                         err_brief = ""

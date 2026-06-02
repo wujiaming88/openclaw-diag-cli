@@ -235,7 +235,7 @@ def _analyze_sessions(session_files):
                     if 0 <= dur <= 600:
                         s["durations"].append(dur)
                         all_model_durations.append((dur, model_key))
-                        label = obj_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        label = obj_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                         dedup_key = (label, model_key, inp)
                         slow_calls_top.append((
                             dur, "model",
@@ -251,7 +251,7 @@ def _analyze_sessions(session_files):
                                 break
 
                 if obj_ts:
-                    day_key = obj_ts.strftime("%m-%d")
+                    day_key = obj_ts.astimezone().strftime("%m-%d")
                     d = daily_stats[day_key]
                     d["calls"] += 1
                     if dur is not None and 0 <= dur <= 600:
@@ -275,7 +275,7 @@ def _analyze_sessions(session_files):
                 api_total_assistant_calls += 1
                 if stop and stop not in NORMAL_STOPS:
                     label = (
-                        obj_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        obj_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                         if obj_ts else "?"
                     )
                     abnormal_stops.append(
@@ -366,7 +366,7 @@ def _analyze_sessions(session_files):
                     ts["durations"].append(dur_s)
                     all_tool_durations.append((dur_s, tool_name))
                     label = (
-                        obj_ts.strftime("%Y-%m-%d %H:%M:%S")
+                        obj_ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
                         if obj_ts else "?"
                     )
                     brief = f" | {args_str}" if args_str else ""

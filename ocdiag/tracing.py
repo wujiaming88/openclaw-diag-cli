@@ -31,8 +31,9 @@ def iso_to_epoch_ms(iso: str) -> int:
 
 
 def epoch_ms_to_iso(ms: int) -> str:
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
-    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms % 1000:03d}Z"
+    """Format epoch-ms as local time."""
+    dt = datetime.fromtimestamp(ms / 1000)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def fmt_duration(ms: float) -> str:

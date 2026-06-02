@@ -26,12 +26,13 @@ SAMPLE_LIMIT = 5
 
 
 def _fmt_iso(ms: Optional[int]) -> str:
+    """Format epoch-ms as local time."""
     if not ms:
         return "?"
     try:
         return _dt.datetime.fromtimestamp(
-            ms / 1000.0, tz=_dt.timezone.utc,
-        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            ms / 1000.0,
+        ).strftime("%Y-%m-%d %H:%M:%S")
     except (OSError, ValueError, OverflowError):
         return "?"
 

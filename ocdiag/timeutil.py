@@ -49,10 +49,44 @@ def fmt_age(ms_delta) -> str:
 
 
 def fmt_ts(ms) -> str:
+    """Format epoch-ms as local time string: YYYY-MM-DD HH:MM:SS."""
     if not ms:
         return "?"
     try:
         return datetime.fromtimestamp(int(ms) / 1000).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return str(ms)
+
+
+def fmt_ts_short(ms) -> str:
+    """Format epoch-ms as local time HH:MM:SS only."""
+    if not ms:
+        return "?"
+    try:
+        return datetime.fromtimestamp(int(ms) / 1000).strftime("%H:%M:%S")
+    except Exception:
+        return str(ms)
+
+
+def fmt_iso_local(iso_str: Optional[str]) -> str:
+    """Convert ISO/UTC string to local time display: YYYY-MM-DD HH:MM:SS."""
+    if not iso_str:
+        return "?"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        local_dt = dt.astimezone()
+        return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return iso_str[:19]
+
+
+def fmt_epoch_local(ms) -> str:
+    """Format epoch-ms as local ISO-like string for structured output."""
+    if not ms:
+        return "?"
+    try:
+        dt = datetime.fromtimestamp(int(ms) / 1000)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         return str(ms)
 

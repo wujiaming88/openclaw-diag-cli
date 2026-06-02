@@ -191,9 +191,8 @@ def _analyze_sessions(session_files):
             if role == "assistant":
                 provider = msg.get("provider") or ""
                 model = msg.get("model") or "?"
-                if provider == "openclaw" and model in (
-                    "delivery-mirror", "gateway-injected",
-                ):
+                # openclaw/* entries are internal runtime markers, not real model calls
+                if provider == "openclaw":
                     continue
                 model_key = f"{provider}/{model}" if provider else model
                 usage = msg.get("usage", {}) or {}

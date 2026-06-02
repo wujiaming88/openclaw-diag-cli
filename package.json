@@ -31,18 +31,16 @@
     "ocdiag/collectors/*.py",
     "ocdiag/inspectors/*.py",
     "ocdiag/render/*.py",
-    "scripts/postinstall.js",
-    "skill/SKILL.md",
-    "skill/install.py",
     "README.md",
     "CHANGELOG.md",
-    "LICENSE"
+    "LICENSE",
+    "skill/openclaw-diag/SKILL.md",
+    "skill/openclaw-diag/scripts/install.py"
   ],
   "engines": {
     "node": ">=18"
   },
   "scripts": {
-    "test": "node bin/openclaw-diag.js list && echo OK",
-    "postinstall": "node scripts/postinstall.js"
+    "test": "node bin/openclaw-diag.js list && echo OK"
   }
 }

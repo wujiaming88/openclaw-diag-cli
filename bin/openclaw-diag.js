@@ -167,7 +167,7 @@ function main() {
   }
 
   if (head === 'skill-install') {
-    const skillScript = path.join(REPO_ROOT, 'skill', 'install.py');
+    const skillScript = path.join(REPO_ROOT, 'skill', 'openclaw-diag', 'scripts', 'install.py');
     if (!fs.existsSync(skillScript)) {
       console.error(`Error: skill installer not found at ${skillScript}`);
       process.exit(1);

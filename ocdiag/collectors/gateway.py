@@ -292,9 +292,32 @@ def _section_model_api(s: Section, ctx: DiagContext) -> dict:
             data={"endpoints": []},
         )
         return data
-    lines = [f"{r['url']}: HTTP {r['http_code']}" for r in api_results]
-    s.ok(
+    # Determine verdict from HTTP status codes — no provider-specific special cases
+    worst = Verdict.OK
+    lines: List[str] = []
+    for r in api_results:
+        code = r["http_code"]
+        try:
+            code_int = int(code)
+        except (ValueError, TypeError):
+            code_int = 0
+        if code_int == 0:
+            lines.append(f"{r['url']}  ✗ 不可达")
+            worst = Verdict.worst(worst, Verdict.FAIL)
+        elif 200 <= code_int < 300:
+            lines.append(f"{r['url']}  ✓ HTTP {code}")
+        elif 400 <= code_int < 500:
+            lines.append(f"{r['url']}  ⚠ HTTP {code}")
+            worst = Verdict.worst(worst, Verdict.WARN)
+        elif code_int >= 500:
+            lines.append(f"{r['url']}  ✗ HTTP {code}")
+            worst = Verdict.worst(worst, Verdict.FAIL)
+        else:
+            lines.append(f"{r['url']}  HTTP {code}")
+
+    s.add(
         "gateway.model_api",
+        worst,
         f"模型 API: 探测到 {len(api_results)} 个端点",
         detail="\n".join(lines),
         data={"endpoints": api_results},

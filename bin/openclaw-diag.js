@@ -96,6 +96,9 @@ function printHelp(modules) {
 }
 
 function spawnDispatcher(pyCmd, args) {
+  // v2 transition: pass --v2 through to the Python shim, which then routes
+  // to ocdiag.main instead of ocdiag.dispatcher. OCDIAG_V2=1 in the env
+  // triggers the same routing without changing argv.
   const child = spawn(pyCmd, [DISPATCHER, ...args], { stdio: 'inherit' });
   child.on('error', (err) => {
     console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);

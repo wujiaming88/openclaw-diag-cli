@@ -245,7 +245,35 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
         report.elapsed_ms = (time.time() - t0) * 1000
         traceback.print_exc(file=sys.stderr)
     _render(report, ctx)
+
+    # Extract: dump records to stdout after summary (unless --summary or --list)
+    if head == "extract" and not report.error:
+        _dump_extract_records(report, ctx)
+
     return _exit_code(report)
+
+
+def _dump_extract_records(report: Report, ctx: DiagContext) -> None:
+    """Dump session records to stdout after the Report summary.
+
+    This restores the legacy extract behavior: the primary output is the
+    session content itself, not just the summary stats.
+    """
+    import json as _json
+    files_payload = report.data.get("files_payload", [])
+    for entry in files_payload:
+        records = entry.get("records")
+        if not records:
+            continue
+        path = entry.get("path", "")
+        state = entry.get("state", "")
+        sep = "\u2500" * 76
+        print(f"\n{sep}")
+        print(f"  Records: {os.path.basename(path)} [{state}]")
+        print(f"{sep}\n")
+        for rec in records:
+            print(_json.dumps(rec, indent=2, ensure_ascii=False))
+            print()
 
 
 def _split_skip(rest: List[str]):

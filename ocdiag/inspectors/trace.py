@@ -500,10 +500,15 @@ class TraceInspector:
             "session", f"session: {full_session_id}",
             data={"session_id": full_session_id, "file": session_file},
         )
+        total_user_msgs = len(user_msgs)
+        msg_hint = (
+            f"user message #{user_msg_ordinal} of {total_user_msgs} (id: {user_msg_id})"
+        )
+        if total_user_msgs > 1:
+            msg_hint += f"  [use --msg-index 0~{total_user_msgs - 1} to select]"
         s_meta.ok(
-            "user_message",
-            f"user message #{user_msg_ordinal} (id: {user_msg_id})",
-            data={"index": user_msg_ordinal, "id": user_msg_id},
+            "user_message", msg_hint,
+            data={"index": user_msg_ordinal, "id": user_msg_id, "total": total_user_msgs},
         )
 
         s_timeline = report.section("Trace · 时间轴")

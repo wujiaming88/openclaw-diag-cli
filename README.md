@@ -1,202 +1,285 @@
 # openclaw-diag
 
-零依赖、只读、专为 [OpenClaw](https://github.com/openclaw/openclaw) 设计的诊断 CLI。
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![npm version](https://img.shields.io/npm/v/openclaw-diag-cli.svg)](https://www.npmjs.com/package/openclaw-diag-cli)
+[![Node.js](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](https://nodejs.org/)
+[![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue.svg)](https://www.python.org/)
 
-## 一、特性与定位
+Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 12 diagnostic modules, 2 inspectors, structured output, zero dependencies.
 
-OpenClaw 出问题时，**先跑这条命令再开 ticket**：
+[Install](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [AI Agent Skill](#ai-agent-skill) · [Output Formats](#output-formats) · [Examples](#examples) · [Contributing](#contributing)
+
+## Why openclaw-diag?
+
+- **Agent-Native Design** — Structured JSON output, error codes, explicit verdicts. AI Agents can diagnose OpenClaw systems with zero extra parsing
+- **Zero Dependencies** — Pure Python stdlib + Node thin-shell. No pip packages, no build steps
+- **Observer-Only** — Never modifies system state. Safe to run anytime, anywhere
+- **Explicit Verdicts** — Every check produces `ok` / `warn` / `fail` with clear thresholds, not regex-guessed
+- **12 Diagnostic Modules** — From system health to model performance to cron jobs, comprehensive coverage
+- **Session Forensics** — Trace a single message's full lifecycle, or extract entire session history
+- **Default Sanitization** — API keys, tokens, secrets masked by default. `--unmask` to override
+
+## Features
+
+| Module | What it checks |
+|--------|----------------|
+| 🖥️ sys_health | Disk, memory, CPU, DNS, NTP, network, IO wait |
+| ⚙️ environment | OpenClaw version, Node/Python, env vars, version drift (14d) |
+| 📋 configuration | openclaw.json validation, sensitive field sanitization |
+| 🌐 gateway | Process status, port, restarts, WebSocket lifecycle, error codes, model API endpoints |
+| ❗ recent_errors | Log aggregation by level, journalctl, session tool-call errors |
+| ⏰ cron_jobs | Schedule parsing, consecutive failures, drift, silent detection |
+| 📊 performance | Model/tool P50/P95, slow calls Top N, cache hit rate, throughput |
+| 💬 sessions_diag | Session count, sizes, stuck detection |
+| 🔌 plugin_diag | Plugin status, hook errors, DNS, trajectory drift |
+| 🏃 run_health | 24h/7d/30d run health, abort rate, active leak detection |
+| 🐚 shell_history | Dangerous command detection in shell history |
+| 🩺 doctor | Environment self-check (Node, Python, OpenClaw, paths) |
+
+| Inspector | Purpose |
+|-----------|---------|
+| 🔍 trace | Trace one user message: receive → model → tools → response timeline |
+| 📤 extract | Export session.jsonl to readable format with stats |
+
+## Installation
+
+**Requirements:** Node.js 18+, Python 3.8+
 
 ```bash
-npx openclaw-diag-cli all
-```
-
-核心特性：
-
-- **Banner + Verdict + Footer 三段式诊断输出** —— 每个模块顶部给出 `ok / warn / fail` 三态判定与 pass/warn/fail 计数，肉眼可在 30 秒内扫完
-- **System prompt 全链路可视化** —— `trace` 还原一条用户消息从进入到响应的时间轴，包含 prompt 大小、模型选型、工具调用、token 消耗
-- **Session 级 trace + extract** —— 用 session uuid 或 ≥ 8 位前缀即可定位，无需手动翻 `agents/*/sessions/*.jsonl`
-- **模型 / 工具性能分析** —— P50/P95 延迟、慢调用 Top N、E2E 延迟、Cache 命中率、throughput tps
-- **默认脱敏** —— API key / token / credential 类字符串在输出前已被 mask，`--unmask` 显式关闭
-
-适用场景：
-
-- 部署后日常监控：`all --json` 接监控管道
-- 用户报障应急：5 分钟摸清"哪挂了、什么时候挂的、谁动过它"
-- AI agent 运维：trace 单条慢消息、extract 排查 stuck session
-
-## 二、安装与上手
-
-环境要求：**Node 18+**、**Python 3.8+**。
-
-```bash
-# 免安装（首次下载到 npm cache，之后离线可用）
+# Option 1: Run directly with npx (recommended)
 npx openclaw-diag-cli all
 
-# 装到 PATH
+# Option 2: Install globally
 npm install -g openclaw-diag-cli
+openclaw-diag all
 
-# 开发者模式
-git clone <repo-url> openclaw-diag-cli
-cd openclaw-diag-cli && ./bin/openclaw-diag.js list
+# Option 3: Install AI Agent skill
+npx openclaw-diag-cli skill-install
 ```
 
-Quick start：
+## Quick Start
 
 ```bash
-openclaw-diag doctor          # 自检 Node / Python / OpenClaw 环境
-openclaw-diag all             # 跑全部扫描类诊断
-openclaw-diag trace <uuid>    # 追踪一条 session 的处理时间轴
+# Full health check
+openclaw-diag all
+
+# Something slow? Check model performance
+openclaw-diag performance
+
+# Session stuck? Trace the last message
+openclaw-diag trace <session-uuid>
+
+# See all session content
+openclaw-diag extract <session-uuid>
+
+# JSON output for scripts / AI Agents
+openclaw-diag all --format json
 ```
 
-## 三、能力详解
+## Quick Start (AI Agent)
 
-### 扫描类（11 个 state collector，无需参数）
-
-| 诊断 | 看什么 | 示例 |
-|---|---|---|
-| `sys_health` | DNS / 网络 / CPU / 内存 / 磁盘 / IO / 进程 / 时间同步 | `openclaw-diag sys_health` |
-| `environment` | OpenClaw 版本一致性、Gateway 进程的环境变量 + **trajectory 14d 版本/Node 漂移** | `openclaw-diag environment` |
-| `configuration` | `openclaw.json` 展平（敏感字段已脱敏）+ **trajectory effective runtime config** | `openclaw-diag configuration` |
-| `gateway` | Gateway 进程、端口、24h 启停、WS 生命周期、错误码 + **trajectory 24h run 频率** | `openclaw-diag gateway` |
-| `recent_errors` | 应用日志 / journalctl / session 工具调用错误聚合 + **trajectory 7d run 错误信号** | `openclaw-diag recent_errors` |
-| `cron_jobs` | 定时任务状态、连续失败、调度漂移、静默检测 + **trajectory cron 投递审计 + delivery_audit** | `openclaw-diag cron_jobs` |
-| `performance` | 模型/工具耗时 P50/P95、慢调用 Top 20、E2E 延迟、Cache 命中率 + **trajectory cache health + system prompt budget** | `openclaw-diag performance` |
-| `sessions` | Session 总览、活跃度、Stuck 探测 + **trajectory run 健康度** | `openclaw-diag sessions` |
-| `plugin_diag` | 插件状态一致性、ERROR/WARN、Hook、Channel、外部 DNS + **trajectory 插件快照 + drift 检测** | `openclaw-diag plugin_diag` |
-| `shell_history` | Shell 历史中的高危命令与最近 OpenClaw 操作 | `openclaw-diag shell_history` |
-| `run_health` | **(v0.6.0 新增)** trajectory 总体运行健康度（24h/7d/30d 多窗口）、abort 分布、active leak、P95 wall 耗时 | `openclaw-diag run_health` |
-
-### 对象类（2 个 object inspector，需要 session uuid 或 ≥ 8 位前缀）
-
-**`trace <session_id>`** —— 还原一条用户消息从进入到响应的时间轴，包含 system prompt 大小、模型选型、每个工具调用的耗时、gateway 日志关联。v0.6.0 起额外渲染 trajectory 来源的 outcome / lifecycle / cache / delivery / plugin snapshot 信号。
+If you are an AI Agent helping a user diagnose OpenClaw:
 
 ```bash
-openclaw-diag trace 7f3a2c91                    # 默认追踪最后一条 user 消息
-openclaw-diag trace 7f3a2c91 --msg-index 0      # 第 0 条 user 消息
-openclaw-diag trace 7f3a2c91 --msg-id msg_abc   # 指定 message id
-openclaw-diag trace 7f3a2c91 --msg-match "ssh"  # 按文本匹配第一条
-openclaw-diag trace 7f3a2c91 --no-trajectory    # 跳过 trajectory 富化
-openclaw-diag trace 7f3a2c91 --no-log           # 跳过 gateway 日志关联
-openclaw-diag trace 7f3a2c91 --show-tool-metas      # 渲染 toolMetas（默认 plaintext）
-openclaw-diag trace 7f3a2c91 --show-plugin-snapshot # 渲染 plugin entries 完整状态
-openclaw-diag trace 7f3a2c91 --mask                 # 启用 trajectory 文本字段脱敏
+# 1. Install (if not already)
+npx openclaw-diag-cli skill-install
+
+# 2. Run full diagnostic
+openclaw-diag all --format json
+
+# 3. Drill into specific issues based on verdict
+openclaw-diag gateway --format json      # if gateway verdict != ok
+openclaw-diag performance --format json  # if performance verdict != ok
 ```
 
-**`extract <session_id>`** —— 把 `session.jsonl` 导出为人类可读格式，支持 active / reset / deleted / backup 四种状态。
+## Commands
+
+### State Collectors (no arguments needed)
 
 ```bash
-openclaw-diag extract 7f3a2c91                  # 导出当前 active session
-openclaw-diag extract 7f3a2c91 --summary        # 仅输出记录类型计数
-openclaw-diag extract 7f3a2c91 --all            # 导出所有版本（含 reset/deleted/backup）
-openclaw-diag extract 7f3a2c91 --list           # 仅列出匹配文件，不解析
-openclaw-diag extract 7f3a2c91 --types message,toolCall  # 按类型过滤
-openclaw-diag extract 7f3a2c91 --unmask         # 关闭脱敏（慎用）
+openclaw-diag all                    # Run all collectors
+openclaw-diag all --skip gateway,cron_jobs  # Skip specific modules
+openclaw-diag <module-id>            # Run single module
+openclaw-diag list                   # List all available modules
+openclaw-diag doctor                 # Environment self-check
+openclaw-diag examples               # Show usage examples
 ```
 
-### 全局 flag
+### Inspectors (require session UUID)
 
-| flag | 作用 |
-|---|---|
-| `--json` | 输出结构化 JSON（适合喂给 jq / 监控） |
-| `--no-color` | 禁用 ANSI 颜色（CI / 文件重定向） |
-| `--unmask` | 关闭默认脱敏（仅 `extract` 与含敏感字段的模块） |
+```bash
+# Trace: follow one message's lifecycle
+openclaw-diag trace <uuid>                    # Last user message
+openclaw-diag trace <uuid> --msg-index 0      # First message
+openclaw-diag trace <uuid> --msg-match "deploy"  # Match by content
+openclaw-diag trace <uuid> --no-trajectory    # Skip trajectory enrichment
 
-### JSON 输出 schema
+# Extract: dump session content
+openclaw-diag extract <uuid>                  # Full records
+openclaw-diag extract <uuid> --summary        # Stats only
+openclaw-diag extract <uuid> --all            # Include backups/deleted
+openclaw-diag extract <uuid> --types message  # Filter by record type
+```
 
-每个诊断 `--json` 输出的 envelope 一致：
+### Utility
 
+```bash
+openclaw-diag skill-install          # Deploy skill to AI Agent frameworks
+openclaw-diag --version              # Show version
+```
+
+## Output Formats
+
+```bash
+--format pretty    # Colored human output (default when TTY)
+--format json      # Structured JSON envelope
+--format ndjson    # One JSON line per section (streaming/pipes)
+--json             # Alias for --format json (backward compat)
+```
+
+### JSON Envelope
+
+Success:
 ```json
 {
-  "module": "sys_health",
-  "status": "ok",
-  "verdict": "warn",
-  "summary": {"pass": 7, "warn": 1, "fail": 0, "total": 8},
-  "elapsed_ms": 1862,
-  "data": { ... }
+  "ok": true,
+  "data": {
+    "module": "gateway",
+    "verdict": "warn",
+    "summary": {"pass": 5, "warn": 1, "fail": 0, "total": 6},
+    "elapsed_ms": 1234,
+    "sections": [...],
+    "data": {...}
+  }
 }
 ```
 
-- `status`：legacy 二态，`"ok"` 表示模块正常运行（即使内部有 warn/fail），`"error"` 表示数据源缺失等运行失败
-- `verdict`：三态判定，`"ok" | "warn" | "fail"`，由模块内规则汇总
-- `summary`：通过/警告/失败/总条目数
-- `data`：模块特定结构
-
-### jq 配方
-
-```bash
-# 只看 verdict 非 ok 的模块
-openclaw-diag all --json | jq 'select(.verdict != "ok") | {module, verdict, summary}'
-
-# 提取每个模型的 P95 与吞吐
-openclaw-diag performance --json | jq '.data.models | to_entries[] | {name: .key, p95_s: .value.p95_s, tps: .value.throughput_tps}'
-
-# 列出最大的 5 个 session
-openclaw-diag sessions --json | jq '.data.sessions | sort_by(-.size_bytes) | .[0:5] | .[] | {uuid, size_kb: (.size_bytes/1024|floor)}'
-
-# 找连续失败的定时任务
-openclaw-diag cron_jobs --json | jq '.data.jobs[] | select(.consecutive_failures > 0) | {name, consecutive_failures}'
-
-# 把所有诊断聚合成 NDJSON 报告（崩溃模块也有错误行，不会丢）
-openclaw-diag all --json > report.ndjson
+Error:
+```json
+{
+  "ok": false,
+  "error": {
+    "code": "SESSION_NOT_FOUND",
+    "message": "找不到 session 'abc123'",
+    "retryable": false,
+    "hint": "recent sessions: 7e9f3b31, b371118e"
+  }
+}
 ```
 
-### Trajectory 数据层（v0.6.0+）
+### Exit Codes
 
-OpenClaw 2026.5.x 起为每个 session 写入 `<uuid>.trajectory.jsonl` —— 按 7 个事件类型（`session.started` / `trace.metadata` / `context.compiled` / `prompt.submitted` / `model.completed` / `trace.artifacts` / `session.ended`）记录每个 run 的完整生命周期。openclaw-diag 在 v0.6.0 中把这层数据吸收为 first-class 数据源：
+| Code | Meaning |
+|------|---------|
+| 0 | Success, verdict = ok |
+| 1 | Success, verdict = warn or fail |
+| 2 | User input error (bad command, missing arg) |
+| 3 | Runtime error (file unreadable, crash) |
 
-- 所有 11 个 state collector 都消费 trajectory（如果存在）。来源都通过 `ocdiag.trajectory` 流式读取，不缓存。
-- 在 OpenClaw 2026.5.x 之前的版本上仍可正常工作 —— 缺失 trajectory 时退化到原有的 session.jsonl/log 数据源。
-- `OCDIAG_TRAJECTORY_WORKERS=N` 控制并发度（默认 4）。
+## AI Agent Skill
 
-**敏感性变更**（与 DESIGN.md 公理 #7 的故意偏离）：
+openclaw-diag ships with a [SKILL.md](./skill/openclaw-diag/SKILL.md) compatible with multiple AI Agent frameworks.
 
-trajectory 字段（`assistantTexts`、`messagingToolSentTexts`、`prompt`、`finalPromptText`、`toolMetas[].meta`）**默认明文展示**，因为这些数据的诊断价值远高于泄漏风险（trajectory 文件本就在用户家目录里）。
-
-- `--mask` 显式打开 trajectory 字段脱敏（仅 `trace` 命令支持）
-- 非-trajectory 来源的自由文本（shell 历史、plugin 错误样本、systemd 配置、session message body）**保持默认脱敏**，行为不变。
-
-## 四、其他
-
-### 设计原则
-
-1. **Observer-only** —— 只读取，绝不修改 OpenClaw 的配置 / session / cron / 服务状态
-2. **Zero-deps** —— 只用 Python 标准库 + Node 薄壳，不引入第三方 pip / npm 包
-3. **Default-sanitize** —— 默认脱敏 API key / token / credential 类字符串，`--unmask` 显式关闭。**例外**：trajectory 字段默认明文（见上文）
-
-### 环境变量覆盖
-
-诊断他人机器或容器时，无需改代码：
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `OPENCLAW_HOME` | `~/.openclaw` | OpenClaw 主目录 |
-| `OPENCLAW_CONFIG` | `$OPENCLAW_HOME/openclaw.json` | 配置文件 |
-| `OPENCLAW_LOG_DIR` | `/tmp/openclaw` | 日志目录 |
-| `OPENCLAW_SESSIONS` | `$OPENCLAW_HOME/agents` | Session 根目录 |
-
-也可单次运行时用 flag：`--config /path --log-dir /path --base-dir /path`。
-
-### 退出码
-
-| rc | 含义 |
-|---|---|
-| 0 | 诊断成功（即使内部 verdict=warn/fail） |
-| 1 | 诊断运行成功但报告 `status: "error"`（数据源缺失等） |
-| 2 | 诊断崩溃（已隔离，不影响 `all`） |
-
-### 测试
-
-零依赖、纯标准库脚本，直接 `python3` 跑：
+### Install
 
 ```bash
-# trajectory 加载器 + 数据投影（10 个 fixture，含静默 cron / 工具泄漏 / schema 漂移 / 截断行）
-python3 tests/run_trajectory_tests.py
-
-# 9 个 trajectory-touching collector 的 E2E 测试
-# （隔离 HOME / OPENCLAW_SESSIONS，spawn `bin/ocdiag <module> --json`，断言 verdict + 关键字段）
-python3 tests/run_collector_tests.py
+openclaw-diag skill-install
 ```
 
-`run_collector_tests.py` 在临时目录里搭建最小 `~/.openclaw`，把 fixture 时间戳重写到 “刚才”，所以 24h / 7d / 30d 时间窗口都能命中。整套跑完 < 5s，命中率 100%。
+This deploys the skill to all detected frameworks:
 
-License: MIT
+| Framework | Path |
+|-----------|------|
+| OpenClaw | `~/.openclaw/skills/openclaw-diag/SKILL.md` |
+| Claude Code | `~/.claude/commands/openclaw-diag.md` |
+| Codex | `~/.codex/instructions/openclaw-diag.md` |
+| Cursor | `~/.cursor/rules/openclaw-diag.mdc` |
+
+### Intent Routing (for Agents)
+
+| Symptom | Command |
+|---------|---------|
+| General health check | `openclaw-diag all --format json` |
+| Slow responses | `openclaw-diag performance --format json` |
+| Can't connect / Gateway down | `openclaw-diag gateway --format json` |
+| Session stuck | `openclaw-diag trace <uuid> --format json` |
+| Recent errors | `openclaw-diag recent_errors --format json` |
+| Cron not firing | `openclaw-diag cron_jobs --format json` |
+| Plugin issues | `openclaw-diag plugin_diag --format json` |
+
+## Examples
+
+```bash
+# Quick health summary with jq
+openclaw-diag all --format json | jq -r '.data | "\(.module): \(.verdict)"'
+
+# Find modules with problems
+openclaw-diag all --format json | jq 'select(.data.verdict != "ok") | .data.module'
+
+# Model P95 latency
+openclaw-diag performance --format json | jq '.data.data.model_p95_max'
+
+# Trace a slow message
+openclaw-diag trace abc12345 --msg-index 0
+
+# Export session and pipe to file
+openclaw-diag extract abc12345 > session-dump.txt
+
+# NDJSON for monitoring pipeline
+openclaw-diag all --format ndjson | while read line; do
+  echo "$line" | jq -r 'select(.verdict != "ok") | "\(.module)/\(.section): \(.verdict)"'
+done
+```
+
+## Architecture
+
+```
+bin/
+  openclaw-diag.js     Node thin-shell (npx entry, spawns Python)
+  ocdiag               Python direct entry
+ocdiag/
+  main.py              CLI dispatch + argument parsing
+  core/                Types (Check/Section/Report/Verdict), registry, context
+  collectors/          12 state collectors (one file each, @register decorator)
+  inspectors/          trace + extract
+  render/              human / json / ndjson renderers
+  (shared utilities)   sessions, trajectory, sensitive, paths, ...
+skill/
+  openclaw-diag/       Agent skill (SKILL.md + install script)
+```
+
+Adding a new collector: create one file in `ocdiag/collectors/`, add `@register` — done. No other files to edit.
+
+## Global Flags
+
+| Flag | Effect |
+|------|--------|
+| `--format pretty\|json\|ndjson` | Output format |
+| `--json` | Alias for `--format json` |
+| `--no-color` | Disable ANSI colors |
+| `--unmask` | Show secrets (default: sanitized) |
+| `--config PATH` | Custom openclaw.json path |
+| `--log-dir PATH` | Custom log directory |
+| `--sessions-base PATH` | Custom sessions base directory |
+| `--openclaw-home PATH` | Custom OpenClaw home directory |
+
+## Security
+
+- **Observer-only**: never writes, deletes, or modifies any OpenClaw state
+- **Default sanitization**: API keys, tokens, secrets are masked in output
+- **No network calls**: all diagnostics are local file reads + process inspection
+- **No dependencies**: no supply-chain attack surface beyond Node.js + Python stdlib
+
+## Contributing
+
+Issues and PRs welcome. For new collectors:
+
+1. Create `ocdiag/collectors/your_module.py`
+2. Use `@register` decorator
+3. Return `Report` with explicit `Verdict` on every `Check`
+4. Run `python3 -m ocdiag.main your_module` to test
+5. Add tests in `tests/`
+
+## License
+
+[MIT](./LICENSE)

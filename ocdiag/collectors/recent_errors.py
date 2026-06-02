@@ -244,21 +244,7 @@ def _section_app_logs(s: Section, log_dir: str) -> dict:
             data={"error_count": 0, "fatal_count": 0},
         )
 
-    api_lines, _api_unreadable = _collect_api_errors(logs)
-    data["api_error_count"] = len(api_lines)
-    if api_lines:
-        rendered = []
-        for ln in api_lines[:100]:
-            r = _render_log_line(ln, 500)
-            if r:
-                rendered.append(r)
-        s.warn(
-            "logs.api_http_errors",
-            f"模型 API HTTP 错误: {len(api_lines)} 条",
-            evidence="\n".join(rendered) if rendered else None,
-            data={"count": len(api_lines)},
-        )
-    # 0 条时不显示，减少噪音
+    # Model API HTTP errors removed — already checked by gateway collector
     return data
 
 

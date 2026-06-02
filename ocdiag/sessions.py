@@ -1,11 +1,12 @@
 """Shared session-file lookup utilities for trace/extract.
 
 A "session" is identified by a UUID. On disk it can have multiple files:
-  <uuid>.jsonl              — active
-  <uuid>.jsonl.lock         — write lock (transient, filtered by default)
-  <uuid>.jsonl.deleted.<ts> — soft-deleted
-  <uuid>.jsonl.reset.<ts>   — pre-reset snapshot
-  <uuid>.jsonl.bak-<pid>    — backup snapshot
+  <uuid>.jsonl                          — active
+  <uuid>.jsonl.lock                     — write lock (transient, filtered by default)
+  <uuid>.jsonl.deleted.<ts>             — soft-deleted
+  <uuid>.jsonl.reset.<ts>               — pre-reset snapshot
+  <uuid>.jsonl.bak-<pid>                — backup snapshot
+  <uuid>.checkpoint.<cp-uuid>.jsonl     — checkpoint snapshot (belongs to <uuid>)
 
 Sibling artifacts (NOT session content):
   <uuid>.trajectory.jsonl, <uuid>.acp-stream.jsonl, <uuid>.json
@@ -41,6 +42,8 @@ def classify_state(filename: str) -> str:
         return "backup"
     if filename.endswith(".jsonl.lock"):
         return "lock"
+    if ".checkpoint." in filename and filename.endswith(".jsonl"):
+        return "checkpoint"
     if filename.endswith(".jsonl"):
         return "active"
     return "unknown"
@@ -55,7 +58,11 @@ def _session_uuid_of(filename: str) -> Optional[str]:
     idx = filename.find(".jsonl")
     if idx <= 0:
         return None
-    return filename[:idx]
+    stem = filename[:idx]
+    cp_idx = stem.find(".checkpoint.")
+    if cp_idx > 0:
+        return stem[:cp_idx]
+    return stem
 
 
 def _is_transient(filename: str) -> bool:
@@ -127,7 +134,7 @@ def resolve(
         return [], sorted(by_uuid.keys())
 
     files = next(iter(by_uuid.values()))
-    prio = {"active": 0, "lock": 1, "deleted": 2, "reset": 3, "backup": 4, "unknown": 9}
+    prio = {"active": 0, "lock": 1, "checkpoint": 2, "deleted": 3, "reset": 4, "backup": 5, "unknown": 9}
     files.sort(key=lambda x: (prio.get(x[1], 9), x[0]))
     return files, []
 

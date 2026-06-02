@@ -5,7 +5,7 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue.svg)](https://www.python.org/)
 
-Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 12 diagnostic modules, 2 inspectors, structured output, zero dependencies.
+Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 13 diagnostic modules, 2 inspectors, structured output, zero dependencies.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [AI Agent Skill](#ai-agent-skill) · [Output Formats](#output-formats) · [Examples](#examples) · [Contributing](#contributing)
 
@@ -15,7 +15,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 - **Zero Dependencies** — Pure Python stdlib + Node thin-shell. No pip packages, no build steps
 - **Observer-Only** — Never modifies system state. Safe to run anytime, anywhere
 - **Explicit Verdicts** — Every check produces `ok` / `warn` / `fail` with clear thresholds, not regex-guessed
-- **12 Diagnostic Modules** — From system health to model performance to cron jobs, comprehensive coverage
+- **13 Diagnostic Modules** — From system health to model performance to cron jobs, comprehensive coverage
 - **Session Forensics** — Trace a single message's full lifecycle, or extract entire session history
 - **Default Sanitization** — API keys, tokens, secrets masked in config/log output. Trajectory-sourced fields are plaintext by default; use `trace --mask` when sharing output
 
@@ -33,6 +33,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 | 💬 sessions_diag | Session count, sizes, stuck detection |
 | 🔌 plugin_diag | Plugin status, hook errors, DNS, trajectory drift |
 | 🏃 run_health | 24h/7d/30d run health, abort rate, active leak detection |
+| 📋 task_health | Task/subagent success rate, failures, timeouts, stuck detection |
 | 🐚 shell_history | Dangerous command detection in shell history |
 | 🩺 doctor | Environment self-check (Node, Python, OpenClaw, paths) |
 
@@ -243,7 +244,7 @@ bin/
 ocdiag/
   main.py              CLI dispatch + argument parsing
   core/                Types (Check/Section/Report/Verdict), registry, context
-  collectors/          12 state collectors (one file each, @register decorator)
+  collectors/          13 state collectors (one file each, @register decorator)
   inspectors/          trace + extract
   render/              human / json / ndjson renderers
   (shared utilities)   sessions, trajectory, sensitive, paths, ...

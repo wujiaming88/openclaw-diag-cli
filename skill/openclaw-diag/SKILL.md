@@ -39,6 +39,7 @@ openclaw-diag all --format json
    - `cron_jobs != ok` → run `openclaw-diag cron_jobs --format json`
    - `plugin_diag != ok` → run `openclaw-diag plugin_diag --format json`
    - `run_health != ok` → run `openclaw-diag run_health --format json`, then use `trace` if a session UUID is involved
+   - `task_health != ok` → run `openclaw-diag task_health --format json`, check error patterns and timeout config
    - `sessions_diag != ok` → run `openclaw-diag sessions_diag --format json`, then use `extract <uuid> --summary --format json` when a session UUID is known
 
 4. Final answer should include:
@@ -57,6 +58,7 @@ openclaw-diag all --format json
 | Gateway down / cannot connect | `openclaw-diag gateway --format json` |
 | Recent failures / errors | `openclaw-diag recent_errors --format json` |
 | Cron not firing / no delivery | `openclaw-diag cron_jobs --format json` |
+| Task/subagent 失败 | `openclaw-diag task_health --format json` |
 | Plugin issue | `openclaw-diag plugin_diag --format json` |
 | Session stuck | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |

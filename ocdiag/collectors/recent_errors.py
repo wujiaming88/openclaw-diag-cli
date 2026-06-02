@@ -258,12 +258,7 @@ def _section_app_logs(s: Section, log_dir: str) -> dict:
             evidence="\n".join(rendered) if rendered else None,
             data={"count": len(api_lines)},
         )
-    else:
-        s.ok(
-            "logs.api_http_errors",
-            "模型 API HTTP 错误: 0 条",
-            data={"count": 0},
-        )
+    # 0 条时不显示，减少噪音
     return data
 
 

@@ -17,7 +17,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 - **Explicit Verdicts** — Every check produces `ok` / `warn` / `fail` with clear thresholds, not regex-guessed
 - **12 Diagnostic Modules** — From system health to model performance to cron jobs, comprehensive coverage
 - **Session Forensics** — Trace a single message's full lifecycle, or extract entire session history
-- **Default Sanitization** — API keys, tokens, secrets masked by default. `--unmask` to override
+- **Default Sanitization** — API keys, tokens, secrets masked in config/log output. Trajectory-sourced fields are plaintext by default; use `trace --mask` when sharing output
 
 ## Features
 
@@ -149,8 +149,10 @@ Success:
     "summary": {"pass": 5, "warn": 1, "fail": 0, "total": 6},
     "elapsed_ms": 1234,
     "sections": [...],
-    "data": {...}
-  }
+    "data": {...},
+    "status": "ok"
+  },
+  "error": null
 }
 ```
 
@@ -158,6 +160,7 @@ Error:
 ```json
 {
   "ok": false,
+  "data": null,
   "error": {
     "code": "SESSION_NOT_FOUND",
     "message": "找不到 session 'abc123'",
@@ -245,7 +248,9 @@ ocdiag/
   render/              human / json / ndjson renderers
   (shared utilities)   sessions, trajectory, sensitive, paths, ...
 skill/
-  openclaw-diag/       Agent skill (SKILL.md + install script)
+  openclaw-diag/       Agent skill (SKILL.md only)
+scripts/
+  install-skill.py     Deploys skill to agent frameworks
 ```
 
 Adding a new collector: create one file in `ocdiag/collectors/`, add `@register` — done. No other files to edit.
@@ -265,9 +270,9 @@ Adding a new collector: create one file in `ocdiag/collectors/`, add `@register`
 
 ## Security
 
-- **Observer-only**: never writes, deletes, or modifies any OpenClaw state
-- **Default sanitization**: API keys, tokens, secrets are masked in output
-- **No network calls**: all diagnostics are local file reads + process inspection
+- **Observer-only diagnostics**: diagnostic commands never write, delete, or modify OpenClaw state. `skill-install` writes skill files to agent framework paths by explicit request
+- **Default sanitization**: API keys, tokens, secrets are masked in config/log collectors. Trajectory-sourced free-form fields (message content, tool output) are plaintext by default — use `trace --mask` / `extract --mask` when sharing output externally
+- **Read-only probes**: some collectors perform DNS lookups, TCP connects, or HTTP GET/HEAD probes (sys_health, gateway, plugin_diag) for connectivity checks. No POST/PUT/DELETE, no service restarts, no runtime state mutation
 - **No dependencies**: no supply-chain attack surface beyond Node.js + Python stdlib
 
 ## Contributing

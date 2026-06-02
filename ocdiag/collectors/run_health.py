@@ -267,21 +267,42 @@ def _section_active_leaks(
             data=payload,
         )
         return payload
-    body_lines = [
-        f"检测到 {len(leaks)} 个未正常结束 + 启动超过 1h 的 run",
-    ]
-    for lk in leaks[:10]:
-        body_lines.append(
-            f"  {lk['sessionId'][:8]}#{lk['runId'][:8]} "
-            f"trigger={lk['trigger']} age={lk['age_hours']}h "
-            f"active={lk['active_count']}",
+    # Separate true leaks (active>0) from historical orphans (active=0)
+    true_leaks = [lk for lk in leaks if lk["active_count"] > 0]
+    orphans = [lk for lk in leaks if lk["active_count"] == 0]
+
+    if true_leaks:
+        body_lines = [f"检测到 {len(true_leaks)} 个正在泄漏的 run (active>0)"]
+        for lk in true_leaks[:10]:
+            body_lines.append(
+                f"  {lk['sessionId'][:8]}#{lk['runId'][:8]} "
+                f"trigger={lk['trigger']} age={lk['age_hours']}h "
+                f"active={lk['active_count']}",
+            )
+        if orphans:
+            body_lines.append(f"另有 {len(orphans)} 个历史孤儿 (active=0, 无害)")
+        s.fail(
+            "run_health.active_leaks",
+            f"Active run 泄漏: {len(true_leaks)} 个正在泄漏, {len(orphans)} 个历史孤儿",
+            evidence="\n".join(body_lines),
+            data=payload,
         )
-    s.fail(
-        "run_health.active_leaks",
-        f"Active run 泄漏: {len(leaks)} 个",
-        evidence="\n".join(body_lines),
-        data=payload,
-    )
+    else:
+        # All leaks are orphans (active=0) — historical bookkeeping artifacts
+        body_lines = [
+            f"{len(orphans)} 个历史孤儿 run (started 但无 ended 事件, active=0, 无实际资源占用)",
+        ]
+        for lk in orphans[:10]:
+            body_lines.append(
+                f"  {lk['sessionId'][:8]}#{lk['runId'][:8]} "
+                f"trigger={lk['trigger']} age={lk['age_hours']}h",
+            )
+        s.warn(
+            "run_health.active_leaks",
+            f"历史孤儿 run: {len(orphans)} 个 (无害, 等待 trajectory GC)",
+            evidence="\n".join(body_lines),
+            data=payload,
+        )
     return payload
 
 

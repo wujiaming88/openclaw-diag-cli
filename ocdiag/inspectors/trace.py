@@ -81,6 +81,8 @@ def _format_event(ev: Dict[str, Any]) -> str:
         return f"T+{off:<8} [model #{ev['num']}] {detail}"
     if etype == "tool_batch":
         return f"T+{off:<8} [tool]      {detail}"
+    if etype == "tool_not_dispatched":
+        return f"T+{off:<8} [tool]      {detail}"
     if etype == "error":
         return f"T+{off:<8} [ERROR]     {detail}"
     return f"T+{off:<8} [{etype}]    {detail}"
@@ -89,7 +91,12 @@ def _format_event(ev: Dict[str, Any]) -> str:
 def _section_timeline(s: Section, analysis: Dict[str, Any]) -> None:
     for ev in analysis["events"]:
         msg = _format_event(ev)
-        verdict = Verdict.FAIL if ev["type"] == "error" else Verdict.OK
+        if ev["type"] == "error":
+            verdict = Verdict.FAIL
+        elif ev["type"] == "tool_not_dispatched":
+            verdict = Verdict.WARN
+        else:
+            verdict = Verdict.OK
         s.add(f"timeline.{ev['type']}", verdict, msg)
 
 

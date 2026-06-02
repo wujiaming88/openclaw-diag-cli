@@ -308,6 +308,16 @@ def analyze_phases(trace):
             elif role == "toolResult":
                 pending_tool_results.append(r)
         elif rtype == "custom" and r.get("customType") == "openclaw:prompt-error":
+            # If model requested toolUse but tool never executed, emit warning
+            if model_calls and not pending_tool_results:
+                last_mc = model_calls[-1]
+                if last_mc["stop_reason"] == "toolUse" and last_mc["tool_names"]:
+                    names = ", ".join(last_mc["tool_names"])
+                    events.append({
+                        "offset_ms": events[-1]["offset_ms"] if events else 0,
+                        "type": "tool_not_dispatched",
+                        "detail": f"{names} (requested, never dispatched)",
+                    })
             data = r.get("data", {})
             err_ts = data.get("timestamp", 0)
             offset = err_ts - base_ms if err_ts else 0

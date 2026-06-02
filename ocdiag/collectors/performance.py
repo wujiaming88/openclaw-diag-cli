@@ -100,13 +100,15 @@ def _categorize_api_error(msg, stop):
     return f"other(stop={stop or 'n/a'})"
 
 
-def _collect_session_files(sessions_base, limit=20):
+def _collect_session_files(sessions_base, limit=50):
     files = []
     pattern1 = os.path.join(sessions_base, "*", "*", "*.jsonl")
     pattern2 = os.path.join(sessions_base, "*", "*", "*.jsonl.reset.*")
     for pat in (pattern1, pattern2):
         for p in glob.glob(pat):
             if p.endswith(".trajectory.jsonl"):
+                continue
+            if ".acp-stream" in p:
                 continue
             try:
                 m = os.path.getmtime(p)
@@ -117,8 +119,14 @@ def _collect_session_files(sessions_base, limit=20):
     return [p for _, p in files[:limit]]
 
 
-def _tail_lines(path, n=500):
+def _tail_lines(path, n=2000):
+    """Read the last n lines of a file. Increased from 500 to capture more tool calls."""
     try:
+        size = os.path.getsize(path)
+        # For files under 2MB, read the whole thing (more complete data)
+        if size < 2 * 1024 * 1024:
+            with open(path, "r", errors="replace") as f:
+                return f.readlines()
         with open(path, "r", errors="replace") as f:
             return f.readlines()[-n:]
     except OSError:
@@ -166,8 +174,9 @@ def _analyze_sessions(session_files):
         pending_tool_calls = {}
         current_turn_user_ts = None
         current_turn_last_assistant_ts = None
+        last_assistant_record_epoch_ms = None  # for tool duration fallback
 
-        for raw_line in _tail_lines(session_path, 500):
+        for raw_line in _tail_lines(session_path):
             raw_line = raw_line.strip()
             if not raw_line:
                 continue
@@ -189,6 +198,9 @@ def _analyze_sessions(session_files):
                     max_msg_ms = msg_ts_raw
 
             if role == "assistant":
+                # Track record timestamp for tool duration fallback
+                if obj_ts:
+                    last_assistant_record_epoch_ms = obj_ts.timestamp() * 1000
                 provider = msg.get("provider") or ""
                 model = msg.get("model") or "?"
                 # openclaw/* entries are internal runtime markers, not real model calls
@@ -298,6 +310,12 @@ def _analyze_sessions(session_files):
                     details.get("durationMs")
                     if isinstance(details, dict) else None
                 )
+                # Fallback: compute duration from record timestamps
+                if dur_ms is None and obj_ts and last_assistant_record_epoch_ms:
+                    result_epoch_ms = obj_ts.timestamp() * 1000
+                    inferred = result_epoch_ms - last_assistant_record_epoch_ms
+                    if 0 < inferred < 600000:  # sanity: 0 < dur < 10 min
+                        dur_ms = inferred
                 is_error = bool(msg.get("isError", False))
 
                 ts = tool_stats[tool_name]

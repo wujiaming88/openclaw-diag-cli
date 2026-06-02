@@ -271,7 +271,7 @@ Adding a new collector: create one file in `ocdiag/collectors/`, add `@register`
 ## Security
 
 - **Observer-only diagnostics**: diagnostic commands never write, delete, or modify OpenClaw state. `skill-install` writes skill files to agent framework paths by explicit request
-- **Default sanitization**: API keys, tokens, secrets are masked in config/log collectors. Trajectory-sourced free-form fields (message content, tool output) are plaintext by default — use `trace --mask` / `extract --mask` when sharing output externally
+- **Default sanitization**: API keys, tokens, secrets are masked in config/log collectors. Trajectory-sourced free-form fields (message content, tool output) are plaintext by default — use `trace --mask` when sharing output externally; `extract` is masked by default, use `--unmask` only for trusted local analysis
 - **Read-only probes**: some collectors perform DNS lookups, TCP connects, or HTTP GET/HEAD probes (sys_health, gateway, plugin_diag) for connectivity checks. No POST/PUT/DELETE, no service restarts, no runtime state mutation
 - **No dependencies**: no supply-chain attack surface beyond Node.js + Python stdlib
 

@@ -36,6 +36,39 @@ from .render.ndjson import NdjsonRenderer
 _FORMAT_CHOICES = ("pretty", "json", "ndjson")
 
 
+def _paged_print(text: str) -> None:
+    """Print text through a pager when stdout is a TTY and output is long.
+
+    Uses $PAGER or falls back to 'less -R' (preserves ANSI colors).
+    If pager is unavailable or stdout is not a TTY, prints directly.
+    """
+    import shutil as _shutil
+    import subprocess as _sp
+
+    if not sys.stdout.isatty():
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+
+    term_lines = _shutil.get_terminal_size().lines
+    text_lines = text.count("\n")
+    if text_lines <= term_lines - 2:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+
+    pager_cmd = os.environ.get("PAGER", "less -R")
+    try:
+        proc = _sp.Popen(
+            pager_cmd, shell=True, stdin=_sp.PIPE,
+            encoding="utf-8", errors="replace",
+        )
+        proc.communicate(input=text)
+    except (OSError, BrokenPipeError):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+
 def _resolve_format(args) -> str:
     """Resolve effective output format from --format / --json flags.
 
@@ -211,6 +244,8 @@ def cmd_all(args, skip_ids: List[str]) -> int:
 
     total = len(state)
     n = 0
+    renderer = HumanRenderer(no_color=getattr(args, "no_color", False))
+    buffered_output: List[str] = []
     for c in state:
         n += 1
         print(
@@ -230,7 +265,7 @@ def cmd_all(args, skip_ids: List[str]) -> int:
             report.elapsed_ms = (time.time() - t0) * 1000
             traceback.print_exc(file=sys.stderr)
             rc_overall = EXIT_RUNTIME_ERROR
-        _render(report, args)
+        buffered_output.append(renderer.render(report))
         elapsed = report.elapsed_ms / 1000.0
         print(
             f"[{n}/{total}] {c.title} ({c.id}) ... done ({elapsed:.1f}s)",
@@ -239,6 +274,10 @@ def cmd_all(args, skip_ids: List[str]) -> int:
         rc = _exit_code(report)
         if rc != 0 and rc > rc_overall:
             rc_overall = rc
+
+    # Output all buffered content, using pager if needed
+    full_output = "\n".join(buffered_output) + "\n"
+    _paged_print(full_output)
     return rc_overall
 
 

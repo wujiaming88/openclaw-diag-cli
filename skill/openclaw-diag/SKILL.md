@@ -38,7 +38,8 @@ openclaw-diag all --format json
    - `recent_errors != ok` → run `openclaw-diag recent_errors --format json`
    - `cron_jobs != ok` → run `openclaw-diag cron_jobs --format json`
    - `plugin_diag != ok` → run `openclaw-diag plugin_diag --format json`
-   - `run_health` or `sessions_diag != ok` → inspect trajectory/run health first
+   - `run_health != ok` → run `openclaw-diag run_health --format json`, then use `trace` if a session UUID is involved
+   - `sessions_diag != ok` → run `openclaw-diag sessions_diag --format json`, then use `extract <uuid> --summary --format json` when a session UUID is known
 
 4. Final answer should include:
    - Overall verdict

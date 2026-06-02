@@ -1,6 +1,6 @@
 {
   "name": "openclaw-diag-cli",
-  "version": "0.6.2",
+  "version": "1.0.0",
   "description": "OpenClaw observer-only diagnostic CLI. Zero-dependency Python scripts wrapped in Node for npx-friendly install.",
   "keywords": [
     "openclaw",
@@ -26,9 +26,11 @@
   "files": [
     "bin/openclaw-diag.js",
     "bin/ocdiag",
-    "diag/*.py",
     "ocdiag/*.py",
-    "tools/*.py",
+    "ocdiag/core/*.py",
+    "ocdiag/collectors/*.py",
+    "ocdiag/inspectors/*.py",
+    "ocdiag/render/*.py",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"

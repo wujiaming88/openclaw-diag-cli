@@ -1,1 +1,1 @@
-"""Object inspector package (Phase 3). Empty for now."""
+"""Object inspector package — inspectors take a session uuid and inspect it."""

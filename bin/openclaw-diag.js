@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 // openclaw-diag — Node entry shell.
 //
-// All real logic lives in Python (ocdiag.dispatcher, ocdiag.doctor). This
-// shell exists for one reason only: npx-friendly install. It locates a
-// suitable python3, hands argv to the Python dispatcher, and forwards stdio
-// + exit code transparently. The single source of truth for the module
-// catalogue is `ocdiag/dispatcher.py`; the Node shell pulls the list from
-// `ocdiag list --json` instead of duplicating it (axiom #3).
+// All real logic lives in Python (ocdiag.main). This shell exists for one
+// reason only: npx-friendly install. It locates a suitable python3, hands
+// argv to the Python dispatcher, and forwards stdio + exit code transparently.
+// The single source of truth for the module catalogue is `ocdiag/main.py`;
+// the Node shell pulls the list from `ocdiag list --json` instead of
+// duplicating it (axiom #3).
 
 'use strict';
 
@@ -96,9 +96,6 @@ function printHelp(modules) {
 }
 
 function spawnDispatcher(pyCmd, args) {
-  // v2 transition: pass --v2 through to the Python shim, which then routes
-  // to ocdiag.main instead of ocdiag.dispatcher. OCDIAG_V2=1 in the env
-  // triggers the same routing without changing argv.
   const child = spawn(pyCmd, [DISPATCHER, ...args], { stdio: 'inherit' });
   child.on('error', (err) => {
     console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
@@ -115,8 +112,20 @@ function spawnDispatcher(pyCmd, args) {
 
 function runDoctor(pyCmd, args) {
   // Forward Node version into the Python doctor so it can include it in the
-  // report. ocdiag.doctor handles the actual logic; we just spawn it.
-  spawnDispatcher(pyCmd, ['doctor', '--node-version', process.versions.node, ...args]);
+  // report. The v2 doctor reads OCDIAG_NODE_VERSION from the env.
+  const env = Object.assign({}, process.env, { OCDIAG_NODE_VERSION: process.versions.node });
+  const child = spawn(pyCmd, [DISPATCHER, 'doctor', ...args], { stdio: 'inherit', env });
+  child.on('error', (err) => {
+    console.error(`Error: failed to spawn ${pyCmd}: ${err.message}`);
+    process.exit(1);
+  });
+  child.on('exit', (code, signal) => {
+    if (signal) {
+      process.kill(process.pid, signal);
+      return;
+    }
+    process.exit(code == null ? 1 : code);
+  });
 }
 
 function main() {

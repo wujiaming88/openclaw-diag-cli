@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
-"""ocdiag entry-point shim that runs the dispatcher from the repo root.
+"""ocdiag entry-point shim that runs the v2 dispatcher from the repo root."""
 
-Routes to the v2 (ocdiag.main) dispatch when ``OCDIAG_V2=1`` env var is set
-or when ``--v2`` is the first argv. Otherwise the legacy v1 dispatcher
-(ocdiag.dispatcher) handles the request — this is the default during the
-v2 transition.
-"""
-
-import os
 import sys
 from pathlib import Path
 
@@ -15,18 +8,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 
-def _use_v2(argv):
-    if os.environ.get("OCDIAG_V2") == "1":
-        return True, argv
-    if argv and argv[0] == "--v2":
-        return True, argv[1:]
-    return False, argv
-
-
 if __name__ == "__main__":
-    use_v2, argv = _use_v2(sys.argv[1:])
-    if use_v2:
-        from ocdiag.main import main as v2_main
-        sys.exit(v2_main(argv))
-    from ocdiag.dispatcher import main
-    sys.exit(main(argv))
+    argv = sys.argv[1:]
+    # Accept --v2 as a no-op for backward-compat with phase-2 callers.
+    if argv and argv[0] == "--v2":
+        argv = argv[1:]
+    from ocdiag.main import main as v2_main
+    sys.exit(v2_main(argv))

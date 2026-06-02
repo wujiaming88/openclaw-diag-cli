@@ -1,8 +1,8 @@
-"""v2 CLI entry point.
+"""v2 CLI entry point — the default path since v1.0.0.
 
-Activated via ``OCDIAG_V2=1`` env var or ``--v2`` flag on the launcher. The
-old v1 path (ocdiag.dispatcher → diag/XX_*.py) remains the default during
-the transition.
+Routes to registered collectors / inspectors via @register decorators.
+The ``--legacy`` flag (or ``OCDIAG_LEGACY=1``) on the launcher falls back
+to the pre-v2 dispatcher in ``_legacy/``.
 """
 
 from __future__ import annotations
@@ -88,10 +88,15 @@ def cmd_list(args) -> int:
     return 0
 
 
-def cmd_doctor(args) -> int:
-    # Reuse the existing v1 doctor module; it already prints structured output.
-    from . import doctor
-    return doctor.run(json_mode=args.json)
+def cmd_doctor(args, node_version: Optional[str] = None) -> int:
+    """Run the v2 doctor collector.
+
+    The ``--node-version`` value forwarded by the Node launcher is stashed in
+    an env var the collector reads, so we keep DiagContext free of CLI noise.
+    """
+    if node_version:
+        os.environ["OCDIAG_NODE_VERSION"] = node_version
+    return cmd_run_collector(args, "doctor")
 
 
 def cmd_all(args, skip_ids: List[str]) -> int:
@@ -160,31 +165,87 @@ def cmd_run_collector(args, mid: str) -> int:
     return _exit_code(report)
 
 
-def cmd_trace_or_extract(args, head: str, rest: List[str]) -> int:
-    """Phase 1: delegate to legacy tools/oc_session_trace.py and extract.py."""
-    import runpy
-    from pathlib import Path as _P
-    repo_root = _P(__file__).resolve().parent.parent
-    script = (
-        repo_root / "tools" / "oc_session_trace.py" if head == "trace"
-        else repo_root / "tools" / "oc_session_extract.py"
-    )
-    if not script.is_file():
-        print(f"Error: tool not found: {script}", file=sys.stderr)
+def _build_trace_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="openclaw-diag trace", add_help=True)
+    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
+    p.add_argument("--msg-index", type=int, default=None,
+                   help="Nth user message (0-based)")
+    p.add_argument("--msg-id", default=None, help="Message by id field")
+    p.add_argument("--msg-match", default=None,
+                   help="First user message containing TEXT")
+    p.add_argument("--no-trajectory", action="store_true")
+    p.add_argument("--no-log", action="store_true")
+    p.add_argument("--show-tool-metas", action="store_true")
+    p.add_argument("--show-plugin-snapshot", action="store_true")
+    p.add_argument("--mask", action="store_true")
+    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    _common_arguments(p)
+    return p
+
+
+def _build_extract_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="openclaw-diag extract", add_help=True)
+    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
+    p.add_argument("--summary", action="store_true",
+                   help="Per-file record-count summary, no record dump")
+    p.add_argument("-a", "--all", action="store_true", dest="all_versions",
+                   help="Extract all versions (active + reset + deleted + backup)")
+    p.add_argument("--list", action="store_true", dest="list_only",
+                   help="List matching files; do not extract")
+    p.add_argument("--types", default=None,
+                   help="Filter by record type (comma-separated)")
+    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    _common_arguments(p)
+    return p
+
+
+def cmd_inspector(head: str, rest: List[str]) -> int:
+    inspector = registry.get(head)
+    if inspector is None or inspector.kind != "inspector":
+        print(f"Error: 未知 inspector '{head}'", file=sys.stderr)
         return 2
-    saved_argv = sys.argv[:]
+    if head == "trace":
+        parser = _build_trace_parser()
+        ns = parser.parse_args(rest)
+        kwargs = {
+            "session_id": ns.session_id,
+            "msg_index": ns.msg_index,
+            "msg_id": ns.msg_id,
+            "msg_match": ns.msg_match,
+            "no_trajectory": ns.no_trajectory,
+            "no_log": ns.no_log,
+            "show_tool_metas": ns.show_tool_metas,
+            "show_plugin_snapshot": ns.show_plugin_snapshot,
+            "mask": ns.mask,
+            "agent": ns.agent,
+        }
+    elif head == "extract":
+        parser = _build_extract_parser()
+        ns = parser.parse_args(rest)
+        kwargs = {
+            "session_id": ns.session_id,
+            "summary": ns.summary,
+            "all_versions": ns.all_versions,
+            "list_only": ns.list_only,
+            "types_filter": ns.types,
+            "agent": ns.agent,
+            "unmask": ns.unmask,
+        }
+    else:
+        print(f"Error: inspector '{head}' has no argument schema", file=sys.stderr)
+        return 2
+
+    ctx = _build_context(ns)
+    t0 = time.time()
     try:
-        sys.argv = [str(script), *rest]
-        os.environ.setdefault("OPENCLAW_DIAG_PROG", f"openclaw-diag {head}")
-        runpy.run_path(str(script), run_name="__main__")
-        return 0
-    except SystemExit as e:
-        try:
-            return int(e.code) if e.code is not None else 0
-        except (TypeError, ValueError):
-            return 1
-    finally:
-        sys.argv = saved_argv
+        report = inspector.collect(ctx, **kwargs)
+    except BaseException as e:  # noqa: BLE001
+        report = Report(module_id=inspector.id, title=inspector.title)
+        report.error = f"{type(e).__name__}: {e}"
+        report.elapsed_ms = (time.time() - t0) * 1000
+        traceback.print_exc(file=sys.stderr)
+    _render(report, ctx)
+    return _exit_code(report)
 
 
 def _split_skip(rest: List[str]):
@@ -237,8 +298,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_list(args)
 
     if head == "doctor":
-        args, _ = parser.parse_known_args(rest)
-        return cmd_doctor(args)
+        # Pull --node-version out before argparse so the v2 doctor collector
+        # can read it from the env without a custom DiagContext field.
+        node_version: Optional[str] = None
+        passthrough: List[str] = []
+        i = 0
+        while i < len(rest):
+            if rest[i] == "--node-version" and i + 1 < len(rest):
+                node_version = rest[i + 1]
+                i += 2
+                continue
+            passthrough.append(rest[i])
+            i += 1
+        args, _ = parser.parse_known_args(passthrough)
+        return cmd_doctor(args, node_version=node_version)
 
     if head == "all":
         skip_ids, passthrough = _split_skip(rest)
@@ -246,9 +319,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return cmd_all(args, skip_ids)
 
     if head in ("trace", "extract"):
-        return cmd_trace_or_extract(None, head, rest)
+        return cmd_inspector(head, rest)
 
-    if registry.get(head) is not None:
+    coll = registry.get(head)
+    if coll is not None:
+        if coll.kind == "inspector":
+            return cmd_inspector(head, rest)
         args, _ = parser.parse_known_args(rest)
         return cmd_run_collector(args, head)
 

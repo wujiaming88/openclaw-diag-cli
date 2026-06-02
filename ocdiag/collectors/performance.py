@@ -717,7 +717,7 @@ def _section_daily_trend(s: Section, data: dict) -> dict:
         )
         out_data["daily_trend"] = []
         return out_data
-    today = datetime.now(timezone.utc).date()
+    today = datetime.now().date()
     day_list = [
         (today - timedelta(days=i)).strftime("%m-%d") for i in range(7)
     ]

@@ -40,7 +40,7 @@ def _fmt_duration(ms):
 def _format_schedule(sched) -> str:
     k = sched.get("kind", "?")
     if k == "cron":
-        return f"cron {sched.get('expr','?')} (tz={sched.get('tz','UTC')})"
+        return f"cron {sched.get('expr','?')} (tz={sched.get('tz','local')})"
     if k == "every":
         return f"every {sched.get('everyMs',0)/1000:.0f}s"
     if k == "at":

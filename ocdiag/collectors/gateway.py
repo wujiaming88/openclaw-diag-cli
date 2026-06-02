@@ -627,7 +627,7 @@ def _section_ws_lifecycle(s: Section, app_log: str) -> dict:
             ]
             if len(window) >= 3:
                 freq_flags.append(
-                    (acc, attempts[i].strftime("%H:%M:%S"), len(window)),
+                    (acc, attempts[i].astimezone().strftime("%H:%M:%S"), len(window)),
                 )
                 break
 

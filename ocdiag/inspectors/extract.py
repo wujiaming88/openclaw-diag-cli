@@ -18,6 +18,7 @@ from ..core.context import DiagContext
 from ..core.errors import DiagError
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
+from ..timeutil import fmt_iso_local
 from ..extracting import (
     collect_records,
     collect_summary,
@@ -54,7 +55,7 @@ def _section_summary(s: Section, summary: Dict[str, Any]) -> None:
     if tr["start"] or tr["end"]:
         s.ok(
             "extract.time_range",
-            f"Time range: {tr['start'] or '?'}  →  {tr['end'] or '?'}",
+            f"Time range: {fmt_iso_local(tr['start'])}  →  {fmt_iso_local(tr['end'])}",
             data=tr,
         )
 

@@ -193,6 +193,10 @@ def cmd_examples() -> int:
   openclaw-diag extract <uuid>
   openclaw-diag extract abc12345 --summary
 
+  # session 全景诊断（关联到 trajectory + 日志 + 子任务 + cron）
+  openclaw-diag panorama <uuid>
+  openclaw-diag panorama abc12345 --include-ambient --format json
+
   # 模型性能
   openclaw-diag performance
 
@@ -317,6 +321,15 @@ _EXTRACT_EPILOG = """示例:
   openclaw-diag extract 7e9f3b31 --format json
 """
 
+_PANORAMA_EPILOG = """示例:
+  openclaw-diag panorama 7e9f3b31                       # latest run
+  openclaw-diag panorama 7e9f3b31 --all-runs            # every run
+  openclaw-diag panorama 7e9f3b31 --run-index 0         # first run
+  openclaw-diag panorama 7e9f3b31 --include-ambient     # 也带上窗口内 WARN/ERROR
+  openclaw-diag panorama 7e9f3b31 --strict-correlation  # only sessionId / runIds
+  openclaw-diag panorama 7e9f3b31 --format json --mask
+"""
+
 
 def _build_trace_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -362,6 +375,31 @@ def _build_extract_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _build_panorama_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="openclaw-diag panorama",
+        add_help=True,
+        epilog=_PANORAMA_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
+    p.add_argument("--mask", action="store_true",
+                   help="Sanitize tool args / message content / api keys")
+    p.add_argument("--run-index", type=int, default=None,
+                   help="Pick the Nth run (default: -1 = latest)")
+    p.add_argument("--all-runs", action="store_true",
+                   help="Include every run in the session")
+    p.add_argument("--include-ambient", action="store_true",
+                   help="Also include uncorrelated WARN/ERROR logs in the "
+                        "session's time window")
+    p.add_argument("--strict-correlation", action="store_true",
+                   help="Match only on sessionId / runIds (drops sessionKey "
+                        "and toolCallId hits)")
+    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    _common_arguments(p)
+    return p
+
+
 def cmd_inspector(head: str, rest: List[str]) -> int:
     inspector = registry.get(head)
     if inspector is None or inspector.kind != "inspector":
@@ -393,6 +431,19 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
             "types_filter": ns.types,
             "agent": ns.agent,
             "unmask": ns.unmask,
+        }
+    elif head == "panorama":
+        parser = _build_panorama_parser()
+        ns = parser.parse_args(rest)
+        kwargs = {
+            "session_id": ns.session_id,
+            "mask": ns.mask,
+            "unmask": ns.unmask,
+            "run_index": ns.run_index,
+            "all_runs": ns.all_runs,
+            "include_ambient": ns.include_ambient,
+            "strict_correlation": ns.strict_correlation,
+            "agent": ns.agent,
         }
     else:
         print(f"Error: inspector '{head}' has no argument schema", file=sys.stderr)
@@ -475,6 +526,7 @@ def _print_help() -> None:
     print("  openclaw-diag doctor              检查环境")
     print("  openclaw-diag trace <uuid>        追踪一条用户消息")
     print("  openclaw-diag extract <uuid>      导出 session 为可读格式")
+    print("  openclaw-diag panorama <uuid>     360° session 全景诊断")
     print("  openclaw-diag examples            打印常用示例")
     print()
     print("通用 flag：--format pretty|json|ndjson  --json (alias)  --no-color  --unmask")
@@ -522,7 +574,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args, _ = parser.parse_known_args(passthrough)
         return cmd_all(args, skip_ids)
 
-    if head in ("trace", "extract"):
+    if head in ("trace", "extract", "panorama"):
         return cmd_inspector(head, rest)
 
     coll = registry.get(head)

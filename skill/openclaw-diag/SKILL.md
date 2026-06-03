@@ -1,6 +1,6 @@
 ---
 name: openclaw-diag
-description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract. 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住。"
+description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract, full-session 360° diagnosis (panorama). 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住、session 全景、session 全方位诊断。"
 metadata:
   requires:
     bins: ["openclaw-diag"]
@@ -62,6 +62,7 @@ openclaw-diag all --format json
 | Plugin issue | `openclaw-diag plugin_diag --format json` |
 | Session stuck | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
+| Full session diagnosis (everything correlated to one UUID) | `openclaw-diag panorama <uuid> --format json` |
 
 ## Trace
 
@@ -86,6 +87,46 @@ openclaw-diag extract <uuid> --all --format json
 ```
 
 Avoid `--unmask` unless the user explicitly needs raw local content.
+
+## Panorama
+
+Use panorama when given a session UUID and asked an open-ended health
+question ("是否健康?", "为什么这条 session 卡住?", "把所有相关信息拉出来"). It
+walks every standard data source — `session.jsonl`, `trajectory.jsonl`,
+`sessions.json`, OpenClaw app log, `runs.sqlite`, and any matching
+`cron/runs/<jobId>.jsonl` — and emits a single Report with sections for
+session overview, correlation graph, timeline, runtime context, tool
+execution, correlated logs, model decisions, child tasks, delivery, and
+health signals.
+
+```bash
+openclaw-diag panorama <uuid> --format json
+openclaw-diag panorama <uuid> --all-runs --format json
+openclaw-diag panorama <uuid> --include-ambient --format json
+openclaw-diag panorama <uuid> --strict-correlation --format json --mask
+```
+
+Inclusion of every record is determined by the correlation graph expanded
+from `sessionId` (sessionKey, runIds, toolCallIds, childSessionIds, cronJobId).
+Each correlated log entry is annotated with `correlation.path` so the
+"why was this included" answer is auditable.
+
+- Default: latest run only. Use `--run-index N` (negative ok) or
+  `--all-runs` for persistent multi-run sessions.
+- `--include-ambient` adds uncorrelated WARN/ERROR log lines that fell
+  inside the session's time window — flagged as ambient because they are
+  *not* provably related.
+- `--strict-correlation` drops sessionKey-only and toolCallId-only
+  matches; useful on noisy multi-tenant logs.
+- `--mask` sanitizes tool arguments and message-style text. Default is
+  unmasked since panorama is intended for local diagnosis.
+
+Verdict mapping:
+- `fail`: trajectory `aborted/timedOut`, child task failed, or any
+  ERROR-level correlated log.
+- `warn`: WARN-level correlated log, model fallback / context overflow
+  decision, stall log, plugin activation error, or E2E > 5min.
+- `ok`: everything clean.
 
 ## JSON Notes
 

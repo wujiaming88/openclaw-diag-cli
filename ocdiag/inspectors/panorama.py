@@ -927,11 +927,16 @@ class PanoramaInspector:
             )
 
         s_timeline = report.section("Panorama · Timeline")
-        s_timeline.ok(
-            "timeline.size",
-            f"timeline entries: {len(timeline)}",
-            data={"count": len(timeline)},
-        )
+        # Don't just show count — show key events
+        if not timeline:
+            s_timeline.warn("timeline.empty", "no timeline events")
+        else:
+            s_timeline.ok(
+                "timeline.window",
+                f"{len(timeline)} events over "
+                f"{fmt_duration((timeline[-1]['ts_ms'] - timeline[0]['ts_ms']) / 1000)}",
+                data={"count": len(timeline)},
+            )
 
         s_runtime = report.section("Panorama · Runtime Context")
         for blk in runtime_blocks:
@@ -951,23 +956,12 @@ class PanoramaInspector:
             s_runtime.warn("runtime.missing", "no trajectory runs available")
 
         s_tools = report.section("Panorama · Tool Execution")
-        s_tools.ok(
-            "tools.total",
-            f"tool calls: {wf_stats['total']} "
-            f"(completed {wf_stats['completed']}, errors {wf_stats['errors']})",
-            data=wf_stats,
-        )
         if wf_stats["completed"]:
             s_tools.ok(
                 "tools.timing",
-                f"avg={wf_stats['avg_ms']}ms p50={wf_stats['p50_ms']}ms "
+                f"timing: avg={wf_stats['avg_ms']}ms p50={wf_stats['p50_ms']}ms "
                 f"p95={wf_stats['p95_ms']}ms max={wf_stats['max_ms']}ms",
-                data={
-                    "avg_ms": wf_stats["avg_ms"],
-                    "p50_ms": wf_stats["p50_ms"],
-                    "p95_ms": wf_stats["p95_ms"],
-                    "max_ms": wf_stats["max_ms"],
-                },
+                data=wf_stats,
             )
         if wf_stats["slowest"]:
             s_tools.ok(
@@ -976,87 +970,97 @@ class PanoramaInspector:
                 f"({wf_stats['slowest']['duration_ms']}ms)",
                 data=wf_stats["slowest"],
             )
-        if wf_stats["errors"]:
+        # Show actual tool errors with names
+        errored_tools = [t for t in waterfall if t.get("is_error")]
+        for et in errored_tools[:10]:
             s_tools.warn(
-                "tools.errors", f"tool errors: {wf_stats['errors']}",
+                f"tools.error.{et.get('tool_call_id', '?')[:12]}",
+                f"FAILED: {et.get('name', '?')} ({et.get('duration_ms', '?')}ms)",
+                data=et,
             )
+        if not errored_tools and not wf_stats["completed"]:
+            s_tools.ok("tools.none", "no tool calls in this run")
 
         s_logs = report.section("Panorama · Correlated Logs")
         if not log_files:
             s_logs.warn("logs.missing", "no app log files found in log_dir")
+        elif not correlated_logs:
+            s_logs.ok("logs.none", "no correlated log entries found")
         else:
-            level_counts: Dict[str, int] = {}
-            sub_counts: Dict[str, int] = {}
-            for rec in correlated_logs:
-                lvl = _log_level(rec) or "INFO"
-                level_counts[lvl] = level_counts.get(lvl, 0) + 1
+            # Show actual ERROR entries (most important)
+            error_entries = [
+                rec for rec in correlated_logs
+                if (_log_level(rec) or "").upper() == "ERROR"
+            ]
+            for rec in error_entries[:10]:
+                msg = parse_log_msg(rec) or "?"
                 sub = get_log_subsystem(rec) or "?"
-                sub_counts[sub] = sub_counts.get(sub, 0) + 1
-            s_logs.ok(
-                "logs.total",
-                f"correlated entries: {len(correlated_logs)}",
-                data={"by_level": level_counts, "by_subsystem": sub_counts},
-            )
-            err_n = level_counts.get("ERROR", 0)
-            warn_n = level_counts.get("WARN", 0)
-            if err_n:
                 s_logs.fail(
-                    "logs.error", f"ERROR-level correlated logs: {err_n}",
+                    f"logs.error.{sub}",
+                    f"[ERROR] [{sub}] {msg[:200]}",
+                    data={"correlation": rec.get("correlation")},
                 )
-            if warn_n:
+            # Show actual WARN entries
+            warn_entries = [
+                rec for rec in correlated_logs
+                if (_log_level(rec) or "").upper() == "WARN"
+            ]
+            for rec in warn_entries[:10]:
+                msg = parse_log_msg(rec) or "?"
+                sub = get_log_subsystem(rec) or "?"
                 s_logs.warn(
-                    "logs.warn", f"WARN-level correlated logs: {warn_n}",
+                    f"logs.warn.{sub}",
+                    f"[WARN] [{sub}] {msg[:200]}",
+                    data={"correlation": rec.get("correlation")},
+                )
+            # If only INFO, just note the count
+            info_count = len(correlated_logs) - len(error_entries) - len(warn_entries)
+            if info_count and not error_entries and not warn_entries:
+                s_logs.ok(
+                    "logs.info_only",
+                    f"{info_count} INFO-level correlated log entries (no errors)",
                 )
 
         s_decisions = report.section("Panorama · Model Decisions")
-        s_decisions.ok(
-            "decisions.count",
-            f"decision events: {len(decisions)}",
-            data={"count": len(decisions)},
-        )
-        for d in decisions[:8]:
-            kind = d.get("kind", "?")
-            if kind == "model_select":
-                msg_s = (
-                    f"model: {d.get('provider')}/{d.get('name')} "
-                    f"(api={d.get('api')})"
-                )
-            else:
-                msg_s = d.get("summary", "?")
-            s_decisions.ok(f"decision.{kind}", msg_s, data=d)
+        if not decisions:
+            s_decisions.ok("decisions.none", "no model fallback or selection events")
+        else:
+            for d in decisions[:8]:
+                kind = d.get("kind", "?")
+                if kind == "model_select":
+                    msg_s = (
+                        f"model: {d.get('provider')}/{d.get('name')} "
+                        f"(api={d.get('api')})"
+                    )
+                    s_decisions.ok(f"decision.{kind}", msg_s, data=d)
+                else:
+                    msg_s = d.get("summary", "?")
+                    s_decisions.warn(f"decision.{kind}", msg_s, data=d)
 
         s_children = report.section("Panorama · Child Tasks")
         if not children:
             s_children.ok("children.none", "no child tasks correlated")
         else:
-            s_children.ok(
-                "children.count",
-                f"child tasks: {len(children)}",
-                data={"count": len(children)},
-            )
+            # Show failed tasks with error detail
             failed = [c for c in children if c.get("status") in (
                 "failed", "errored", "error",
             ) or c.get("terminal_outcome") in ("failed", "error")]
-            if failed:
-                s_children.warn(
-                    "children.failed",
-                    f"failed child tasks: {len(failed)}",
-                    data={"failed": failed},
-                )
-            for c in children[:6]:
-                v = Verdict.OK
-                if c.get("status") in ("failed", "errored", "error"):
-                    v = Verdict.WARN
-                elif c.get("status") in ("running", "pending"):
-                    v = Verdict.WARN
+            for c in failed:
+                err = c.get("error") or c.get("terminal_summary") or "unknown error"
                 dur = c.get("duration_ms")
                 dur_s = f"{dur}ms" if dur is not None else "?"
-                s_children.add(
-                    f"child.{c.get('task_id', '?')[:8]}",
-                    v,
-                    f"{c.get('agent_id')}/{c.get('runtime')} "
-                    f"status={c.get('status')} duration={dur_s}",
+                s_children.warn(
+                    f"child.failed.{c.get('task_id', '?')[:8]}",
+                    f"FAILED: {c.get('agent_id')}/{c.get('runtime')} "
+                    f"duration={dur_s} error={str(err)[:150]}",
                     data=c,
+                )
+            # Show succeeded tasks briefly
+            succeeded = [c for c in children if c.get("status") == "succeeded"]
+            if succeeded:
+                s_children.ok(
+                    "children.succeeded",
+                    f"{len(succeeded)} child tasks succeeded",
                 )
 
         s_delivery = report.section("Panorama · Delivery")

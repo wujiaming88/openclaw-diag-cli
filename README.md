@@ -5,7 +5,7 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue.svg)](https://www.python.org/)
 
-Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 13 diagnostic modules, 2 inspectors, structured output, zero dependencies.
+Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 13 diagnostic modules, 3 inspectors, structured output, zero dependencies.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [AI Agent Skill](#ai-agent-skill) · [Output Formats](#output-formats) · [Examples](#examples) · [Contributing](#contributing)
 
@@ -41,6 +41,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 |-----------|---------|
 | 🔍 trace | Trace one user message: receive → model → tools → response timeline |
 | 📤 extract | Export session.jsonl to readable format with stats |
+| 🌐 panorama | Session 360° diagnosis: all correlated data from every source |
 
 ## Installation
 
@@ -69,6 +70,9 @@ openclaw-diag performance
 
 # Session stuck? Trace the last message
 openclaw-diag trace <session-uuid>
+
+# Full session 360° diagnosis
+openclaw-diag panorama <session-uuid>
 
 # See all session content
 openclaw-diag extract <session-uuid>
@@ -120,6 +124,13 @@ openclaw-diag extract <uuid>                  # Full records
 openclaw-diag extract <uuid> --summary        # Stats only
 openclaw-diag extract <uuid> --all            # Include backups/deleted
 openclaw-diag extract <uuid> --types message  # Filter by record type
+
+# Panorama: 360° session diagnosis
+openclaw-diag panorama <uuid>                 # Latest run (default)
+openclaw-diag panorama <uuid> --all-runs      # All runs in session
+openclaw-diag panorama <uuid> --strict-correlation  # Only sessionId/runId matches
+openclaw-diag panorama <uuid> --unmask        # Show full tool args/results
+openclaw-diag panorama <uuid> --format json   # JSON output for programmatic use
 ```
 
 ### Utility
@@ -207,6 +218,7 @@ This deploys the skill to all detected frameworks:
 | Slow responses | `openclaw-diag performance --format json` |
 | Can't connect / Gateway down | `openclaw-diag gateway --format json` |
 | Session stuck | `openclaw-diag trace <uuid> --format json` |
+| Full session health check | `openclaw-diag panorama <uuid> --format json` |
 | Recent errors | `openclaw-diag recent_errors --format json` |
 | Cron not firing | `openclaw-diag cron_jobs --format json` |
 | Plugin issues | `openclaw-diag plugin_diag --format json` |
@@ -228,6 +240,10 @@ openclaw-diag trace abc12345 --msg-index 0
 
 # Export session and pipe to file
 openclaw-diag extract abc12345 > session-dump.txt
+
+# Full session panorama — is it slow? tools ok? model perf? stuck?
+openclaw-diag panorama abc12345
+openclaw-diag panorama abc12345 --all-runs --format json
 
 # NDJSON for monitoring pipeline
 openclaw-diag all --format ndjson | while read line; do

@@ -91,13 +91,20 @@ Avoid `--unmask` unless the user explicitly needs raw local content.
 ## Panorama
 
 Use panorama when given a session UUID and asked an open-ended health
-question ("是否健康?", "为什么这条 session 卡住?", "把所有相关信息拉出来"). It
-walks every standard data source — `session.jsonl`, `trajectory.jsonl`,
-`sessions.json`, OpenClaw app log, `runs.sqlite`, and any matching
-`cron/runs/<jobId>.jsonl` — and emits a single Report with sections for
-session overview, correlation graph, timeline, runtime context, tool
-execution, correlated logs, model decisions, child tasks, delivery, and
-health signals.
+question ("是否健康?", "为什么这条 session 卡住?", "把所有相关信息拉出来",
+"执行慢不慢", "工具有没有异常", "模型性能好不好"). It walks every standard
+data source and produces a complete execution picture:
+
+**Sections:**
+- **Session Overview** — IDs, trigger, model, time window, activity stats (model calls / tool calls / errors / tokens / cost), sources, verdict
+- **Timeline** — first/last events, first error/stall timestamp, longest gap
+- **Runtime Context** — model, prompt chars, tools/skills/plugins, workspace files, bootstrap truncation, stream strategy
+- **Model Calls** — per-model performance breakdown + every model call with duration, output tokens, stopReason, triggered tools, cache stats
+- **Tool Execution** — per-call detail with args + result/error message, timing stats (avg/p50/p95/max)
+- **Correlated Logs** — ERROR/WARN entries with full text; representative INFO entries; level/subsystem breakdown
+- **Model Decisions** — model selection, fallback events
+- **Child Tasks** — failed tasks with error message, succeeded count
+- **Health Signals** — stall/long-running logs with timestamps, long tool calls, trajectory abort/timeout, child failures
 
 ```bash
 openclaw-diag panorama <uuid> --format json
@@ -105,17 +112,15 @@ openclaw-diag panorama <uuid> --all-runs --format json
 openclaw-diag panorama <uuid> --strict-correlation --format json --mask
 ```
 
-Inclusion of every record is determined by the correlation graph expanded
-from `sessionId` (sessionKey, runIds, toolCallIds, childSessionIds, cronJobId).
-Each correlated log entry is annotated with `correlation.path` so the
-"why was this included" answer is auditable.
+**Key design:** zero subjective filtering. Inclusion is determined by the
+correlation graph expanded from `sessionId` (sessionKey, runIds,
+toolCallIds, childSessionIds, cronJobId). Each correlated log entry is
+annotated with `correlation.path`.
 
-- Default: latest run only. Use `--run-index N` (negative ok) or
-  `--all-runs` for persistent multi-run sessions.
-- `--strict-correlation` drops sessionKey-only and toolCallId-only
-  matches; useful on noisy multi-tenant logs.
-- `--mask` sanitizes tool arguments and message-style text. Default is
-  unmasked since panorama is intended for local diagnosis.
+- Default: latest run only. Use `--run-index N` or `--all-runs` for
+  persistent multi-run sessions.
+- `--strict-correlation` only matches sessionId/runId (drops sessionKey/toolCallId matches).
+- `--mask` sanitizes tool arguments and result text. Default is unmasked.
 
 Verdict mapping:
 - `fail`: trajectory `aborted/timedOut`, child task failed, or any

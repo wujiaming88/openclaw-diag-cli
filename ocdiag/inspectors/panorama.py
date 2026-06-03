@@ -18,8 +18,6 @@ Inclusion of any record is determined entirely by the correlation graph
 expanded from ``sessionId`` (see ``ocdiag.correlation``). No subjective
 filtering, no allow/deny lists. The only knobs are:
 
-  --include-ambient     also surface uncorrelated WARN/ERROR log lines that
-                        fell inside the session's time window
   --strict-correlation  match only on sessionId / runIds (ignores
                         sessionKey / toolCallId hits)
   --run-index N         pick the Nth run in a multi-run session
@@ -341,52 +339,6 @@ def _summarize_child_task(row: Dict[str, Any]) -> Dict[str, Any]:
         "terminal_outcome": row.get("terminal_outcome"),
     }
 
-
-# ── ambient log scan ───────────────────────────────────────────────────────
-
-
-def _scan_ambient(
-    log_files: Iterable[str],
-    graph: CorrelationGraph,
-    window_start_ms: int,
-    window_end_ms: int,
-    *,
-    cap: int = 200,
-) -> List[Dict[str, Any]]:
-    """Surface uncorrelated WARN/ERROR log lines inside the session window."""
-    if not window_start_ms or not window_end_ms or window_end_ms < window_start_ms:
-        return []
-    ids = graph.all_ids()
-    out: List[Dict[str, Any]] = []
-    for lf in log_files:
-        if not os.path.isfile(lf) or len(out) >= cap:
-            continue
-        try:
-            with open(lf, "r", encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if len(out) >= cap:
-                        break
-                    if any(i and i in line for i in ids):
-                        continue
-                    if "WARN" not in line and "ERROR" not in line and \
-                            "warn" not in line and "error" not in line:
-                        continue
-                    try:
-                        rec = json.loads(line.strip())
-                    except (json.JSONDecodeError, ValueError):
-                        continue
-                    if not isinstance(rec, dict):
-                        continue
-                    lvl = _log_level(rec)
-                    if lvl not in ("WARN", "ERROR"):
-                        continue
-                    ts = _log_ts_ms(rec)
-                    if ts < window_start_ms or ts > window_end_ms:
-                        continue
-                    out.append(rec)
-        except OSError:
-            continue
-    return out
 
 
 # ── timeline merge ─────────────────────────────────────────────────────────
@@ -839,11 +791,6 @@ class PanoramaInspector:
             log_files, graph,
             strict=strict, max_records=DEFAULT_LOG_RECORD_CAP,
         ) if log_files else []
-        ambient_logs = []
-        if kwargs.get("include_ambient") and log_files:
-            ambient_logs = _scan_ambient(
-                log_files, graph, window_start, window_end,
-            )
 
         mask = bool(kwargs.get("mask")) and not (
             kwargs.get("unmask") or ctx.unmask
@@ -904,8 +851,6 @@ class PanoramaInspector:
         report.data["tool_stats"] = wf_stats
         report.data["runtime_context"] = runtime_blocks
         report.data["correlated_logs"] = correlated_logs
-        if ambient_logs:
-            report.data["ambient_logs"] = ambient_logs
         report.data["model_decisions"] = decisions
         report.data["health_signals"] = signals
         report.data["child_tasks"] = children
@@ -1061,13 +1006,6 @@ class PanoramaInspector:
             if warn_n:
                 s_logs.warn(
                     "logs.warn", f"WARN-level correlated logs: {warn_n}",
-                )
-            if ambient_logs:
-                s_logs.warn(
-                    "logs.ambient",
-                    f"ambient (uncorrelated) WARN/ERROR in window: "
-                    f"{len(ambient_logs)}",
-                    data={"count": len(ambient_logs)},
                 )
 
         s_decisions = report.section("Panorama · Model Decisions")

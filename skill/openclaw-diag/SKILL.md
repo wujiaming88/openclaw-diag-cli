@@ -102,7 +102,6 @@ health signals.
 ```bash
 openclaw-diag panorama <uuid> --format json
 openclaw-diag panorama <uuid> --all-runs --format json
-openclaw-diag panorama <uuid> --include-ambient --format json
 openclaw-diag panorama <uuid> --strict-correlation --format json --mask
 ```
 
@@ -113,9 +112,6 @@ Each correlated log entry is annotated with `correlation.path` so the
 
 - Default: latest run only. Use `--run-index N` (negative ok) or
   `--all-runs` for persistent multi-run sessions.
-- `--include-ambient` adds uncorrelated WARN/ERROR log lines that fell
-  inside the session's time window — flagged as ambient because they are
-  *not* provably related.
 - `--strict-correlation` drops sessionKey-only and toolCallId-only
   matches; useful on noisy multi-tenant logs.
 - `--mask` sanitizes tool arguments and message-style text. Default is

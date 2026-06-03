@@ -195,7 +195,7 @@ def cmd_examples() -> int:
 
   # session 全景诊断（关联到 trajectory + 日志 + 子任务 + cron）
   openclaw-diag panorama <uuid>
-  openclaw-diag panorama abc12345 --include-ambient --format json
+  openclaw-diag panorama abc12345 --strict-correlation --format json
 
   # 模型性能
   openclaw-diag performance
@@ -325,7 +325,6 @@ _PANORAMA_EPILOG = """示例:
   openclaw-diag panorama 7e9f3b31                       # latest run
   openclaw-diag panorama 7e9f3b31 --all-runs            # every run
   openclaw-diag panorama 7e9f3b31 --run-index 0         # first run
-  openclaw-diag panorama 7e9f3b31 --include-ambient     # 也带上窗口内 WARN/ERROR
   openclaw-diag panorama 7e9f3b31 --strict-correlation  # only sessionId / runIds
   openclaw-diag panorama 7e9f3b31 --format json --mask
 """
@@ -389,9 +388,6 @@ def _build_panorama_parser() -> argparse.ArgumentParser:
                    help="Pick the Nth run (default: -1 = latest)")
     p.add_argument("--all-runs", action="store_true",
                    help="Include every run in the session")
-    p.add_argument("--include-ambient", action="store_true",
-                   help="Also include uncorrelated WARN/ERROR logs in the "
-                        "session's time window")
     p.add_argument("--strict-correlation", action="store_true",
                    help="Match only on sessionId / runIds (drops sessionKey "
                         "and toolCallId hits)")
@@ -441,7 +437,6 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
             "unmask": ns.unmask,
             "run_index": ns.run_index,
             "all_runs": ns.all_runs,
-            "include_ambient": ns.include_ambient,
             "strict_correlation": ns.strict_correlation,
             "agent": ns.agent,
         }

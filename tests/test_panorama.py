@@ -8,7 +8,6 @@ Covers:
   - Tool-call waterfall pairing, duration arithmetic
   - Timeline ordering and merge across session.jsonl + trajectory + app log
   - Multi-run handling: --run-index, --all-runs
-  - --include-ambient surfaces uncorrelated WARN/ERROR within window
   - --strict-correlation drops sessionKey-only matches
   - Verdict logic (FAIL on artifact abort, WARN on slow E2E, OK on clean)
   - JSON envelope round-trip
@@ -528,18 +527,6 @@ def test_strict_correlation_excludes_session_key_only(tmp_path: Path):
                            strict_correlation=True)
     assert len(strict.data["correlated_logs"]) <= \
         len(full.data["correlated_logs"])
-
-
-def test_include_ambient_surfaces_uncorrelated(tmp_path: Path):
-    ctx = _build_fixture_home(tmp_path)
-    base = _run_panorama(ctx, session_id=SESSION_ID)
-    assert "ambient_logs" not in base.data
-    enriched = _run_panorama(
-        ctx, session_id=SESSION_ID, include_ambient=True,
-    )
-    # The fixture writes one ambient WARN inside the window.
-    assert "ambient_logs" in enriched.data
-    assert len(enriched.data["ambient_logs"]) >= 1
 
 
 def test_run_index_and_all_runs(tmp_path: Path):

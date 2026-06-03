@@ -1,6 +1,6 @@
 ---
 name: openclaw-diag
-description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, session trace/extract. 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session。"
+description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract. 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住。"
 metadata:
   requires:
     bins: ["openclaw-diag"]
@@ -39,7 +39,7 @@ openclaw-diag all --format json
    - `cron_jobs != ok` → run `openclaw-diag cron_jobs --format json`
    - `plugin_diag != ok` → run `openclaw-diag plugin_diag --format json`
    - `run_health != ok` → run `openclaw-diag run_health --format json`, then use `trace` if a session UUID is involved
-   - `task_health != ok` → run `openclaw-diag task_health --format json`, check error patterns and timeout config
+   - `task_health != ok` → run `openclaw-diag task_health --format json`, check failure samples, top_error_patterns, timeout_analysis, stuck_analysis, and runtime breakdown
    - `sessions_diag != ok` → run `openclaw-diag sessions_diag --format json`, then use `extract <uuid> --summary --format json` when a session UUID is known
 
 4. Final answer should include:

@@ -1100,7 +1100,7 @@ class PanoramaInspector:
                 "failed", "errored", "error",
             ) or c.get("terminal_outcome") in ("failed", "error")]
             if failed:
-                s_children.fail(
+                s_children.warn(
                     "children.failed",
                     f"failed child tasks: {len(failed)}",
                     data={"failed": failed},
@@ -1108,7 +1108,7 @@ class PanoramaInspector:
             for c in children[:6]:
                 v = Verdict.OK
                 if c.get("status") in ("failed", "errored", "error"):
-                    v = Verdict.FAIL
+                    v = Verdict.WARN
                 elif c.get("status") in ("running", "pending"):
                     v = Verdict.WARN
                 dur = c.get("duration_ms")

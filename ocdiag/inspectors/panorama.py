@@ -955,6 +955,93 @@ class PanoramaInspector:
         if not runtime_blocks:
             s_runtime.warn("runtime.missing", "no trajectory runs available")
 
+        # ── Model Calls section ──
+        s_model = report.section("Panorama · Model Calls")
+        model_calls = []
+        for rec in session_records:
+            if not isinstance(rec, dict) or rec.get("type") != "message":
+                continue
+            msg = rec.get("message", {})
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            usage = msg.get("usage")
+            if not isinstance(usage, dict):
+                continue
+            model_calls.append({
+                "provider": msg.get("provider", "?"),
+                "model": msg.get("model", "?"),
+                "stopReason": msg.get("stopReason", "?"),
+                "input": usage.get("input") or usage.get("inputTokens") or 0,
+                "output": usage.get("output") or usage.get("outputTokens") or 0,
+                "cacheRead": usage.get("cacheRead") or usage.get("cacheReadInputTokens") or 0,
+                "cacheWrite": usage.get("cacheWrite") or usage.get("cacheCreationInputTokens") or 0,
+                "totalTokens": usage.get("totalTokens") or usage.get("total") or 0,
+                "cost": usage.get("cost"),
+            })
+        if not model_calls:
+            s_model.ok("model.none", "no model calls in selected run")
+        else:
+            total_input = sum(c["input"] for c in model_calls)
+            total_output = sum(c["output"] for c in model_calls)
+            total_cache_read = sum(c["cacheRead"] for c in model_calls)
+            total_cache_write = sum(c["cacheWrite"] for c in model_calls)
+            total_tokens = sum(c["totalTokens"] for c in model_calls)
+            total_cost = None
+            costs = [c["cost"] for c in model_calls if isinstance(c.get("cost"), dict)]
+            if costs:
+                total_cost = round(sum(
+                    (co.get("input", 0) or 0) + (co.get("output", 0) or 0) +
+                    (co.get("cacheRead", 0) or 0) + (co.get("cacheWrite", 0) or 0)
+                    for co in costs
+                ), 4)
+            s_model.ok(
+                "model.calls",
+                f"model calls: {len(model_calls)}",
+                data={"count": len(model_calls)},
+            )
+            s_model.ok(
+                "model.tokens",
+                f"tokens: in={total_input} out={total_output} "
+                f"cache_read={total_cache_read} cache_write={total_cache_write} "
+                f"total={total_tokens}",
+                data={
+                    "input": total_input, "output": total_output,
+                    "cache_read": total_cache_read, "cache_write": total_cache_write,
+                    "total": total_tokens,
+                },
+            )
+            if total_cost is not None:
+                s_model.ok(
+                    "model.cost",
+                    f"estimated cost: ${total_cost:.4f}",
+                    data={"cost_usd": total_cost},
+                )
+            # Output rate
+            if duration_ms and total_output:
+                rate = round(total_output / (duration_ms / 1000), 1)
+                s_model.ok(
+                    "model.rate",
+                    f"avg output rate: {rate} tok/s",
+                    data={"tokens_per_sec": rate},
+                )
+            # Per-model breakdown
+            by_model: Dict[str, Dict[str, Any]] = {}
+            for c in model_calls:
+                key = f"{c['provider']}/{c['model']}"
+                if key not in by_model:
+                    by_model[key] = {"calls": 0, "output": 0, "input": 0}
+                by_model[key]["calls"] += 1
+                by_model[key]["output"] += c["output"]
+                by_model[key]["input"] += c["input"]
+            for model_key, stats in sorted(by_model.items(), key=lambda x: -x[1]["output"]):
+                s_model.ok(
+                    f"model.breakdown.{model_key[:30]}",
+                    f"{model_key}: {stats['calls']} calls, "
+                    f"in={stats['input']} out={stats['output']}",
+                    data={"model": model_key, **stats},
+                )
+
+        # ── Tool Execution section ──
         s_tools = report.section("Panorama · Tool Execution")
         if wf_stats["completed"]:
             s_tools.ok(
@@ -980,6 +1067,32 @@ class PanoramaInspector:
             )
         if not errored_tools and not wf_stats["completed"]:
             s_tools.ok("tools.none", "no tool calls in this run")
+        else:
+            # Per-tool-name aggregation
+            by_name: Dict[str, Dict[str, Any]] = {}
+            for t in waterfall:
+                name = t.get("name", "?")
+                if name not in by_name:
+                    by_name[name] = {"count": 0, "errors": 0, "durations": []}
+                by_name[name]["count"] += 1
+                if t.get("is_error"):
+                    by_name[name]["errors"] += 1
+                dur = t.get("duration_ms")
+                if isinstance(dur, (int, float)) and dur >= 0:
+                    by_name[name]["durations"].append(dur)
+            # Show top tools by call count
+            for name, stats in sorted(by_name.items(), key=lambda x: -x[1]["count"])[:10]:
+                durs = stats["durations"]
+                avg = round(sum(durs) / len(durs)) if durs else 0
+                err_s = f" errors={stats['errors']}" if stats["errors"] else ""
+                v = Verdict.WARN if stats["errors"] else Verdict.OK
+                s_tools.add(
+                    f"tools.by_name.{name}",
+                    v,
+                    f"{name}: {stats['count']}x avg={avg}ms{err_s}",
+                    data={"name": name, "count": stats["count"],
+                          "avg_ms": avg, "errors": stats["errors"]},
+                )
 
         s_logs = report.section("Panorama · Correlated Logs")
         if not log_files:

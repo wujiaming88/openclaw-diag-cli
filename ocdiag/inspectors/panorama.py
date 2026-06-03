@@ -940,18 +940,44 @@ class PanoramaInspector:
 
         s_runtime = report.section("Panorama · Runtime Context")
         for blk in runtime_blocks:
-            rid = blk.get("runId", "?")
-            err_count = len(blk.get("plugin_errors") or [])
-            v = Verdict.WARN if err_count else Verdict.OK
-            s_runtime.add(
-                f"runtime.{rid[:8]}",
-                v,
-                f"run {rid[:8]}: trigger={blk.get('trigger')} "
-                f"model={blk.get('model_id')} "
-                f"plugins={blk.get('plugin_count')} "
-                f"plugin_errors={err_count}",
+            rid = blk.get("runId", "?")[:8]
+            s_runtime.ok(
+                f"runtime.model.{rid}",
+                f"model: {blk.get('provider')}/{blk.get('model_id')}",
                 data=blk,
             )
+            s_runtime.ok(
+                f"runtime.trigger.{rid}",
+                f"trigger: {blk.get('trigger')} | channel: {blk.get('channel')}",
+            )
+            sp_chars = blk.get("system_prompt_chars")
+            pc_chars = blk.get("project_context_chars")
+            if sp_chars:
+                s_runtime.ok(
+                    f"runtime.prompt.{rid}",
+                    f"system prompt: {sp_chars:,} chars"
+                    + (f" (project context: {pc_chars:,})" if pc_chars else ""),
+                )
+            tool_count = blk.get("tool_count")
+            skill_count = blk.get("skill_count")
+            plugin_count = blk.get("plugin_count")
+            s_runtime.ok(
+                f"runtime.tools.{rid}",
+                f"tools: {tool_count or '?'} | skills: {skill_count or '?'} | plugins: {plugin_count or '?'}",
+            )
+            schema_chars = blk.get("tools_schema_chars")
+            if schema_chars:
+                s_runtime.ok(
+                    f"runtime.schema.{rid}",
+                    f"tools schema: {schema_chars:,} chars",
+                )
+            err_count = len(blk.get("plugin_errors") or [])
+            if err_count:
+                for pe in (blk.get("plugin_errors") or [])[:5]:
+                    s_runtime.warn(
+                        f"runtime.plugin_error.{pe.get('id','?')}",
+                        f"plugin error: {pe.get('id')} — {pe.get('error','?')[:100]}",
+                    )
         if not runtime_blocks:
             s_runtime.warn("runtime.missing", "no trajectory runs available")
 
@@ -967,6 +993,13 @@ class PanoramaInspector:
             usage = msg.get("usage")
             if not isinstance(usage, dict):
                 continue
+            # Extract triggered tools from content
+            triggered_tools: List[str] = []
+            content = msg.get("content", [])
+            if isinstance(content, list):
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "toolCall":
+                        triggered_tools.append(c.get("name", "?"))
             model_calls.append({
                 "provider": msg.get("provider", "?"),
                 "model": msg.get("model", "?"),
@@ -977,6 +1010,8 @@ class PanoramaInspector:
                 "cacheWrite": usage.get("cacheWrite") or usage.get("cacheCreationInputTokens") or 0,
                 "totalTokens": usage.get("totalTokens") or usage.get("total") or 0,
                 "cost": usage.get("cost"),
+                "tools": triggered_tools,
+                "ts": rec.get("timestamp", ""),
             })
         if not model_calls:
             s_model.ok("model.none", "no model calls in selected run")
@@ -994,28 +1029,19 @@ class PanoramaInspector:
                     (co.get("cacheRead", 0) or 0) + (co.get("cacheWrite", 0) or 0)
                     for co in costs
                 ), 4)
+            # Summary line
             s_model.ok(
-                "model.calls",
-                f"model calls: {len(model_calls)}",
-                data={"count": len(model_calls)},
-            )
-            s_model.ok(
-                "model.tokens",
-                f"tokens: in={total_input} out={total_output} "
-                f"cache_read={total_cache_read} cache_write={total_cache_write} "
-                f"total={total_tokens}",
+                "model.summary",
+                f"{len(model_calls)} calls | out={total_output} tok | "
+                f"cache_read={total_cache_read} | cache_write={total_cache_write}"
+                + (f" | cost=${total_cost:.4f}" if total_cost else ""),
                 data={
-                    "input": total_input, "output": total_output,
-                    "cache_read": total_cache_read, "cache_write": total_cache_write,
-                    "total": total_tokens,
+                    "count": len(model_calls), "input": total_input,
+                    "output": total_output, "cache_read": total_cache_read,
+                    "cache_write": total_cache_write, "total": total_tokens,
+                    "cost_usd": total_cost,
                 },
             )
-            if total_cost is not None:
-                s_model.ok(
-                    "model.cost",
-                    f"estimated cost: ${total_cost:.4f}",
-                    data={"cost_usd": total_cost},
-                )
             # Output rate
             if duration_ms and total_output:
                 rate = round(total_output / (duration_ms / 1000), 1)
@@ -1024,74 +1050,44 @@ class PanoramaInspector:
                     f"avg output rate: {rate} tok/s",
                     data={"tokens_per_sec": rate},
                 )
-            # Per-model breakdown
-            by_model: Dict[str, Dict[str, Any]] = {}
-            for c in model_calls:
-                key = f"{c['provider']}/{c['model']}"
-                if key not in by_model:
-                    by_model[key] = {"calls": 0, "output": 0, "input": 0}
-                by_model[key]["calls"] += 1
-                by_model[key]["output"] += c["output"]
-                by_model[key]["input"] += c["input"]
-            for model_key, stats in sorted(by_model.items(), key=lambda x: -x[1]["output"]):
+            # Per-call detail (every call)
+            for idx, c in enumerate(model_calls, 1):
+                tools_s = ",".join(c["tools"][:3]) if c["tools"] else "→ final"
                 s_model.ok(
-                    f"model.breakdown.{model_key[:30]}",
-                    f"{model_key}: {stats['calls']} calls, "
-                    f"in={stats['input']} out={stats['output']}",
-                    data={"model": model_key, **stats},
+                    f"model.call.{idx}",
+                    f"#{idx} out={c['output']} ({c['stopReason']}) "
+                    f"[{tools_s}] "
+                    f"cr={c['cacheRead']} cw={c['cacheWrite']}",
+                    data=c,
                 )
 
         # ── Tool Execution section ──
         s_tools = report.section("Panorama · Tool Execution")
-        if wf_stats["completed"]:
-            s_tools.ok(
-                "tools.timing",
-                f"timing: avg={wf_stats['avg_ms']}ms p50={wf_stats['p50_ms']}ms "
-                f"p95={wf_stats['p95_ms']}ms max={wf_stats['max_ms']}ms",
-                data=wf_stats,
-            )
-        if wf_stats["slowest"]:
-            s_tools.ok(
-                "tools.slowest",
-                f"slowest: {wf_stats['slowest']['name']} "
-                f"({wf_stats['slowest']['duration_ms']}ms)",
-                data=wf_stats["slowest"],
-            )
-        # Show actual tool errors with names
-        errored_tools = [t for t in waterfall if t.get("is_error")]
-        for et in errored_tools[:10]:
-            s_tools.warn(
-                f"tools.error.{et.get('tool_call_id', '?')[:12]}",
-                f"FAILED: {et.get('name', '?')} ({et.get('duration_ms', '?')}ms)",
-                data=et,
-            )
-        if not errored_tools and not wf_stats["completed"]:
+        if not waterfall:
             s_tools.ok("tools.none", "no tool calls in this run")
         else:
-            # Per-tool-name aggregation
-            by_name: Dict[str, Dict[str, Any]] = {}
-            for t in waterfall:
+            # Summary stats
+            if wf_stats["completed"]:
+                s_tools.ok(
+                    "tools.timing",
+                    f"{wf_stats['total']} calls | "
+                    f"avg={wf_stats['avg_ms']}ms p50={wf_stats['p50_ms']}ms "
+                    f"p95={wf_stats['p95_ms']}ms max={wf_stats['max_ms']}ms",
+                    data=wf_stats,
+                )
+            # Each tool call individually
+            for idx, t in enumerate(waterfall, 1):
                 name = t.get("name", "?")
-                if name not in by_name:
-                    by_name[name] = {"count": 0, "errors": 0, "durations": []}
-                by_name[name]["count"] += 1
-                if t.get("is_error"):
-                    by_name[name]["errors"] += 1
                 dur = t.get("duration_ms")
-                if isinstance(dur, (int, float)) and dur >= 0:
-                    by_name[name]["durations"].append(dur)
-            # Show top tools by call count
-            for name, stats in sorted(by_name.items(), key=lambda x: -x[1]["count"])[:10]:
-                durs = stats["durations"]
-                avg = round(sum(durs) / len(durs)) if durs else 0
-                err_s = f" errors={stats['errors']}" if stats["errors"] else ""
-                v = Verdict.WARN if stats["errors"] else Verdict.OK
+                dur_s = f"{dur}ms" if dur is not None else "?"
+                is_err = t.get("is_error")
+                v = Verdict.WARN if is_err else Verdict.OK
+                status = "✗" if is_err else "✓"
                 s_tools.add(
-                    f"tools.by_name.{name}",
+                    f"tools.call.{idx}",
                     v,
-                    f"{name}: {stats['count']}x avg={avg}ms{err_s}",
-                    data={"name": name, "count": stats["count"],
-                          "avg_ms": avg, "errors": stats["errors"]},
+                    f"#{idx} {name} {dur_s} {status}",
+                    data=t,
                 )
 
         s_logs = report.section("Panorama · Correlated Logs")

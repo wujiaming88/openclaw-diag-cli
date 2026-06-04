@@ -91,7 +91,7 @@ Only include entries matching `sessionId` or `runIds`. Exclude sessionKey-only a
 }
 ```
 
-## Sections (v1.4.11 layout — 6 sections)
+## Sections (v1.4.13 layout — 7 sections)
 
 The standalone "Runtime Context", "Model Decisions", and "Delivery" sections
 were merged into adjacent sections in v1.4.3. JSON consumers keep the
@@ -106,8 +106,84 @@ read together — signals are the human explanation of what the logs say —
 so a single section reduces scrolling without changing what is rendered
 or how the verdict is computed. Section count went from 7 to 6.
 
+**v1.4.13 add:** a new "Panorama · Findings" section is rendered FIRST
+(before Session Overview) — an objective, deterministic triage summary
+that re-surfaces the worst already-computed problem signals at the top
+so the reader sees the punch list without scrolling. It does NOT invent
+anything: every line is a pure restatement of fields the source signal
+already carries (ts, runId, finalStatus, raw flags, tool args, error
+text quoted verbatim). The same deterministic severity key is now also
+applied to the problem-signals list inside Correlated Logs & Signals
+(fail-class before warn-class, higher rank first, ts tie-break) so
+both sections agree on order. Verdict logic is unchanged. Section
+count went from 6 to 7.
+
 JSON consumers are unaffected: `report.data["health_signals"]` and
 `report.data["positive_health_signals"]` are still populated.
+v1.4.13 adds `report.data["findings"]` (ordered list of objective
+`{severity, kind, ts_ms, summary, ref}` dicts capped at
+`FINDINGS_TOP_N`) and `report.data["findings_more_count"]` (integer
+tail count when more than the cap exist).
+
+### ⛔ Findings — objective-only contract
+
+Findings is the ONLY summary surface in the report. To stay useful as a
+human triage tool, it MUST present nothing but objective, machine-derivable
+facts. Forbidden ABSOLUTELY in any rendered Findings line:
+
+- root-cause claims ("root cause: X", "the problem is X")
+- causal chains ("caused", "led to", "because", "due to", "→ triggered")
+- probabilistic / subjective language ("likely", "probably", "seems",
+  "appears", "most significant")
+- recommendations / next steps ("suggest", "should", "recommend",
+  "investigate")
+
+Allowed (objective): reading field values verbatim, counting signal
+occurrences, deterministic severity classification from the fixed
+`SIGNAL_SEVERITY` table, timestamps, run/tool ids, error text quoted
+verbatim, evidence pointers ("see Correlated Logs & Signals"). State
+WHAT IS, never WHY or WHAT-TO-DO. A test (`test_findings_summary_lines_
+have_no_forbidden_words`) scans the rendered Findings text for the
+blocklist and asserts none of these tokens appear.
+
+### Severity classification — `SIGNAL_SEVERITY` table
+
+Severity is a fixed module-level mapping `kind → (class, rank)`,
+documented in code so the ordering is traceable. `class ∈ {fail, warn}`
+mirrors the verdict-driving call (`.fail()` vs `.warn()`) the renderer
+already makes for that kind under Correlated Logs & Signals. `rank` is
+an int; higher = more severe within its class. Ordering key (used in
+both the new Findings section and the existing problem-signals list):
+
+```
+(class_order desc, rank desc, ts asc, kind asc)
+```
+
+Class order: `fail` > `warn` > unknown. Stable, total, deterministic.
+Unknown signal kinds default to `("warn", 0)` so future additions still
+surface even before the table is updated. The single per-kind promotion
+is `retried_after_failure` upgrading `warn → fail` when its
+`final_failed` field is true (matches the render-time `.fail()` call).
+
+### 0. findings (v1.4.13)
+- Renders FIRST, before Session Overview. Built last in code so the verdict
+  is fully resolved, then moved to position 0 in the section list.
+- First line: `verdict: <VERDICT> — <F> fail, <W> warn signals` (or
+  `verdict: <VERDICT> — 0 problem signals` when there are none). The
+  verdict is read from `report.verdict` — never recomputed.
+- Up to `FINDINGS_TOP_N` (=10) ranked findings, each on its own line with
+  the deterministic severity marker (`✗` for fail, `⚠` for warn). Lines
+  are objective restatements of the signal's fields plus a `(see
+  Correlated Logs & Signals)` evidence pointer. Examples:
+  - `✗ artifact run 7b06f3d9: finalStatus=error, idleTimedOut=true,
+    promptErrorSource=prompt @<ts> (see Correlated Logs & Signals)`
+  - `⚠ long_tool_call cron(action=update, jobId=0cdb2836-...) duration=2.4m
+    is_error=true result="patch required" @<ts>
+    (see Correlated Logs & Signals)`
+- When more than `FINDINGS_TOP_N` problem signals exist, a single
+  `+N more (see Correlated Logs & Signals)` line is appended.
+- When zero problem signals exist, a single objective line `no problem
+  signals` is rendered. No fabricated praise.
 
 ### 1. session_overview (incl. runtime context)
 - sessionId, agentId, sessionKey, trigger (user/cron/subagent)
@@ -324,6 +400,19 @@ section above, with severity (`fail`/`warn`) preserved.
 - `health_signals[]` gains kinds: `prompt_cache_broke`, `items_incomplete`,
   `queue_wait_slow`, `context_precheck_overflow`,
   `state_transition_abnormal`, `config_reload_failed`
+
+## v1.4.13 JSON envelope additions
+
+- `findings`: ordered list of objective triage entries, each
+  `{severity, kind, ts_ms, summary, ref}`. `severity ∈ {"fail", "warn"}`,
+  `summary` is a pure restatement of the source signal (no inference),
+  `ref` always points at `"Correlated Logs & Signals"`. Capped at
+  `FINDINGS_TOP_N` (= 10).
+- `findings_more_count`: integer count of problem signals that did not
+  fit under the cap (0 when ≤ TOP_N).
+- `health_signals[]`: now sorted by the same deterministic severity key
+  used by Findings (fail > warn, rank desc, ts asc, kind asc) — the set
+  of signals is unchanged; only the order is.
 
 ## Multi-run handling (persistent sessions)
 

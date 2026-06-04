@@ -1,5 +1,84 @@
 # Changelog
 
+## v1.4.13 — objective Findings summary + deterministic severity ranking (2026-06-04)
+
+### Added
+- **`Panorama · Findings`** — a new section rendered FIRST (before Session
+  Overview). It is an objective, deterministic triage summary that
+  re-surfaces the worst already-computed problem signals so the reader
+  sees the punch list without scrolling. It does NOT invent anything:
+  every line is a pure restatement of fields already on the source signal
+  (timestamp, runId, finalStatus, raw flags, tool args, error text quoted
+  verbatim) plus a `(see Correlated Logs & Signals)` evidence pointer.
+  - First line: `verdict: <V> — <F> fail, <W> warn signals` (or
+    `verdict: <V> — 0 problem signals`). The verdict is read from
+    `report.verdict`, never recomputed.
+  - Up to `FINDINGS_TOP_N` (= 10) ranked findings ordered by a strictly
+    deterministic key: `(severity_class desc, kind_rank desc, ts asc,
+    kind asc)` — fail-class before warn-class, higher rank first, ts
+    tie-break, kind name as final tie-break.
+  - `+N more (see Correlated Logs & Signals)` trailer when more than
+    `FINDINGS_TOP_N` problem signals exist.
+  - Verdict logic is unchanged — Findings is purely a re-surface.
+
+### Changed
+- **`SIGNAL_SEVERITY`** — a fixed module-level mapping
+  `kind → (class, rank)` covering every signal kind `_health_signals`
+  emits. Documents the severity contract in one place so the ordering is
+  traceable. Unknown kinds default to `("warn", 0)` so a new kind added
+  later still surfaces (just below catalogued entries) — no silent drop.
+  The single per-kind promotion is `retried_after_failure` upgrading
+  `warn → fail` when its `final_failed` is true, matching the
+  render-time `.fail()` call.
+- **Problem signals under Correlated Logs & Signals are now sorted by
+  the same key.** Previously they rendered in insertion order; now the
+  detail list reads in severity order so it matches the Findings summary
+  at the top. Positive `✓` signals and raw ERROR/WARN/INFO log rendering
+  are untouched (positives first, then problems, then raw logs).
+- **JSON envelope** — `report.data["findings"]` (ordered list of
+  `{severity, kind, ts_ms, summary, ref}` dicts) and
+  `report.data["findings_more_count"]` (tail count). `health_signals[]`
+  is unchanged in content but is now ordered by the deterministic key.
+
+### Spec
+- `PANORAMA_SPEC.md` updated: section count 6 → 7, new §0 documenting
+  Findings, new "Findings — objective-only contract" sub-section listing
+  the forbidden subjective vocabulary, new "Severity classification"
+  sub-section pinning the `SIGNAL_SEVERITY` table.
+
+### Tests
+- `test_findings_section_first_and_verdict_line` — section is at index 0
+  and its verdict counts equal the underlying signal totals exactly.
+- `test_findings_ordered_by_deterministic_severity_key` — direct
+  exercise of `_signal_sort_key` against a mixed fail/warn/ts fixture;
+  pins the expected order.
+- `test_findings_cap_and_more_line` — cap respected; `+N more` carries
+  the right tail count.
+- `test_findings_summary_lines_have_no_forbidden_words` — the
+  objective-only contract is mechanically enforced. Scans every rendered
+  Findings line for `root cause`, `caused`, `because`, `likely`,
+  `probably`, `suggest`, `should`, `recommend`, `investigate`,
+  `most significant`, `due to`, `appears`, `seems` (case-insensitive)
+  and asserts none appear.
+- `test_findings_ok_fixture_says_no_problem_signals` — zero problem
+  signals → exactly the line `no problem signals`, no fabricated praise.
+- `test_correlated_logs_problem_signals_severity_ordered` — fail-class
+  signal must precede warn-class signal in the rendered details.
+- `test_findings_in_json_envelope` — shape check of `findings` and
+  `findings_more_count`.
+- `test_findings_top_n_constant_is_module_level`,
+  `test_signal_severity_table_documented` — guard against silent
+  catalogue regressions.
+- Existing `test_no_standalone_health_signals_section` updated for the
+  new section count (6 → 7).
+
+### Validation
+- 104 tests green. 100k-line perf test still passes. Real e2e against
+  `e37602da-ce25-45c6-97d9-2cffa237d1ba --all-runs` produces a
+  Findings section with verdict line `verdict: WARN — 0 fail, 27 warn
+  signals`, ordered top-10 problem signals, and `+17 more`. Forbidden
+  vocabulary scan over the rendered Findings text returns zero hits.
+
 ## v1.4.12 — restore representative INFO, raise cap 5 → 20 (2026-06-04)
 
 ### Changed

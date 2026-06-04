@@ -30,8 +30,14 @@ Verdict semantics:
         detected, or end-to-end wall clock > 5min
   OK    everything else
 
-Section layout (v1.4.11 — 6 sections; was 7 before the merge):
+Section layout (v1.4.13 — 7 sections; was 6 before the Findings add):
 
+  0. Panorama · Findings              (NEW v1.4.13 — objective triage
+       summary rendered FIRST. Re-surfaces the worst already-computed
+       problem signals using a deterministic severity ordering. NEVER
+       infers a cause, recommends a step, or qualifies with "likely"/
+       "probably" etc. Built last in code so the verdict and signals
+       are fully resolved, then moved to position 0 of the section list.)
   1. Panorama · Session Overview
   2. Panorama · Timeline
   3. Panorama · Model Calls
@@ -39,7 +45,9 @@ Section layout (v1.4.11 — 6 sections; was 7 before the merge):
   5. Panorama · Correlated Logs & Signals   (was: two separate sections —
        "Correlated Logs" and "Health Signals". v1.4.11 merged them since
        the signals are the human-readable explanation of what the logs
-       show; the verdict-driving fail()/warn() calls are unchanged.)
+       show; the verdict-driving fail()/warn() calls are unchanged.
+       v1.4.13 also sorts the rendered problem signals here using the
+       same deterministic severity key as Findings.)
   6. Panorama · Child Tasks
 """
 
@@ -1069,6 +1077,222 @@ LONG_TOOL_CALL_THRESHOLD_MS = 60_000
 SLOW_QUEUE_WAIT_MS = 2_000
 
 _FAILED_DELIVERY_STATUSES = {"failed", "error", "errored", "undelivered"}
+
+
+# ── v1.4.13 Findings: deterministic severity ranking ──────────────────────
+#
+# The Findings section (rendered FIRST, before Session Overview) re-surfaces
+# the same problem signals already computed by ``_health_signals`` so the
+# reader sees the worst issues without scrolling. It is OBJECTIVE only —
+# it never invents a root cause, never says "likely"/"probably"/"because",
+# never recommends a next step. Each line is a deterministic restatement
+# of fields the signal already carries (ts, ids, finalStatus, flags,
+# tool args, error text quoted verbatim). The same ordering key is also
+# applied to the problem-signals list inside Correlated Logs & Signals so
+# the detail list reads in the same order.
+#
+# SIGNAL_SEVERITY maps each known signal kind → (class, rank).
+#   class ∈ {"fail", "warn"} mirrors the verdict-driving call the renderer
+#     already makes for that kind in Correlated Logs & Signals (.fail() vs
+#     .warn()). For ``retried_after_failure`` the class is computed at
+#     ranking time from ``final_failed`` — both shapes appear in real data.
+#   rank is an int; higher means more severe within its class. Used as
+#     the secondary sort key so e.g. an artifact abort outranks a stalled
+#     log line even though both are FAIL-class.
+# The ordering key is (class_order desc, rank desc, ts asc, kind asc).
+# Stable, total, traceable. Unknown kinds default to ("warn", 0) so a new
+# signal added without updating this table still ranks after everything
+# we've explicitly catalogued.
+FINDINGS_TOP_N = 10
+
+SIGNAL_SEVERITY: Dict[str, Tuple[str, int]] = {
+    # FAIL class — drive verdict to FAIL.
+    "trajectory_artifact": ("fail", 100),
+    "cron_delivery_failed": ("fail", 90),
+    # WARN class — drive verdict to WARN.
+    "retried_after_failure": ("warn", 80),  # may upgrade to fail (see _signal_severity)
+    "tool_call_leak": ("warn", 70),
+    "items_incomplete": ("warn", 65),
+    "prompt_cache_broke": ("warn", 60),
+    "long_tool_call": ("warn", 55),
+    "child_task_failed": ("warn", 50),
+    "log_stall": ("warn", 45),
+    "context_precheck_overflow": ("warn", 40),
+    "state_transition_abnormal": ("warn", 38),
+    "queue_wait_slow": ("warn", 35),
+    "config_reload_failed": ("warn", 32),
+    "log_decision": ("warn", 25),
+    "last_tool_error": ("warn", 22),
+    "gateway_pid_change": ("warn", 20),
+}
+
+_CLASS_ORDER = {"fail": 2, "warn": 1}
+
+
+def _signal_severity(sig: Dict[str, Any]) -> Tuple[str, int]:
+    """Look up (class, rank) for a signal, with the only kind-specific
+    promotion: ``retried_after_failure`` upgrades from warn → fail when its
+    final attempt also failed (matches the render-time .fail() call).
+    Unknown kinds default to ("warn", 0) so they sort below catalogued
+    entries but still appear.
+    """
+    kind = sig.get("kind") or ""
+    cls, rank = SIGNAL_SEVERITY.get(kind, ("warn", 0))
+    if kind == "retried_after_failure" and sig.get("final_failed"):
+        cls = "fail"
+    return cls, rank
+
+
+def _signal_sort_key(sig: Dict[str, Any]) -> Tuple[int, int, int, str]:
+    """Deterministic sort key. Negate class/rank so Python's ascending
+    sort yields the desired (severity desc, rank desc, ts asc, kind asc).
+    """
+    cls, rank = _signal_severity(sig)
+    ts = int(sig.get("ts_ms") or 0)
+    return (-_CLASS_ORDER.get(cls, 0), -rank, ts, sig.get("kind") or "")
+
+
+def _render_finding_summary(sig: Dict[str, Any]) -> str:
+    """Build the OBJECTIVE one-line summary for a single signal.
+
+    Reads only fields that already exist on the signal — never invents a
+    cause, never speculates, never recommends. Forbidden words
+    ("likely", "probably", "because", "recommend", ...) must not appear
+    here. ``test_findings_lines_have_no_forbidden_words`` enforces this.
+    """
+    kind = sig.get("kind") or "?"
+    if kind == "trajectory_artifact":
+        rid = (sig.get("runId") or "?")[:8]
+        flags = sig.get("flags") or []
+        parts = [f"run {rid}"]
+        if sig.get("final_status"):
+            parts.append(f"finalStatus={sig.get('final_status')}")
+        for flag in flags:
+            parts.append(f"{flag}=true")
+        if sig.get("prompt_error_source"):
+            parts.append(f"promptErrorSource={sig.get('prompt_error_source')}")
+        return "artifact " + ", ".join(parts)
+    if kind == "cron_delivery_failed":
+        return (
+            f"cron_delivery jobId={sig.get('jobId')} "
+            f"action={sig.get('action')} status={sig.get('status')} "
+            f"deliveryStatus={sig.get('deliveryStatus')}"
+        )
+    if kind == "retried_after_failure":
+        rid = (sig.get("runId") or "?")[:8]
+        return (
+            f"retried_after_failure run {rid} "
+            f"attempts={sig.get('attempt_count')} "
+            f"failed={sig.get('failed_count')} "
+            f"final_status={sig.get('final_status')} "
+            f"final_failed={sig.get('final_failed')}"
+        )
+    if kind == "tool_call_leak":
+        rid = (sig.get("runId") or "?")[:8]
+        return (
+            f"tool_call_leak run {rid} active={sig.get('active')} "
+            f"started={sig.get('started')} completed={sig.get('completed')}"
+        )
+    if kind == "items_incomplete":
+        rid = (sig.get("runId") or "?")[:8]
+        return (
+            f"items_incomplete run {rid} started={sig.get('started')} "
+            f"completed={sig.get('completed')} dropped={sig.get('dropped')}"
+        )
+    if kind == "prompt_cache_broke":
+        rid = (sig.get("runId") or "?")[:8]
+        return (
+            f"prompt_cache_broke run {rid} "
+            f"previous_cache_read={sig.get('previous_cache_read')} "
+            f"cache_read={sig.get('cache_read')} "
+            f"lost_tokens={sig.get('lost_tokens')}"
+        )
+    if kind == "long_tool_call":
+        name = sig.get("name") or "?"
+        args_s = sig.get("args_summary") or ""
+        if args_s.startswith("{") and args_s.endswith("}"):
+            args_s = "(" + args_s[1:-1] + ")"
+        elif args_s:
+            args_s = f"({args_s})"
+        dur_ms = sig.get("duration_ms") or 0
+        dur_s = fmt_duration(dur_ms / 1000)
+        snippet = (sig.get("snippet") or "").strip()
+        is_error = bool(sig.get("is_error"))
+        line = f"long_tool_call {name}{args_s} duration={dur_s}"
+        if is_error:
+            line += f' is_error=true result="{snippet}"' if snippet else " is_error=true"
+        elif snippet:
+            line += f' result="{snippet}"'
+        return line
+    if kind == "child_task_failed":
+        return (
+            f"child_task_failed task_id={(sig.get('task_id') or '?')[:12]} "
+            f"agent={sig.get('agent_id')} runtime={sig.get('runtime')} "
+            f'error="{(sig.get("error") or "")[:120]}"'
+        )
+    if kind == "log_stall":
+        return f'log_stall summary="{(sig.get("summary") or "")[:160]}"'
+    if kind == "context_precheck_overflow":
+        return (
+            f"context_precheck_overflow route={sig.get('route')} "
+            f"estimated_prompt_tokens={sig.get('estimated_prompt_tokens')} "
+            f"provider={sig.get('provider')}"
+        )
+    if kind == "state_transition_abnormal":
+        reason = sig.get("reason") or ""
+        reason_s = f' reason="{reason}"' if reason else ""
+        return (
+            f"state_transition prev={sig.get('prev')} "
+            f"new={sig.get('new')}{reason_s}"
+        )
+    if kind == "queue_wait_slow":
+        return (
+            f"queue_wait_slow wait_ms={sig.get('wait_ms')} "
+            f"queue_size={sig.get('queue_size')} "
+            f"lane={(sig.get('lane') or '?')[:80]}"
+        )
+    if kind == "config_reload_failed":
+        return (
+            f'config_reload_failed reason="{(sig.get("reason") or "")[:160]}"'
+        )
+    if kind == "log_decision":
+        return f'log_decision summary="{(sig.get("summary") or "")[:160]}"'
+    if kind == "last_tool_error":
+        rid = (sig.get("runId") or "?")[:8]
+        return (
+            f'last_tool_error run {rid} '
+            f'summary="{(sig.get("summary") or "")[:160]}"'
+        )
+    if kind == "gateway_pid_change":
+        return f"gateway_pid_change pids={sig.get('pids')}"
+    # Unknown kind: emit a stable, lossless restatement so future signal
+    # types still surface even before this table is updated.
+    return f"{kind} {sig}"
+
+
+def _build_findings(
+    problem_signals: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Return ``(ranked, more_count)``.
+
+    ``ranked`` is the top ``FINDINGS_TOP_N`` problem signals as objective
+    finding dicts ``{severity, kind, ts_ms, summary, ref}``, sorted by
+    ``_signal_sort_key``. ``more_count`` is the number of additional
+    problem signals that did not fit (0 when ≤ TOP_N).
+    """
+    sorted_sigs = sorted(problem_signals, key=_signal_sort_key)
+    findings: List[Dict[str, Any]] = []
+    for sig in sorted_sigs[:FINDINGS_TOP_N]:
+        cls, _rank = _signal_severity(sig)
+        findings.append({
+            "severity": cls,
+            "kind": sig.get("kind") or "?",
+            "ts_ms": int(sig.get("ts_ms") or 0),
+            "summary": _render_finding_summary(sig),
+            "ref": "Correlated Logs & Signals",
+        })
+    more = max(0, len(sorted_sigs) - FINDINGS_TOP_N)
+    return findings, more
 
 
 # ── log-line parsers (v1.4.4) ──────────────────────────────────────────────
@@ -2474,10 +2698,24 @@ class PanoramaInspector:
         report.data["correlated_logs"] = correlated_logs
         report.data["model_calls"] = model_calls
         report.data["model_aggregate"] = model_aggregate
+        # v1.4.13 Findings: deterministic ordering of problem signals so the
+        # detail list under Correlated Logs & Signals reads in severity
+        # order (fail → warn → desc rank → asc ts → asc kind name) and
+        # matches the Findings summary at the top. The list of signals
+        # itself is unchanged — only the order is.
+        signals = sorted(signals, key=_signal_sort_key)
         report.data["health_signals"] = signals
         # v1.4.10: positive signals on the JSON envelope so consumers can
         # render their own "what looks fine" summary alongside problems.
         report.data["positive_health_signals"] = positive_signals
+        # v1.4.13: ranked, objective findings on the JSON envelope.
+        # Each entry is {severity, kind, ts_ms, summary, ref}; values
+        # are pure restatements of fields already on the source signal
+        # (no inference, no recommendation). more_count is the tail that
+        # didn't fit under FINDINGS_TOP_N.
+        findings_list, findings_more = _build_findings(signals)
+        report.data["findings"] = findings_list
+        report.data["findings_more_count"] = findings_more
         report.data["child_tasks"] = children
         report.data["session_stats"] = session_stats
         # v1.4.4: surface the parsed log buckets and the OTel traceIds we
@@ -3413,6 +3651,80 @@ class PanoramaInspector:
                 data={"duration_ms": duration_ms,
                       "threshold_ms": SLOW_E2E_MS},
             )
+
+        # ── 0. Panorama · Findings (v1.4.13) ─────────────────────────────
+        # Built LAST so the verdict and every problem signal are fully
+        # known, then moved to position 0 so it renders FIRST. Strictly
+        # objective: the verdict is read from the already-computed
+        # ``report.verdict``; lines re-state fields already on the source
+        # signal. No inference, no recommendation. The same deterministic
+        # severity key (fail-class > warn-class, rank desc, ts asc, kind
+        # asc) applied above to ``signals`` orders the lines here too.
+        s_findings = report.section("Panorama · Findings")
+        verdict_value = report.verdict.value  # "ok" | "warn" | "fail"
+        fail_count = sum(
+            1 for s in signals if _signal_severity(s)[0] == "fail"
+        )
+        warn_count = sum(
+            1 for s in signals if _signal_severity(s)[0] == "warn"
+        )
+        verdict_line = f"verdict: {verdict_value.upper()}"
+        if fail_count or warn_count:
+            verdict_line += (
+                f" — {fail_count} fail, {warn_count} warn signals"
+            )
+        else:
+            verdict_line += " — 0 problem signals"
+        s_findings.ok(
+            "findings.verdict",
+            verdict_line,
+            data={
+                "verdict": verdict_value,
+                "fail_count": fail_count,
+                "warn_count": warn_count,
+                "total_problem_signals": len(signals),
+            },
+        )
+        if not signals:
+            s_findings.ok(
+                "findings.none",
+                "no problem signals",
+            )
+        else:
+            for idx, f in enumerate(findings_list, 1):
+                ts_local = (
+                    f"@{fmt_epoch_local(f['ts_ms'])} "
+                    if f.get("ts_ms") else ""
+                )
+                line = (
+                    f"{f['summary']} {ts_local}"
+                    f"(see {f['ref']})"
+                )
+                if f["severity"] == "fail":
+                    s_findings.fail(
+                        f"findings.{idx:02d}",
+                        line, data=f,
+                    )
+                else:
+                    s_findings.warn(
+                        f"findings.{idx:02d}",
+                        line, data=f,
+                    )
+            if findings_more:
+                s_findings.warn(
+                    "findings.more",
+                    f"+{findings_more} more "
+                    f"(see Correlated Logs & Signals)",
+                    data={
+                        "more": findings_more,
+                        "cap": FINDINGS_TOP_N,
+                    },
+                )
+
+        # Move Findings to position 0 so it renders before Session Overview.
+        # Built last so the verdict + signals are fully resolved.
+        if report.sections and report.sections[-1] is s_findings:
+            report.sections.insert(0, report.sections.pop())
 
         report.data["verdict"] = report.verdict.value
         report.elapsed_ms = (time.time() - t0) * 1000

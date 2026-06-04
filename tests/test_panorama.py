@@ -2765,9 +2765,12 @@ def test_no_standalone_health_signals_section(tmp_path: Path):
     section_titles = [s.title for s in report.sections]
     assert "Panorama · Health Signals" not in section_titles
     assert "Panorama · Correlated Logs & Signals" in section_titles
-    # 6 sections (was 7 before the merge).
-    assert len(section_titles) == 6, (
-        f"expected 6 sections after merge, got: {section_titles}"
+    # v1.4.13: section count rose to 7 with the new objective Findings
+    # summary at the top (renders FIRST).
+    assert "Panorama · Findings" in section_titles
+    assert section_titles[0] == "Panorama · Findings"
+    assert len(section_titles) == 7, (
+        f"expected 7 sections after Findings added, got: {section_titles}"
     )
 
 
@@ -2888,6 +2891,326 @@ def test_merged_section_verdict_unchanged_for_artifact_failure(
         "trajectory_artifact line missing from merged section; "
         f"names={[c.name for c in section.checks]}"
     )
+
+
+# ── v1.4.13: objective Findings summary + deterministic ranking ──────────
+
+
+def test_findings_section_first_and_verdict_line(tmp_path: Path):
+    """v1.4.13: 'Panorama · Findings' renders before Session Overview and
+    leads with the computed verdict + objective signal counts.
+    """
+    ctx = _build_fixture_home(tmp_path, artifact_failure=True)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    titles = [s.title for s in report.sections]
+    assert titles[0] == "Panorama · Findings"
+    findings = next(s for s in report.sections if s.title == "Panorama · Findings")
+    verdict_line = next(
+        c for c in findings.checks if c.name == "findings.verdict"
+    )
+    # Verdict line begins with "verdict: <VERDICT>".
+    assert verdict_line.message.startswith(
+        f"verdict: {report.verdict.value.upper()}"
+    )
+    # Counts must be objective non-negative integers and reflect the
+    # underlying problem signals exactly (no inference).
+    sigs = report.data["health_signals"]
+    fail_n = verdict_line.data["fail_count"]
+    warn_n = verdict_line.data["warn_count"]
+    assert fail_n + warn_n == len(sigs)
+    assert fail_n >= 0 and warn_n >= 0
+
+
+def test_findings_ordered_by_deterministic_severity_key(tmp_path: Path):
+    """The order is (severity_class desc, kind_rank desc, ts asc, kind asc).
+    Build a fixture mixing fail-class + warn-class signals at varied ts and
+    assert the ordering is exactly what the key prescribes — fail before
+    warn, higher rank before lower, earlier ts before later within a tie.
+    """
+    from ocdiag.inspectors.panorama import (
+        SIGNAL_SEVERITY,
+        _signal_sort_key,
+    )
+    sigs = [
+        # warn-class, lower rank, earlier ts
+        {"kind": "log_decision", "ts_ms": 100, "summary": "x"},
+        # fail-class, highest rank, later ts
+        {"kind": "trajectory_artifact", "ts_ms": 5000, "runId": "rrr",
+         "flags": ["timedOut"], "final_status": "error"},
+        # warn-class, higher rank, very late ts
+        {"kind": "tool_call_leak", "ts_ms": 9000, "runId": "rrr",
+         "active": 1, "started": 5, "completed": 4},
+        # fail-class, lower rank, earliest ts
+        {"kind": "cron_delivery_failed", "ts_ms": 50, "jobId": "j",
+         "action": "a", "status": "ok", "deliveryStatus": "failed"},
+    ]
+    ordered = sorted(sigs, key=_signal_sort_key)
+    # Expected order: fail-class trajectory_artifact (rank 100),
+    # then fail-class cron_delivery_failed (rank 90),
+    # then warn-class tool_call_leak (rank 70),
+    # then warn-class log_decision (rank 25).
+    assert [s["kind"] for s in ordered] == [
+        "trajectory_artifact",
+        "cron_delivery_failed",
+        "tool_call_leak",
+        "log_decision",
+    ]
+    # Confirm SIGNAL_SEVERITY is the source of truth for class+rank.
+    assert SIGNAL_SEVERITY["trajectory_artifact"][0] == "fail"
+    assert SIGNAL_SEVERITY["log_decision"][0] == "warn"
+    assert (
+        SIGNAL_SEVERITY["trajectory_artifact"][1]
+        > SIGNAL_SEVERITY["cron_delivery_failed"][1]
+    )
+
+
+def test_findings_cap_and_more_line(tmp_path: Path):
+    """When more than FINDINGS_TOP_N problem signals exist, the section caps
+    them and emits a single '+N more (see Correlated Logs & Signals)' line.
+    """
+    from ocdiag.inspectors.panorama import (
+        FINDINGS_TOP_N,
+        _build_findings,
+    )
+    sigs = [
+        {"kind": "long_tool_call", "ts_ms": i * 100,
+         "name": f"tool_{i}", "duration_ms": 60_000, "is_error": False,
+         "args_summary": "{}", "snippet": ""}
+        for i in range(FINDINGS_TOP_N + 5)
+    ]
+    findings, more = _build_findings(sigs)
+    assert len(findings) == FINDINGS_TOP_N
+    assert more == 5
+
+
+def test_findings_summary_lines_have_no_forbidden_words(tmp_path: Path):
+    """The Findings section MUST be objective. Scan every rendered line for
+    a blocklist of subjective words and assert none appear (case-insens).
+    """
+    # Fixture covering many distinct signal kinds at once. We append one
+    # of each into the inspector via synthetic logs / trajectory tweaks.
+    home = tmp_path / "many"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "13131313-1313-1313-1313-131313131313"
+    rid = "13131313-aaaa-bbbb-cccc-131313131313"
+    _make_minimal_session_jsonl(main_sd, sid)
+
+    # Trajectory with abort/timeout AND incomplete lifecycle AND cache
+    # break — three distinct problem signals at once.
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        final_status="error",
+        artifacts_data_overrides={
+            "aborted": True, "timedOut": True, "idleTimedOut": True,
+            "promptErrorSource": "prompt", "finalStatus": "error",
+            "itemLifecycle": {
+                "startedCount": 12, "completedCount": 7, "activeCount": 0,
+            },
+            "promptCache": {
+                "observation": {
+                    "broke": True,
+                    "previousCacheRead": 1_000_000,
+                    "cacheRead": 250_000,
+                },
+            },
+        },
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    findings = next(
+        s for s in report.sections if s.title == "Panorama · Findings"
+    )
+    rendered = "\n".join(c.message for c in findings.checks)
+    forbidden = [
+        "root cause", "caused", "because", "likely", "probably",
+        "suggest", "should", "recommend", "investigate",
+        "most significant", " due to ", "appears", "seems",
+    ]
+    lower = rendered.lower()
+    for word in forbidden:
+        assert word not in lower, (
+            f"forbidden subjective word '{word}' in Findings:\n{rendered}"
+        )
+    # Sanity: there ARE problem signals + a FAIL verdict.
+    assert "verdict: FAIL" in rendered
+    # Each non-verdict line ends with a pointer to the detail section.
+    detail_lines = [
+        c.message for c in findings.checks
+        if c.name.startswith("findings.") and c.name != "findings.verdict"
+        and c.name != "findings.none"
+    ]
+    for line in detail_lines:
+        assert "(see Correlated Logs & Signals)" in line
+
+
+def test_findings_ok_fixture_says_no_problem_signals(tmp_path: Path):
+    """When there are zero problem signals, Findings emits one explicit
+    objective line — no fabricated praise.
+    """
+    sid = "14141414-1414-1414-1414-141414141414"
+    rid = "14141414-aaaa-bbbb-cccc-141414141414"
+    home = tmp_path / "ok"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_minimal_session_jsonl(main_sd, sid)
+    # Clean trajectory: success, no flags, no leaks.
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "itemLifecycle": {
+                "startedCount": 3, "completedCount": 3, "activeCount": 0,
+            },
+        },
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    # No problem signals expected on this fixture.
+    assert sigs == [], f"expected zero problem signals, got: {sigs}"
+    findings = next(
+        s for s in report.sections if s.title == "Panorama · Findings"
+    )
+    none_line = next(
+        (c for c in findings.checks if c.name == "findings.none"), None,
+    )
+    assert none_line is not None
+    assert none_line.message == "no problem signals"
+
+
+def test_correlated_logs_problem_signals_severity_ordered(tmp_path: Path):
+    """v1.4.13: problem signals rendered under Correlated Logs & Signals
+    follow the same deterministic severity key as Findings. Build a
+    fixture that emits a fail-class and a warn-class signal and assert
+    the fail-class line precedes the warn-class line in the section.
+    """
+    home = tmp_path / "ord"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "15151515-1515-1515-1515-151515151515"
+    call_id = "tooluse_LongOrdered1"
+    start_ms = T0
+    end_ms = T0 + 90_000  # long tool call → warn signal
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T0),
+         "message": {"role": "user", "timestamp": T0, "content": "go"}},
+        {"type": "message", "id": "a-1",
+         "timestamp": _ms_to_iso(start_ms),
+         "message": {
+             "role": "assistant", "timestamp": start_ms,
+             "content": [
+                 {"type": "toolCall", "id": call_id, "name": "cron",
+                  "input": {"action": "update", "jobId": "ababcdcd"}},
+             ],
+         }},
+        {"type": "message", "id": "r-1",
+         "timestamp": _ms_to_iso(end_ms),
+         "message": {
+             "role": "toolResult", "timestamp": end_ms,
+             "toolCallId": call_id, "toolName": "cron",
+             "isError": True, "content": "deadline exceeded",
+         }},
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+    # Trajectory with an artifact failure → fail signal.
+    rid = "15151515-aaaa-bbbb-cccc-151515151515"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, end_ms + 1000,
+        final_status="error",
+        artifacts_data_overrides={
+            "aborted": True, "timedOut": True, "finalStatus": "error",
+        },
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    section = next(
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
+    )
+    # Find positions of the fail-class trajectory_artifact line and the
+    # warn-class long_tool_call line. The artifact line must come first.
+    names = [c.name for c in section.checks]
+    art_idx = next(
+        i for i, n in enumerate(names)
+        if n.startswith("health.trajectory_artifact.")
+    )
+    long_idx = next(
+        i for i, n in enumerate(names)
+        if n.startswith("health.long_tool_call.")
+    )
+    assert art_idx < long_idx, (
+        f"fail-class signal must precede warn-class; got names={names}"
+    )
+
+
+def test_findings_in_json_envelope(tmp_path: Path):
+    """v1.4.13: ``report.data['findings']`` carries an ordered list of
+    objective dicts; ``findings_more_count`` carries the tail.
+    """
+    ctx = _build_fixture_home(tmp_path, artifact_failure=True)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    findings = report.data["findings"]
+    assert isinstance(findings, list) and findings, (
+        "expected non-empty findings on a failing fixture"
+    )
+    for f in findings:
+        # Each finding has exactly the documented keys.
+        assert set(f.keys()) == {
+            "severity", "kind", "ts_ms", "summary", "ref",
+        }, f"unexpected keys: {f.keys()}"
+        assert f["severity"] in ("fail", "warn")
+        assert isinstance(f["kind"], str) and f["kind"]
+        assert isinstance(f["ts_ms"], int)
+        assert isinstance(f["summary"], str) and f["summary"]
+        assert f["ref"] == "Correlated Logs & Signals"
+    assert isinstance(report.data["findings_more_count"], int)
+
+
+def test_findings_top_n_constant_is_module_level():
+    """The cap is a module-level constant so it can be tuned in one place
+    without renaming code paths.
+    """
+    from ocdiag.inspectors.panorama import FINDINGS_TOP_N
+    assert isinstance(FINDINGS_TOP_N, int) and FINDINGS_TOP_N > 0
+
+
+def test_signal_severity_table_documented():
+    """Every kind that ``_health_signals`` can emit must appear in
+    SIGNAL_SEVERITY (otherwise it would silently fall through to the
+    ('warn', 0) default and rank below catalogued entries — fine for
+    forward-compat but bad as a regression). Pin the catalogue here.
+    """
+    from ocdiag.inspectors.panorama import SIGNAL_SEVERITY
+    expected_kinds = {
+        "trajectory_artifact",
+        "cron_delivery_failed",
+        "retried_after_failure",
+        "tool_call_leak",
+        "items_incomplete",
+        "prompt_cache_broke",
+        "long_tool_call",
+        "child_task_failed",
+        "log_stall",
+        "context_precheck_overflow",
+        "state_transition_abnormal",
+        "queue_wait_slow",
+        "config_reload_failed",
+        "log_decision",
+        "last_tool_error",
+        "gateway_pid_change",
+    }
+    missing = expected_kinds - set(SIGNAL_SEVERITY)
+    assert not missing, f"SIGNAL_SEVERITY missing entries for: {missing}"
 
 
 if __name__ == "__main__":

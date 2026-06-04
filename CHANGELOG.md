@@ -1,5 +1,82 @@
 # Changelog
 
+## v1.4.11 — bigger timeline middle, drop representative INFO, merge Health Signals into Correlated Logs (2026-06-04)
+
+### Changed
+- **Timeline middle sample is now meaningfully bigger.**
+  `TIMELINE_RENDER_SAMPLE` rose from 20 to 40, AND the filler picker was
+  rewritten to use fractional spacing across the full pool index range
+  (`(i * n) // room`). Pre-1.4.11 used `step = n // room` rounded to 1
+  once `room ≈ n`, which clustered every filler pick near index 0; on
+  long sessions the rendered "middle" sample never reached the run's
+  tail. Now picks span first→last evenly and the renderer shows up to
+  ~40 representative entries between the anchors. Interesting events
+  (errors/warns, state transitions, delivery, model.completed, tool
+  calls) are still prioritized first; remains linear-time and bounded.
+
+### Removed
+- **Cherry-picked "representative INFO" block in Correlated Logs.** When
+  there were no ERROR/WARN entries the section used to emit up to 5
+  keyword-matched INFO lines (`_representative_logs`). The selection was
+  arbitrary (substring match against `start/end/tool/...`), gave a false
+  sense of "we picked the important ones", and frequently buried the
+  user under boilerplate like "session.ended". The block — and the
+  helper — are gone. On a clean run the section now shows the summary
+  line and the positive `ok_*` signals only; the absence of error lines
+  IS the affirmative answer.
+- **Standalone "Panorama · Health Signals" section.** It always read in
+  the same breath as Correlated Logs (signals = "what does this log
+  mean?"), so the merge below replaces it. JSON consumers are unaffected:
+  `report.data["health_signals"]` and `report.data["positive_health_signals"]`
+  still carry every signal, with the same kinds, severities, and shape.
+
+### Merged
+- **`Panorama · Correlated Logs & Signals`** (new section name) folds in
+  every previous Health Signals render. Order:
+  1. Summary line (correlated entries: N ERROR, M WARN, K INFO + window
+     filter note).
+  2. Positive `ok_*` confirmations (✓ tools / lifecycle / cache /
+     outcome / delivery).
+  3. Problem signals (⚠/✗) — same kinds and severities as v1.4.10:
+     `trajectory_artifact`, `tool_call_leak`, `items_incomplete`,
+     `prompt_cache_broke`, `retried_after_failure`, `long_tool_call`,
+     `cron_delivery_failed`, `log_stall`, `log_decision`,
+     `queue_wait_slow`, `context_precheck_overflow`,
+     `state_transition_abnormal`, `config_reload_failed`,
+     `gateway_pid_change`.
+  4. Raw ERROR log lines (cap 200 + "+N more").
+  5. Raw WARN log lines (head 10 + "+N more").
+  Verdict logic is **unchanged** — the same `fail()` / `warn()` calls
+  drive verdict, just from a different host section. Section count went
+  7 → 6.
+
+### Tests
+- `test_timeline_render_sample_cap_raised_to_40` — pins the constant.
+- `test_timeline_sample_more_than_old_cap_and_spans_run` — 200-event
+  fixture: asserts >20 sample lines, ≤40 lines, AND coverage reaches
+  the last quarter of the run (the bug fix proof).
+- `test_correlated_logs_renders_no_info_lines_when_no_err_warn` —
+  clean fixture must render zero `logs.info.*` lines.
+- `test_representative_logs_helper_removed` — guards the deletion.
+- `test_no_standalone_health_signals_section` — section count = 6,
+  no `Panorama · Health Signals` title.
+- `test_merged_section_contains_summary_and_positive_signals` —
+  ordering: summary before positives.
+- `test_merged_section_carries_problem_signals` — long_tool_call lands
+  under the merged section, verdict still warns.
+- `test_merged_section_verdict_unchanged_for_artifact_failure` —
+  trajectory_artifact still renders as ✗ FAIL line under merge.
+- Existing tests that referenced "Panorama · Correlated Logs" or
+  "Panorama · Health Signals" updated to the merged title; the e2e
+  smoke test now asserts presence of the merged section AND absence of
+  the old standalone Health Signals section.
+
+### Spec
+- `PANORAMA_SPEC.md`: 7-section → 6-section layout, section §5 renamed
+  to `correlated_logs_and_signals` with the new render order, INFO log
+  lines explicitly noted as "NOT rendered", `TIMELINE_RENDER_SAMPLE`
+  documented as 40 with the spacing rationale.
+
 ## v1.4.10 — three user-reported panorama fixes (2026-06-04)
 
 ### Fixed

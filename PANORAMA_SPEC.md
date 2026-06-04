@@ -91,13 +91,23 @@ Only include entries matching `sessionId` or `runIds`. Exclude sessionKey-only a
 }
 ```
 
-## Sections (v1.4.3 layout — 7 sections)
+## Sections (v1.4.11 layout — 6 sections)
 
 The standalone "Runtime Context", "Model Decisions", and "Delivery" sections
 were merged into adjacent sections in v1.4.3. JSON consumers keep the
 `runtime_context` data key unchanged for backward-compat; `model_decisions`
 and `delivery` data keys were removed (their content lives under
 `health_signals` and `timeline` respectively).
+
+**v1.4.11 merge:** the standalone "Panorama · Health Signals" section was
+folded into "Panorama · Correlated Logs", and the merged section was
+renamed to "Panorama · Correlated Logs & Signals". The two were always
+read together — signals are the human explanation of what the logs say —
+so a single section reduces scrolling without changing what is rendered
+or how the verdict is computed. Section count went from 7 to 6.
+
+JSON consumers are unaffected: `report.data["health_signals"]` and
+`report.data["positive_health_signals"]` are still populated.
 
 ### 1. session_overview (incl. runtime context)
 - sessionId, agentId, sessionKey, trigger (user/cron/subagent)
@@ -143,12 +153,18 @@ and `delivery` data keys were removed (their content lives under
   line in the section
 - Records with no parseable timestamp are counted under `skipped_no_ts`
 - **v1.4.10 middle-event sample** — the rendered Timeline section now
-  includes a `timeline.sample.*` block (up to `TIMELINE_RENDER_SAMPLE = 20`
+  includes a `timeline.sample.*` block (up to `TIMELINE_RENDER_SAMPLE`
   entries, chronological, deduped against first/last/key-moment anchors).
   Selection prioritizes interesting events (log:ERROR, log:WARN, state
   transitions, delivery, model.completed, tool calls), then pads with
   evenly-spaced filler so the run's overall shape is visible. Linear
   time, bounded memory.
+  **v1.4.11:** `TIMELINE_RENDER_SAMPLE` was raised from 20 to 40, and the
+  filler picker was rewritten to use fractional spacing across the full
+  pool index range (`(i * n) // room`). Pre-1.4.11 code used `step =
+  n // room` rounded to 1 once `room ≈ n`, so the picks all clustered
+  near index 0; long runs now get representative coverage across the
+  whole window.
 
 ### 3. model_calls
 - Per-call data: `ts_ms`, `duration_ms` (round-trip wall-clock proxy — kept
@@ -175,10 +191,29 @@ and `delivery` data keys were removed (their content lives under
 - Per-tool: name, start_ts, end_ts, duration_ms, args, result_text/error
 - Stats: total tools, avg/p50/p95/max duration, error count, slowest
 
-### 5. correlated_logs
-- App log entries passing the correlation filter, **bounded to the session
+### 5. correlated_logs_and_signals (v1.4.11 merged)
+
+This section bundles correlated log lines AND health signals — they are
+the same diagnostic story, so the merge eliminates a back-and-forth read
+between two adjacent sections. Render order:
+
+1. **Summary line** — `<N> correlated entries: <E> ERROR, <W> WARN, <I> INFO`
+   plus a window-filter note when entries were dropped or kept ts-less.
+2. **Positive (✓) signals** — `health.ok_*` lines (tools / lifecycle /
+   cache / outcome / delivery). Always rendered when present; never
+   change the verdict.
+3. **Problem (⚠/✗) signals** — every `_health_signals` kind documented
+   in §7 below renders here, with the same `fail()`/`warn()` severity
+   as the standalone v1.4.10 section. Verdict logic is unchanged.
+4. **Raw ERROR log lines** — head-200 (safety cap) with `+N more`
+   trailer.
+5. **Raw WARN log lines** — head-10 with `+N more` trailer.
+
+Other behavior:
+
+- App log entries pass the correlation filter, **bounded to the session
   window** (`[window_start − 5s, window_end + 5s]`) so reused
-  sessionKey/toolCallId noise is dropped
+  sessionKey/toolCallId noise is dropped.
 - **v1.4.10 window-aware log discovery.** Log files are selected by
   filename date (`openclaw-YYYY-MM-DD.log`) intersecting the session
   window (with a ±1 day margin for midnight / tz boundaries), unioned
@@ -189,17 +224,27 @@ and `delivery` data keys were removed (their content lives under
   `discover_recent_logs`. The downstream window-bound filter still does
   the precise ±5s slice — broadening file selection does not leak
   unrelated entries.
-- ERROR entries: ALL in-window errors are rendered (safety cap 200 with
-  `+N more` line)
-- WARN entries: head-10 plus `+N more`
-- INFO: representative sampling when no errors/warns
-- `logs.summary.data` carries `out_of_window_dropped`, `ts_less_kept`
+- INFO log lines: **NOT rendered.** v1.4.11 removed the cherry-picked
+  "representative INFO" block that ran when no ERROR/WARN existed.
+  It was arbitrary — keyword-driven, ignored content the user might
+  actually care about, and gave a false sense of completeness. On a
+  clean run only the summary line and the positive ✓ confirmations
+  show; that's the honest answer.
+- `logs.summary.data` still carries `out_of_window_dropped`,
+  `ts_less_kept`.
 
 ### 6. child_tasks
 - From runs.sqlite: all tasks where requester_session_key matches
 - Per child: task_id, runtime, agent_id, status, duration, error
 
-### 7. health_signals (incl. model decisions)
+### (Health Signals — folded into §5 in v1.4.11)
+
+The standalone "Panorama · Health Signals" section was merged into
+"Panorama · Correlated Logs & Signals" in v1.4.11. Every signal kind
+listed below is still computed and surfaced under `report.data
+["health_signals"]`; positives are still on `report.data
+["positive_health_signals"]`. The renderer routes them to the merged
+section above, with severity (`fail`/`warn`) preserved.
 - `trajectory_artifact` — abort/timeout flags. v1.4.4 attaches a
   `human_summary` array translating the flag combo into messages like
   "went idle", "hung during tool execution", "hung during context
@@ -252,9 +297,10 @@ and `delivery` data keys were removed (their content lives under
   `ok_lifecycle` ("no leaks (active=0), all N items completed"),
   `ok_cache` ("cache healthy (no breaks)" — only when an observation is
   present), `ok_outcome` ("no aborts/timeouts/stalls"), `ok_delivery`
-  ("delivered ok ..." or cron-records confirmed). They render as `✓`
-  lines at the top of Health Signals and are **additive only** —
-  problem ⚠/✗ lines still drive the verdict.
+  ("delivered ok ..." or cron-records confirmed). v1.4.11 renders them
+  in the merged "Correlated Logs & Signals" section, just below the
+  summary line. They are **additive only** — problem ⚠/✗ lines still
+  drive the verdict.
 
 ## Verdict Logic
 

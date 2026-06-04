@@ -29,6 +29,18 @@ Verdict semantics:
   WARN  any correlated log entry is WARN-level, model fell back, stall
         detected, or end-to-end wall clock > 5min
   OK    everything else
+
+Section layout (v1.4.11 — 6 sections; was 7 before the merge):
+
+  1. Panorama · Session Overview
+  2. Panorama · Timeline
+  3. Panorama · Model Calls
+  4. Panorama · Tool Execution
+  5. Panorama · Correlated Logs & Signals   (was: two separate sections —
+       "Correlated Logs" and "Health Signals". v1.4.11 merged them since
+       the signals are the human-readable explanation of what the logs
+       show; the verdict-driving fail()/warn() calls are unchanged.)
+  6. Panorama · Child Tasks
 """
 
 from __future__ import annotations
@@ -64,10 +76,12 @@ from ..tracing import (
 SLOW_E2E_MS = 5 * 60 * 1000
 DEFAULT_LOG_RECORD_CAP = 5000
 DEFAULT_TIMELINE_CAP = 2000
-# v1.4.10: cap on the number of representative middle-of-the-run timeline
-# events rendered under "timeline.sample". Tunable in one place so the
-# render heuristic can be retuned without hunting for magic numbers.
-TIMELINE_RENDER_SAMPLE = 20
+# Cap on the number of representative middle-of-the-run timeline events
+# rendered under "timeline.sample". Tunable in one place so the render
+# heuristic can be retuned without hunting for magic numbers. v1.4.11
+# raised this from 20 → 40 so the middle of long runs is more visible
+# (and the improved sampler now spreads filler picks across first→last).
+TIMELINE_RENDER_SAMPLE = 40
 # Slack added to the session window when bounding correlated log entries,
 # so a clock-skewed log line written just before/after the run still counts.
 LOG_WINDOW_GRACE_MS = 5_000
@@ -1999,9 +2013,14 @@ def _timeline_sample(
             out.append(e)
         return out
 
-    # Phase 1: prioritize interesting events, in order.
+    # Phase 1: prioritize interesting events. When MORE than `cap` of them
+    # exist, evenly sample across the interesting-event index range so the
+    # picks cover the run's full span — the older "first cap of them in
+    # order" loop hid late interesting events on long sessions where the
+    # early interactions burned through the cap before the renderer ever
+    # reached the tail.
     seen_keys: set = set()
-    chosen: List[Dict[str, Any]] = []
+    interesting_pool: List[Dict[str, Any]] = []
     for e in candidates:
         if not _is_interesting_timeline_event(e):
             continue
@@ -2009,17 +2028,32 @@ def _timeline_sample(
         if key in seen_keys:
             continue
         seen_keys.add(key)
-        chosen.append(e)
-        if len(chosen) >= cap:
-            break
+        interesting_pool.append(e)
+
+    chosen: List[Dict[str, Any]] = []
+    pn = len(interesting_pool)
+    if pn <= cap:
+        chosen.extend(interesting_pool)
+    else:
+        # Fractional even spacing across the interesting pool.
+        # `(i * pn) // cap` for i in [0, cap) yields cap distinct indices
+        # spread across [0, pn) without clustering at either end.
+        for i in range(cap):
+            idx = min(pn - 1, (i * pn) // cap)
+            chosen.append(interesting_pool[idx])
+        # The picks above are already chronological since
+        # interesting_pool was iterated in chronological order.
 
     # Phase 2: pad with evenly-spaced filler from the remaining pool, only
-    # if we have room. We sample by index so the picks span the run's
-    # full duration (helpful when interesting events all cluster near one
-    # end).
+    # if we have room. We sample positions across the FULL pool index range
+    # using fractional spacing so the picks genuinely span first→last —
+    # the older `i * (n // room)` formula clustered everything near index
+    # 0 when `room` was much smaller than `n` (e.g. picks at 0, 50, 100
+    # … and never reaching the tail of a 5000-event pool).
     if len(chosen) < cap:
         room = cap - len(chosen)
-        # Build the filler pool: candidates not yet chosen.
+        # Build the filler pool: candidates not yet chosen, in chronological
+        # order (candidates is a chrono pre-filter).
         pool = [
             e for e in candidates
             if (e.get("ts_ms"), e.get("source"), e.get("summary"))
@@ -2027,12 +2061,13 @@ def _timeline_sample(
         ]
         n = len(pool)
         if n and room:
-            # Even spacing across the pool's index range. step = max(1, n/room).
-            # We add room+1 anchors and take indices 0..room−1 to avoid
-            # always picking the same head/tail twice.
-            step = max(1, n // room)
+            # Fractional even spacing: pick indices 0, n/room, 2*n/room, …
+            # (room−1)*n/room. This guarantees the last pick is at index
+            # ≈ n − n/room (not 0), so the picks reach the run's tail.
+            # Scan indices in the order produced; collisions with already-
+            # chosen interesting events are skipped (cap holds room).
             for i in range(room):
-                idx = min(n - 1, i * step)
+                idx = min(n - 1, (i * n) // room)
                 e = pool[idx]
                 key = (e.get("ts_ms"), e.get("source"), e.get("summary"))
                 if key in seen_keys:
@@ -2042,46 +2077,6 @@ def _timeline_sample(
 
     chosen.sort(key=lambda e: e.get("ts_ms") or 0)
     return chosen[:cap]
-
-
-# ── representative log entries when only INFO is present ───────────────────
-
-
-def _representative_logs(
-    correlated_logs: List[Dict[str, Any]],
-    *,
-    limit: int = 5,
-) -> List[Dict[str, Any]]:
-    """Pick a small set of telling INFO entries: lifecycle starts/ends and
-    anything mentioning a tool/model boundary. We pick from the head, the
-    middle, and the tail to span the run.
-    """
-    if not correlated_logs:
-        return []
-    interesting: List[Dict[str, Any]] = []
-    fallback: List[Dict[str, Any]] = []
-    keywords = (
-        "start", "end", "complete", "spawn", "deliver", "cron",
-        "tool", "model", "compaction", "session",
-    )
-    for rec in correlated_logs:
-        text = (parse_log_msg(rec) or "").lower()
-        if any(k in text for k in keywords):
-            interesting.append(rec)
-        else:
-            fallback.append(rec)
-    pool = interesting or fallback
-    if len(pool) <= limit:
-        return pool
-    # span: 1st, last, plus evenly spaced mids
-    indices = [0, len(pool) - 1]
-    inner = limit - 2
-    if inner > 0:
-        step = max(1, len(pool) // (inner + 1))
-        for i in range(1, inner + 1):
-            indices.append(min(len(pool) - 2, i * step))
-    indices = sorted(set(indices))
-    return [pool[i] for i in indices][:limit]
 
 
 # ── main inspector ─────────────────────────────────────────────────────────
@@ -2331,8 +2326,9 @@ class PanoramaInspector:
             log_parsed=log_parsed,
         )
         # v1.4.10: positive (OK) signals so a healthy run shows confirmation
-        # lines, not just an empty Health Signals section. Additive only —
-        # they never affect the verdict.
+        # lines, not just an empty signals section. Additive only — they
+        # never affect the verdict. v1.4.11 renders these in the merged
+        # "Correlated Logs & Signals" section.
         positive_signals = _positive_health_signals(
             selected_runs or traj_runs,
             waterfall=waterfall,
@@ -2490,7 +2486,7 @@ class PanoramaInspector:
         # v1.4.5: when any selected run had multiple attempt-cycles,
         # surface a one-line "attempts: N (M failed, final=<status>)"
         # for each multi-attempt run so the hidden retry is visible
-        # before scrolling down to Health Signals.
+        # before scrolling down to Correlated Logs & Signals.
         for run in (selected_runs or traj_runs):
             attempts = run.get("attempts") or []
             if len(attempts) <= 1:
@@ -2960,7 +2956,7 @@ class PanoramaInspector:
                     s_model.warn(
                         f"model.error.no_usage.{rid_s}",
                         "model call failed with no usage record "
-                        "(see Health Signals)",
+                        "(see Correlated Logs & Signals)",
                     )
 
         # 5. Tool Execution — args + result summary inline
@@ -2996,11 +2992,25 @@ class PanoramaInspector:
                     f"tools.call.{idx}", v, line, data=t,
                 )
 
-        # 5. Correlated Logs — show ALL in-window errors (capped at safety
-        #    limit) + first WARN entries + representative INFO. Logs were
-        #    bounded to the session window above; the summary line records
-        #    how many entries fell outside (clock-skew / sessionKey reuse).
-        s_logs = report.section("Panorama · Correlated Logs")
+        # 5. Correlated Logs & Signals — v1.4.11 merges the standalone
+        # Health Signals section into Correlated Logs because the two were
+        # always read together (signals explain WHY the logs say what they
+        # say). The render order is intentional:
+        #   1. summary line (or "no logs" notice)
+        #   2. positive ✓ confirmations (so a clean run is visibly clean)
+        #   3. problem ⚠/✗ signals (the diagnostic core)
+        #   4. raw ERROR log lines (head-200 + "+N more")
+        #   5. raw WARN log lines (head-10 + "+N more")
+        # Verdict-driving severity calls (.fail/.warn) are unchanged — only
+        # the section that hosts them moved. The cherry-picked
+        # "representative INFO" block was removed (v1.4.11): on a clean
+        # run, positives carry the affirmation, and a single summary
+        # number is honest about the rest.
+        s_logs = report.section("Panorama · Correlated Logs & Signals")
+
+        # 1. Summary / no-logs notice ────────────────────────────────────
+        error_entries: List[Dict[str, Any]] = []
+        warn_entries: List[Dict[str, Any]] = []
         if not log_files:
             s_logs.warn("logs.missing", "no app log files found in log_dir")
         elif not correlated_logs:
@@ -3039,7 +3049,213 @@ class PanoramaInspector:
                     "ts_less_kept": logs_ts_less,
                 },
             )
-            # Render every in-window ERROR (with safety cap + "+N more").
+
+        # 2. Positive (OK) signals — additive, never affect verdict. ─────
+        for psig in positive_signals:
+            kind = psig.get("kind") or "ok"
+            s_logs.ok(
+                f"health.{kind}",
+                psig.get("summary") or "",
+                data=psig,
+            )
+        # When neither positive nor problem signals were computed, surface
+        # an explicit "clean" line so the section never goes silent on a
+        # truly minimal run (e.g. no trajectory + no logs).
+        if not signals and not positive_signals:
+            s_logs.ok(
+                "health.clean",
+                "no abort/timeout/leak/stall signals",
+            )
+
+        # 3. Problem signals — same vocabulary as the old Health Signals
+        # section. The verdict-driving fail()/warn() calls are unchanged.
+        for sig in signals:
+            kind = sig.get("kind", "?")
+            ts_ms = sig.get("ts_ms") or 0
+            tsfx = f"[{fmt_epoch_local(ts_ms)}] " if ts_ms else ""
+            if kind == "trajectory_artifact":
+                # v1.4.4 task C: render the human-friendly "where it
+                # hung" line; raw flags stay on the data block for
+                # JSON consumers.
+                human = sig.get("human_summary") or []
+                detail = " | ".join(human) if human else (
+                    ",".join(sig.get("flags") or []) or "?"
+                )
+                s_logs.fail(
+                    f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                    f"{tsfx}run {(sig.get('runId') or '?')[:8]}: "
+                    f"{detail} | finalStatus={sig.get('final_status')}",
+                    data=sig,
+                )
+            elif kind == "tool_call_leak":
+                s_logs.warn(
+                    f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                    f"{tsfx}tool-call leak: active={sig.get('active')} "
+                    f"started={sig.get('started')} "
+                    f"completed={sig.get('completed')}",
+                    data=sig,
+                )
+            elif kind == "log_stall":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}stall: {sig.get('summary')}",
+                    data=sig,
+                )
+            elif kind == "gateway_pid_change":
+                s_logs.warn(
+                    f"health.{kind}",
+                    f"gateway pid change: {sig.get('pids')}",
+                    data=sig,
+                )
+            elif kind == "long_tool_call":
+                # v1.4.10: render the call's args + (when present) an
+                # error or result snippet, so the line names WHICH
+                # invocation hung — e.g. "cron(action=update,
+                # jobId=0cdb2836) 2.4m → error: patch required"
+                # — instead of just "cron 2.4m (error)".
+                name = sig.get("name") or "?"
+                args_s = sig.get("args_summary") or ""
+                # Convert the waterfall's {k=v, k=v} curly format to
+                # paren-wrapped (k=v, k=v) so the rendering reads like
+                # a function call. The signal itself preserves the
+                # original {} string for any consumer that already
+                # depends on _format_args_inline output shape.
+                if (args_s.startswith("{") and args_s.endswith("}")):
+                    paren_args = "(" + args_s[1:-1] + ")"
+                else:
+                    paren_args = f"({args_s})" if args_s else ""
+                name_call = f"{name}{paren_args}" if paren_args else name
+                dur_s = fmt_duration(
+                    (sig.get("duration_ms") or 0) / 1000
+                )
+                snippet = sig.get("snippet") or ""
+                if sig.get("is_error"):
+                    tail = (
+                        f" → error: {snippet}" if snippet else " (error)"
+                    )
+                else:
+                    tail = f" → {snippet}" if snippet else ""
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}long tool call: {name_call} {dur_s}{tail}",
+                    data=sig,
+                )
+            elif kind == "last_tool_error":
+                s_logs.warn(
+                    f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                    f"{tsfx}last tool error: {sig.get('summary')}",
+                    data=sig,
+                )
+            elif kind == "child_task_failed":
+                s_logs.warn(
+                    f"health.{kind}.{(sig.get('task_id') or '?')[:8]}",
+                    f"{tsfx}child task failed: "
+                    f"{sig.get('agent_id')}/{sig.get('runtime')} — "
+                    f"{sig.get('error')}",
+                    data=sig,
+                )
+            elif kind == "cron_delivery_failed":
+                s_logs.fail(
+                    f"health.{kind}."
+                    f"{(str(sig.get('jobId')) or '?')[:8]}.{ts_ms}",
+                    f"{tsfx}cron delivery failed: "
+                    f"job={sig.get('jobId')} action={sig.get('action')} "
+                    f"status={sig.get('status')} "
+                    f"deliveryStatus={sig.get('deliveryStatus')}",
+                    data=sig,
+                )
+            elif kind == "log_decision":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}decision: {sig.get('summary')}",
+                    data=sig,
+                )
+            elif kind == "items_incomplete":
+                s_logs.warn(
+                    f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                    f"{tsfx}incomplete items: "
+                    f"{sig.get('started')} started, "
+                    f"{sig.get('completed')} completed "
+                    f"({sig.get('dropped')} dropped/errored)",
+                    data=sig,
+                )
+            elif kind == "prompt_cache_broke":
+                lost = sig.get("lost_tokens")
+                lost_s = (
+                    f", lost ~{lost:,} tokens"
+                    if isinstance(lost, int) and lost > 0 else ""
+                )
+                s_logs.warn(
+                    f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                    f"{tsfx}prompt cache broke{lost_s} "
+                    f"(prev cacheRead={sig.get('previous_cache_read')} "
+                    f"→ {sig.get('cache_read')})",
+                    data=sig,
+                )
+            elif kind == "queue_wait_slow":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}queued {sig.get('wait_ms')}ms behind "
+                    f"other turns "
+                    f"(queueSize={sig.get('queue_size')}, "
+                    f"lane={(sig.get('lane') or '?')[:80]})",
+                    data=sig,
+                )
+            elif kind == "context_precheck_overflow":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}context precheck route="
+                    f"{sig.get('route')} "
+                    f"estTokens={sig.get('estimated_prompt_tokens')}",
+                    data=sig,
+                )
+            elif kind == "state_transition_abnormal":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}abnormal state transition: "
+                    f"{sig.get('prev')} → {sig.get('new')}"
+                    + (
+                        f' reason="{sig.get("reason")}"'
+                        if sig.get("reason") else ""
+                    ),
+                    data=sig,
+                )
+            elif kind == "config_reload_failed":
+                s_logs.warn(
+                    f"health.{kind}.{ts_ms}",
+                    f"{tsfx}config reload FAILED (invalid): "
+                    f"{(sig.get('reason') or '')[:160]}",
+                    data=sig,
+                )
+            elif kind == "retried_after_failure":
+                # v1.4.5: hidden failed-then-recovered attempts. WARN
+                # when the final attempt succeeded (recovered), FAIL
+                # when the final attempt also failed. The existing
+                # trajectory_artifact signal still fires for whichever
+                # attempt is the final one and degrades verdict
+                # independently — this signal is purely additive.
+                rid_s = (sig.get("runId") or "?")[:8]
+                n = sig.get("attempt_count") or 0
+                failed = sig.get("failed_count") or 0
+                final_status = sig.get("final_status") or "?"
+                chain = " | ".join(sig.get("per_attempt") or [])
+                line = (
+                    f"{tsfx}run {rid_s} had {n} attempts "
+                    f"({failed} failed): {chain} → final {final_status}"
+                )
+                if sig.get("final_failed"):
+                    s_logs.fail(
+                        f"health.{kind}.{rid_s}", line, data=sig,
+                    )
+                else:
+                    s_logs.warn(
+                        f"health.{kind}.{rid_s}", line, data=sig,
+                    )
+            else:
+                s_logs.warn(f"health.{kind}", str(sig), data=sig)
+
+        # 4. Raw ERROR log lines (cap + "+N more"). ──────────────────────
+        if error_entries:
             shown_errors = error_entries[:MAX_RENDERED_ERROR_LINES]
             for idx, rec in enumerate(shown_errors, 1):
                 msg_s = parse_log_msg(rec) or "?"
@@ -3059,7 +3275,9 @@ class PanoramaInspector:
                     f"(safety cap {MAX_RENDERED_ERROR_LINES})",
                     data={"more": more, "cap": MAX_RENDERED_ERROR_LINES},
                 )
-            # WARN list keeps the original cap (head only) + "+N more".
+
+        # 5. Raw WARN log lines (head + "+N more"). ──────────────────────
+        if warn_entries:
             shown_warns = warn_entries[:MAX_RENDERED_WARN_LINES]
             for idx, rec in enumerate(shown_warns, 1):
                 msg_s = parse_log_msg(rec) or "?"
@@ -3078,28 +3296,11 @@ class PanoramaInspector:
                     f"+{more} more WARN entries not shown",
                     data={"more": more, "cap": MAX_RENDERED_WARN_LINES},
                 )
-            # Representative INFO entries when nothing failed
-            if info_count and not error_entries and not warn_entries:
-                info_only = [
-                    rec for rec in correlated_logs
-                    if (_log_level(rec) or "").upper() not in ("ERROR", "WARN")
-                ]
-                reps = _representative_logs(info_only, limit=5)
-                for idx, rec in enumerate(reps, 1):
-                    msg_s = parse_log_msg(rec) or "?"
-                    sub = get_log_subsystem(rec) or "?"
-                    ts = _log_ts_ms(rec)
-                    tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
-                    s_logs.ok(
-                        f"logs.info.{idx}",
-                        f"{tsfx}[INFO] [{sub}] {msg_s[:160]}",
-                        data={"correlation": rec.get("correlation")},
-                    )
 
         # (Standalone "Model Decisions" section removed in v1.4.3 — log-marker
-        #  decisions are routed into Health Signals as kind=log_decision; the
-        #  duplicate trajectory model_select entry is gone because the model
-        #  identity is already shown in Session Overview.)
+        #  decisions are routed under "health" entries as kind=log_decision;
+        #  the duplicate trajectory model_select entry is gone because the
+        #  model identity is already shown in Session Overview.)
 
         # 6. Child Tasks
         s_children = report.section("Panorama · Child Tasks")
@@ -3132,209 +3333,12 @@ class PanoramaInspector:
         #  deliveries surface as a kind=cron_delivery_failed health signal so
         #  the verdict still degrades correctly.)
 
-        # 7. Health Signals — with timestamps + richer data. v1.4.10 also
-        # renders positive (OK) signals so a healthy run is visible, not
-        # just an empty section.
-        s_health = report.section("Panorama · Health Signals")
-        if not signals:
-            s_health.ok(
-                "health.clean",
-                "no abort/timeout/leak/stall signals",
-            )
-        # Positive signals come first when present, regardless of whether
-        # there are also problems — they answer "what IS fine?" up front.
-        for psig in positive_signals:
-            kind = psig.get("kind") or "ok"
-            s_health.ok(
-                f"health.{kind}",
-                psig.get("summary") or "",
-                data=psig,
-            )
-        if signals:
-            for sig in signals:
-                kind = sig.get("kind", "?")
-                ts_ms = sig.get("ts_ms") or 0
-                tsfx = f"[{fmt_epoch_local(ts_ms)}] " if ts_ms else ""
-                if kind == "trajectory_artifact":
-                    # v1.4.4 task C: render the human-friendly "where it
-                    # hung" line; raw flags stay on the data block for
-                    # JSON consumers.
-                    human = sig.get("human_summary") or []
-                    detail = " | ".join(human) if human else (
-                        ",".join(sig.get("flags") or []) or "?"
-                    )
-                    s_health.fail(
-                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
-                        f"{tsfx}run {(sig.get('runId') or '?')[:8]}: "
-                        f"{detail} | finalStatus={sig.get('final_status')}",
-                        data=sig,
-                    )
-                elif kind == "tool_call_leak":
-                    s_health.warn(
-                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
-                        f"{tsfx}tool-call leak: active={sig.get('active')} "
-                        f"started={sig.get('started')} "
-                        f"completed={sig.get('completed')}",
-                        data=sig,
-                    )
-                elif kind == "log_stall":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}stall: {sig.get('summary')}",
-                        data=sig,
-                    )
-                elif kind == "gateway_pid_change":
-                    s_health.warn(
-                        f"health.{kind}",
-                        f"gateway pid change: {sig.get('pids')}",
-                        data=sig,
-                    )
-                elif kind == "long_tool_call":
-                    # v1.4.10: render the call's args + (when present) an
-                    # error or result snippet, so the line names WHICH
-                    # invocation hung — e.g. "cron(action=update,
-                    # jobId=0cdb2836) 2.4m → error: patch required"
-                    # — instead of just "cron 2.4m (error)".
-                    name = sig.get("name") or "?"
-                    args_s = sig.get("args_summary") or ""
-                    # Convert the waterfall's {k=v, k=v} curly format to
-                    # paren-wrapped (k=v, k=v) so the rendering reads like
-                    # a function call. The signal itself preserves the
-                    # original {} string for any consumer that already
-                    # depends on _format_args_inline output shape.
-                    if (args_s.startswith("{") and args_s.endswith("}")):
-                        paren_args = "(" + args_s[1:-1] + ")"
-                    else:
-                        paren_args = f"({args_s})" if args_s else ""
-                    name_call = f"{name}{paren_args}" if paren_args else name
-                    dur_s = fmt_duration(
-                        (sig.get("duration_ms") or 0) / 1000
-                    )
-                    snippet = sig.get("snippet") or ""
-                    if sig.get("is_error"):
-                        tail = (
-                            f" → error: {snippet}" if snippet else " (error)"
-                        )
-                    else:
-                        tail = f" → {snippet}" if snippet else ""
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}long tool call: {name_call} {dur_s}{tail}",
-                        data=sig,
-                    )
-                elif kind == "last_tool_error":
-                    s_health.warn(
-                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
-                        f"{tsfx}last tool error: {sig.get('summary')}",
-                        data=sig,
-                    )
-                elif kind == "child_task_failed":
-                    s_health.warn(
-                        f"health.{kind}.{(sig.get('task_id') or '?')[:8]}",
-                        f"{tsfx}child task failed: "
-                        f"{sig.get('agent_id')}/{sig.get('runtime')} — "
-                        f"{sig.get('error')}",
-                        data=sig,
-                    )
-                elif kind == "cron_delivery_failed":
-                    s_health.fail(
-                        f"health.{kind}."
-                        f"{(str(sig.get('jobId')) or '?')[:8]}.{ts_ms}",
-                        f"{tsfx}cron delivery failed: "
-                        f"job={sig.get('jobId')} action={sig.get('action')} "
-                        f"status={sig.get('status')} "
-                        f"deliveryStatus={sig.get('deliveryStatus')}",
-                        data=sig,
-                    )
-                elif kind == "log_decision":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}decision: {sig.get('summary')}",
-                        data=sig,
-                    )
-                elif kind == "items_incomplete":
-                    s_health.warn(
-                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
-                        f"{tsfx}incomplete items: "
-                        f"{sig.get('started')} started, "
-                        f"{sig.get('completed')} completed "
-                        f"({sig.get('dropped')} dropped/errored)",
-                        data=sig,
-                    )
-                elif kind == "prompt_cache_broke":
-                    lost = sig.get("lost_tokens")
-                    lost_s = (
-                        f", lost ~{lost:,} tokens"
-                        if isinstance(lost, int) and lost > 0 else ""
-                    )
-                    s_health.warn(
-                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
-                        f"{tsfx}prompt cache broke{lost_s} "
-                        f"(prev cacheRead={sig.get('previous_cache_read')} "
-                        f"→ {sig.get('cache_read')})",
-                        data=sig,
-                    )
-                elif kind == "queue_wait_slow":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}queued {sig.get('wait_ms')}ms behind "
-                        f"other turns "
-                        f"(queueSize={sig.get('queue_size')}, "
-                        f"lane={(sig.get('lane') or '?')[:80]})",
-                        data=sig,
-                    )
-                elif kind == "context_precheck_overflow":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}context precheck route="
-                        f"{sig.get('route')} "
-                        f"estTokens={sig.get('estimated_prompt_tokens')}",
-                        data=sig,
-                    )
-                elif kind == "state_transition_abnormal":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}abnormal state transition: "
-                        f"{sig.get('prev')} → {sig.get('new')}"
-                        + (
-                            f' reason="{sig.get("reason")}"'
-                            if sig.get("reason") else ""
-                        ),
-                        data=sig,
-                    )
-                elif kind == "config_reload_failed":
-                    s_health.warn(
-                        f"health.{kind}.{ts_ms}",
-                        f"{tsfx}config reload FAILED (invalid): "
-                        f"{(sig.get('reason') or '')[:160]}",
-                        data=sig,
-                    )
-                elif kind == "retried_after_failure":
-                    # v1.4.5: hidden failed-then-recovered attempts. WARN
-                    # when the final attempt succeeded (recovered), FAIL
-                    # when the final attempt also failed. The existing
-                    # trajectory_artifact signal still fires for whichever
-                    # attempt is the final one and degrades verdict
-                    # independently — this signal is purely additive.
-                    rid_s = (sig.get("runId") or "?")[:8]
-                    n = sig.get("attempt_count") or 0
-                    failed = sig.get("failed_count") or 0
-                    final_status = sig.get("final_status") or "?"
-                    chain = " | ".join(sig.get("per_attempt") or [])
-                    line = (
-                        f"{tsfx}run {rid_s} had {n} attempts "
-                        f"({failed} failed): {chain} → final {final_status}"
-                    )
-                    if sig.get("final_failed"):
-                        s_health.fail(
-                            f"health.{kind}.{rid_s}", line, data=sig,
-                        )
-                    else:
-                        s_health.warn(
-                            f"health.{kind}.{rid_s}", line, data=sig,
-                        )
-                else:
-                    s_health.warn(f"health.{kind}", str(sig), data=sig)
+        # (Standalone "Panorama · Health Signals" section was REMOVED in
+        #  v1.4.11. Its rendering now lives in the merged
+        #  "Panorama · Correlated Logs & Signals" section above; the
+        #  underlying signals are still computed and the JSON envelope
+        #  keys `health_signals` / `positive_health_signals` are
+        #  unchanged for downstream consumers.)
 
         if duration_ms > SLOW_E2E_MS:
             s_overview.warn(

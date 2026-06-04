@@ -827,7 +827,8 @@ def test_window_bound_logs_summary_carries_counters(tmp_path: Path):
     ctx = _build_fixture_home(tmp_path)
     report = _run_panorama(ctx, session_id=SESSION_ID)
     logs_section = next(
-        s for s in report.sections if s.title == "Panorama · Correlated Logs"
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
     )
     summary = next(
         (c for c in logs_section.checks if c.name == "logs.summary"), None,
@@ -858,7 +859,8 @@ def test_window_bound_drops_far_future_log(tmp_path: Path):
 
     report = _run_panorama(ctx, session_id=SESSION_ID)
     logs_section = next(
-        s for s in report.sections if s.title == "Panorama · Correlated Logs"
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
     )
     summary = next(
         c for c in logs_section.checks if c.name == "logs.summary"
@@ -1920,12 +1922,15 @@ def test_e2e_real_session_smoke():
         "Panorama · Timeline",
         "Panorama · Model Calls",
         "Panorama · Tool Execution",
-        "Panorama · Correlated Logs",
-        "Panorama · Health Signals",
+        "Panorama · Correlated Logs & Signals",
+        "Panorama · Child Tasks",
     ):
         assert required in section_titles, (
             f"missing section {required}; got {section_titles}"
         )
+    # v1.4.11: standalone "Panorama · Health Signals" is gone — its
+    # rendering moved into "Correlated Logs & Signals" above.
+    assert "Panorama · Health Signals" not in section_titles
     assert isinstance(report.data.get("log_parsed"), dict)
 
 
@@ -2469,14 +2474,17 @@ def test_positive_health_signals_clean_run(tmp_path: Path):
     assert "ok_tools" in kinds
     # Lifecycle clean (started==completed==2, active==0)
     assert "ok_lifecycle" in kinds
-    # The Health Signals section must render the positive lines.
-    health = next(
+    # v1.4.11: positive lines render under the merged
+    # "Correlated Logs & Signals" section (was: standalone Health Signals).
+    section = next(
         s for s in report.sections
-        if s.title == "Panorama · Health Signals"
+        if s.title == "Panorama · Correlated Logs & Signals"
     )
-    ok_msgs = [c.message for c in health.checks
+    ok_msgs = [c.message for c in section.checks
                if c.name.startswith("health.ok_")]
-    assert ok_msgs, "expected at least one ok_* line in Health Signals"
+    assert ok_msgs, (
+        "expected at least one ok_* line in Correlated Logs & Signals"
+    )
 
 
 def test_positive_signals_do_not_change_verdict(tmp_path: Path):
@@ -2628,6 +2636,250 @@ def test_e2e_real_session_e37_v1_4_10_improvements():
         c.name.startswith("timeline.sample.")
         for c in timeline_section.checks
     ), "T3 regression: timeline.sample.* missing"
+
+
+# ── v1.4.11: bigger timeline middle sample (cap raised to 40) ─────────────
+
+
+def test_timeline_render_sample_cap_raised_to_40():
+    """v1.4.11: TIMELINE_RENDER_SAMPLE was raised from 20 to 40 so the
+    rendered Timeline shows more middle activity on long runs.
+    """
+    from ocdiag.inspectors.panorama import TIMELINE_RENDER_SAMPLE
+    assert TIMELINE_RENDER_SAMPLE == 40
+
+
+def test_timeline_sample_more_than_old_cap_and_spans_run():
+    """Build a 200-event timeline and verify the renderer:
+      1. emits MORE than the old cap (>20) and ≤ the new cap (40),
+      2. picks events covering the whole run, NOT just the early span.
+
+    This exercises both the bumped constant AND the rewritten filler
+    that uses fractional spacing across the full pool index range.
+    """
+    from ocdiag.inspectors.panorama import (
+        TIMELINE_RENDER_SAMPLE,
+        _timeline_sample,
+    )
+    n_events = 200
+    timeline = []
+    for i in range(n_events):
+        timeline.append({
+            "ts_ms": T0 + i * 1000,
+            "source": "session.jsonl",
+            "event_type": "message",
+            "summary": f"message:user [{i}]",
+        })
+    # Skip first/last (the renderer already shows them) and sample.
+    skip = {timeline[0]["ts_ms"], timeline[-1]["ts_ms"]}
+    sample = _timeline_sample(
+        timeline, skip_ts_ms=skip, cap=TIMELINE_RENDER_SAMPLE,
+    )
+    # 1. count
+    assert len(sample) > 20, (
+        f"expected >20 sample lines under new cap, got {len(sample)}"
+    )
+    assert len(sample) <= TIMELINE_RENDER_SAMPLE
+    # 2. coverage: at least one pick must land in the LAST quarter of
+    # the timeline (indexes 150..199 → ts T0 + 150_000..199_000ms).
+    # The pre-1.4.11 sampler clustered everything near index 0 because
+    # `step = n // room` rounded to 1 once room ≈ n; this assertion
+    # would have failed under that path.
+    last_quarter_start = T0 + (n_events * 3 // 4) * 1000
+    assert any(s["ts_ms"] >= last_quarter_start for s in sample), (
+        "sample should reach the last quarter of the run; "
+        f"max ts in sample={max(s['ts_ms'] for s in sample) - T0}ms, "
+        f"last_quarter_start={last_quarter_start - T0}ms"
+    )
+
+
+# ── v1.4.11: representative INFO removed from Correlated Logs ─────────────
+
+
+def test_correlated_logs_renders_no_info_lines_when_no_err_warn(
+        tmp_path: Path):
+    """v1.4.11: when correlated logs have no ERROR/WARN, the section must
+    NOT cherry-pick "representative" INFO lines anymore. Only the summary
+    line shows. (The clean fixture has only INFO + one unrelated WARN; we
+    overwrite that WARN to assert the strictly-clean path.)
+    """
+    ctx = _build_fixture_home(tmp_path)
+    # Rewrite today's log so every line is INFO-only and includes the
+    # sessionId so we get a non-zero correlated-log count.
+    log_dir = ctx.log_dir
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = log_dir / f"openclaw-{today}.log"
+    with open(log_path, "w", encoding="utf-8") as f:
+        for i in range(8):
+            ts = T0 + i * 100
+            rec = {
+                "level": "INFO", "time": ts, "pid": 1,
+                "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+                "msg": f"sessionId={SESSION_ID} step {i}",
+            }
+            f.write(json.dumps(rec) + "\n")
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    section = next(
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
+    )
+    # Summary still present
+    assert any(c.name == "logs.summary" for c in section.checks)
+    # The pre-1.4.11 render emitted up to 5 logs.info.* lines here.
+    info_lines = [c for c in section.checks
+                  if c.name.startswith("logs.info.")]
+    assert info_lines == [], (
+        "v1.4.11 regression: 'logs.info.*' representative lines reappeared. "
+        f"Got: {[c.name for c in info_lines]}"
+    )
+
+
+def test_representative_logs_helper_removed():
+    """v1.4.11: the helper that produced cherry-picked INFO lines was
+    removed entirely. Importing it must fail.
+    """
+    import ocdiag.inspectors.panorama as panorama
+    assert not hasattr(panorama, "_representative_logs"), (
+        "_representative_logs should have been deleted in v1.4.11"
+    )
+
+
+# ── v1.4.11: merged "Correlated Logs & Signals" section ───────────────────
+
+
+def test_no_standalone_health_signals_section(tmp_path: Path):
+    """v1.4.11: the standalone "Panorama · Health Signals" section is
+    gone. Its content lives under "Correlated Logs & Signals".
+    """
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    section_titles = [s.title for s in report.sections]
+    assert "Panorama · Health Signals" not in section_titles
+    assert "Panorama · Correlated Logs & Signals" in section_titles
+    # 6 sections (was 7 before the merge).
+    assert len(section_titles) == 6, (
+        f"expected 6 sections after merge, got: {section_titles}"
+    )
+
+
+def test_merged_section_contains_summary_and_positive_signals(
+        tmp_path: Path):
+    """A clean run renders BOTH the log summary AND the positive ✓
+    confirmations under the merged section. The order matters: summary
+    first, then positives.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    section = next(
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
+    )
+    names = [c.name for c in section.checks]
+    # Summary present (its data block carries the counters).
+    assert "logs.summary" in names
+    # At least one positive signal (the fixture is 'lifecycle clean').
+    assert any(n.startswith("health.ok_") for n in names), (
+        f"expected health.ok_* lines under merged section; got {names}"
+    )
+    # Order: logs.summary appears BEFORE health.ok_* lines.
+    summary_idx = names.index("logs.summary")
+    first_positive = next(
+        i for i, n in enumerate(names) if n.startswith("health.ok_")
+    )
+    assert summary_idx < first_positive, (
+        f"logs.summary should come before health.ok_*; names={names}"
+    )
+
+
+def test_merged_section_carries_problem_signals(tmp_path: Path):
+    """A long erroring tool call must produce a long_tool_call problem
+    signal AND it must render under the merged section. Verdict logic
+    is unchanged (warn) compared to pre-merge behavior.
+    """
+    home = tmp_path / "long-tool-merge"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "abcdef11-1111-1111-1111-abcdef111111"
+    call_id = "tooluse_LongMerge1"
+    start_ms = T0
+    end_ms = T0 + 90_000  # 1.5 minutes — exceeds 60s threshold
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T0),
+         "message": {"role": "user", "timestamp": T0, "content": "go"}},
+        {"type": "message", "id": "a-1",
+         "timestamp": _ms_to_iso(start_ms),
+         "message": {
+             "role": "assistant", "timestamp": start_ms,
+             "content": [
+                 {"type": "toolCall", "id": call_id, "name": "cron",
+                  "input": {"action": "update", "jobId": "abc12345"}},
+             ],
+         }},
+        {"type": "message", "id": "r-1",
+         "timestamp": _ms_to_iso(end_ms),
+         "message": {
+             "role": "toolResult", "timestamp": end_ms,
+             "toolCallId": call_id, "toolName": "cron",
+             "isError": True, "content": "deadline exceeded",
+         }},
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=home / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+
+    report = _run_panorama(ctx, session_id=sid)
+    # The signal is still computed.
+    sigs = report.data["health_signals"]
+    long_sigs = [s for s in sigs if s.get("kind") == "long_tool_call"]
+    assert len(long_sigs) == 1
+    # And it renders under the MERGED section, not standalone.
+    section = next(
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
+    )
+    long_lines = [
+        c for c in section.checks
+        if c.name.startswith("health.long_tool_call.")
+    ]
+    assert long_lines, (
+        f"long_tool_call line missing from merged section; "
+        f"got names={[c.name for c in section.checks]}"
+    )
+    # Verdict for problems still warns (unchanged from pre-merge).
+    assert report.verdict in (Verdict.WARN, Verdict.FAIL)
+
+
+def test_merged_section_verdict_unchanged_for_artifact_failure(
+        tmp_path: Path):
+    """A trajectory_artifact failure still drives FAIL verdict, and
+    renders its ✗ line under the merged section.
+    """
+    ctx = _build_fixture_home(tmp_path, artifact_failure=True)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    assert report.verdict == Verdict.FAIL
+    section = next(
+        s for s in report.sections
+        if s.title == "Panorama · Correlated Logs & Signals"
+    )
+    fail_lines = [
+        c for c in section.checks
+        if c.name.startswith("health.trajectory_artifact.")
+    ]
+    assert fail_lines, (
+        "trajectory_artifact line missing from merged section; "
+        f"names={[c.name for c in section.checks]}"
+    )
 
 
 if __name__ == "__main__":

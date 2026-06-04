@@ -63,6 +63,13 @@ from ..tracing import (
 SLOW_E2E_MS = 5 * 60 * 1000
 DEFAULT_LOG_RECORD_CAP = 5000
 DEFAULT_TIMELINE_CAP = 2000
+# Slack added to the session window when bounding correlated log entries,
+# so a clock-skewed log line written just before/after the run still counts.
+LOG_WINDOW_GRACE_MS = 5_000
+# Safety cap on rendered ERROR lines per section. Above this we still report
+# the count via "+N more" so the section never grows unboundedly.
+MAX_RENDERED_ERROR_LINES = 200
+MAX_RENDERED_WARN_LINES = 10
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -113,6 +120,42 @@ def _log_ts_ms(rec: Dict[str, Any]) -> int:
     if isinstance(t, str) and t:
         return _safe_iso_to_ms(t)
     return _safe_iso_to_ms(rec.get("ts") or rec.get("timestamp"))
+
+
+def _bound_logs_to_window(
+    correlated_logs: List[Dict[str, Any]],
+    *,
+    window_start: int,
+    window_end: int,
+    grace_ms: int = LOG_WINDOW_GRACE_MS,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """Drop correlated log entries whose timestamp lies outside the session
+    window (with a small ``grace_ms`` for clock skew). Entries with no
+    parseable timestamp are kept (we can't prove they belong to a different
+    window) but counted separately.
+
+    Returns ``(in_window_logs, out_of_window_count, ts_less_count)``. When
+    no window is computed (``window_start`` and ``window_end`` both 0), the
+    list is returned unchanged with both counters at 0.
+    """
+    if not window_start and not window_end:
+        return list(correlated_logs), 0, 0
+    lo = (window_start - grace_ms) if window_start else 0
+    hi = (window_end + grace_ms) if window_end else 0
+    in_window: List[Dict[str, Any]] = []
+    dropped = 0
+    ts_less = 0
+    for rec in correlated_logs:
+        ts = _log_ts_ms(rec)
+        if not ts:
+            ts_less += 1
+            in_window.append(rec)
+            continue
+        if (lo and ts < lo) or (hi and ts > hi):
+            dropped += 1
+            continue
+        in_window.append(rec)
+    return in_window, dropped, ts_less
 
 
 def _maybe_sanitize(value: Any, *, mask: bool) -> Any:
@@ -426,15 +469,27 @@ def _build_timeline(
     session_records: List[Dict[str, Any]],
     trajectory_runs: List[Dict[str, Any]],
     correlated_logs: List[Dict[str, Any]],
+    cron_runs: Optional[List[Dict[str, Any]]] = None,
+    delivery_run_summary: Optional[Dict[str, Any]] = None,
     cap: int = DEFAULT_TIMELINE_CAP,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Merge all sources into one chronological list.
 
     Each entry has ``ts_ms`` (epoch ms), ``source``, ``event_type``,
     ``summary``, and an optional ``correlation`` block (carried over from
-    correlated log entries).
+    correlated log entries). Delivery events from cron and messaging-tool
+    are folded in as ``source="delivery"`` so the timeline tells the full
+    request → reply story without a separate Delivery section.
+
+    Returns ``(timeline, stats)`` where ``stats`` carries:
+      - ``skipped_no_ts``: records dropped because no parseable timestamp
+      - ``dropped_middle``: events lost to the truncation cap (0 if the
+        whole list fit)
+      - ``truncated``: bool, True iff dropped_middle > 0
+      - ``total_before_cap``: count before truncation, for honest reporting
     """
     out: List[Dict[str, Any]] = []
+    skipped_no_ts = 0
 
     for rec in session_records:
         if not isinstance(rec, dict):
@@ -449,6 +504,7 @@ def _build_timeline(
         if not ts_ms:
             ts_ms = _safe_iso_to_ms(rec.get("timestamp"))
         if not ts_ms:
+            skipped_no_ts += 1
             continue
         summary = rtype
         if rtype == "message" and isinstance(msg, dict):
@@ -479,6 +535,7 @@ def _build_timeline(
         for ev in run.get("events", []):
             ts = _safe_iso_to_ms(ev.get("ts"))
             if not ts:
+                skipped_no_ts += 1
                 continue
             out.append({
                 "ts_ms": ts,
@@ -491,6 +548,7 @@ def _build_timeline(
     for rec in correlated_logs:
         ts = _log_ts_ms(rec)
         if not ts:
+            skipped_no_ts += 1
             continue
         lvl = _log_level(rec) or "INFO"
         sub = get_log_subsystem(rec) or "?"
@@ -506,14 +564,76 @@ def _build_timeline(
             entry["correlation"] = rec["correlation"]
         out.append(entry)
 
+    # Cron run records — each line is a discrete delivery event.
+    for c in (cron_runs or []):
+        if not isinstance(c, dict):
+            continue
+        ts = c.get("ts")
+        if not isinstance(ts, (int, float)) or ts <= 0:
+            ts = _safe_iso_to_ms(c.get("ts"))
+        if not ts:
+            skipped_no_ts += 1
+            continue
+        action = c.get("action") or "?"
+        status = c.get("status") or "?"
+        ds = c.get("deliveryStatus") or "?"
+        job_id = c.get("jobId") or "?"
+        out.append({
+            "ts_ms": int(ts),
+            "source": "delivery",
+            "event_type": "delivery",
+            "summary": (
+                f"cron {str(job_id)[:8]} action={action} "
+                f"status={status} deliveryStatus={ds}"
+            ),
+            "delivery": {
+                "kind": "cron",
+                "jobId": job_id,
+                "action": action,
+                "status": status,
+                "deliveryStatus": ds,
+            },
+        })
+
+    # Messaging-tool send: a single summarized entry at the run end.
+    if delivery_run_summary and delivery_run_summary.get("did_send"):
+        ts = delivery_run_summary.get("ended_ms") or 0
+        if ts:
+            targets = delivery_run_summary.get("targets") or []
+            text_count = delivery_run_summary.get("text_count") or 0
+            out.append({
+                "ts_ms": int(ts),
+                "source": "delivery",
+                "event_type": "delivery",
+                "summary": (
+                    f"messaging-tool send: targets={len(targets)} "
+                    f"texts={text_count}"
+                ),
+                "delivery": {
+                    "kind": "messaging_tool",
+                    "targets": targets,
+                    "text_count": text_count,
+                },
+            })
+
     out.sort(key=lambda r: r["ts_ms"])
-    if len(out) > cap:
+    total_before_cap = len(out)
+    dropped_middle = 0
+    if total_before_cap > cap:
         # Keep oldest 10% + newest 90% so context isn't lost on huge sessions.
         head = max(1, cap // 10)
-        out = out[:head] + out[-(cap - head):]
+        tail = cap - head
+        dropped_middle = total_before_cap - head - tail
+        out = out[:head] + out[-tail:]
     for entry in out:
         entry["ts_local"] = fmt_epoch_local(entry["ts_ms"])
-    return out
+    stats = {
+        "skipped_no_ts": skipped_no_ts,
+        "dropped_middle": dropped_middle,
+        "truncated": dropped_middle > 0,
+        "total_before_cap": total_before_cap,
+    }
+    return out, stats
 
 
 # ── runtime / health extraction from trajectory ────────────────────────────
@@ -668,54 +788,45 @@ def _runtime_context(run: Dict[str, Any]) -> Dict[str, Any]:
     return ctx
 
 
-def _model_decisions(
-    runs: List[Dict[str, Any]],
+_LOG_DECISION_MARKERS = (
+    "model_fallback_decision",
+    "harness_select",
+    "context_overflow",
+    "compaction_triggered",
+)
+
+
+def _log_marker_signals(
     correlated_logs: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    """Pull out structured decision markers from app logs.
+
+    These are routed into ``health_signals`` (kind ``log_decision``) instead
+    of standing alone — there are too few of them to warrant their own
+    section, and they're really just another flavor of operational warning.
+    The ``model_select`` entries from ``trace.metadata`` were dropped because
+    they duplicate the model identity already shown in Session Overview.
+    """
     out: List[Dict[str, Any]] = []
-    for run in runs:
-        meta = run.get("trace_metadata") or {}
-        md = meta.get("data") or {}
-        model = md.get("model") if isinstance(md, dict) else None
-        if isinstance(model, dict):
-            out.append({
-                "ts_ms": _safe_iso_to_ms(meta.get("ts")),
-                "source": "trajectory",
-                "kind": "model_select",
-                "runId": run["runId"],
-                "provider": model.get("provider"),
-                "name": model.get("name"),
-                "api": model.get("api"),
-                "thinkLevel": model.get("thinkLevel"),
-                "reasoningLevel": model.get("reasoningLevel"),
-            })
     for rec in correlated_logs:
         text = parse_log_msg(rec)
-        sub = get_log_subsystem(rec)
         if not text:
             continue
-        # Look for known decision markers. Keep this list small and explicit
-        # so we don't accidentally pull in unrelated log chatter.
-        markers = (
-            "model_fallback_decision",
-            "harness_select",
-            "context_overflow",
-            "compaction_triggered",
-        )
-        if not any(m in text for m in markers):
+        if not any(m in text for m in _LOG_DECISION_MARKERS):
             continue
         out.append({
-            "ts_ms": _log_ts_ms(rec),
-            "source": "app_log",
             "kind": "log_decision",
-            "subsystem": sub,
+            "ts_ms": _log_ts_ms(rec),
+            "subsystem": get_log_subsystem(rec),
             "summary": text[:200],
         })
-    out.sort(key=lambda r: r.get("ts_ms") or 0)
     return out
 
 
 LONG_TOOL_CALL_THRESHOLD_MS = 60_000
+
+
+_FAILED_DELIVERY_STATUSES = {"failed", "error", "errored", "undelivered"}
 
 
 def _health_signals(
@@ -724,6 +835,8 @@ def _health_signals(
     *,
     waterfall: Optional[List[Dict[str, Any]]] = None,
     children: Optional[List[Dict[str, Any]]] = None,
+    cron_runs: Optional[List[Dict[str, Any]]] = None,
+    log_decisions: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
     for run in runs:
@@ -822,6 +935,34 @@ def _health_signals(
                 "error": str(c.get("error") or "")[:200],
                 "ts_ms": c.get("ended_at") or c.get("started_at") or 0,
             })
+    # Failed cron deliveries — surface here so verdict logic still sees them
+    # after the standalone Delivery section was removed.
+    if cron_runs:
+        for c in cron_runs:
+            if not isinstance(c, dict):
+                continue
+            ds = (c.get("deliveryStatus") or "").lower()
+            status = (c.get("status") or "").lower()
+            if ds in _FAILED_DELIVERY_STATUSES or status in (
+                "failed", "error", "errored",
+            ):
+                ts = c.get("ts")
+                if not isinstance(ts, (int, float)):
+                    ts = _safe_iso_to_ms(c.get("ts"))
+                signals.append({
+                    "kind": "cron_delivery_failed",
+                    "ts_ms": int(ts or 0),
+                    "jobId": c.get("jobId"),
+                    "action": c.get("action"),
+                    "status": c.get("status"),
+                    "deliveryStatus": c.get("deliveryStatus"),
+                    "summary": c.get("summary"),
+                })
+    # Log-marker decisions (model_fallback / harness_select / context_overflow
+    # / compaction_triggered). These were the standalone "Model Decisions"
+    # section in v1.4.x; they live here as WARN-level operational signals.
+    if log_decisions:
+        signals.extend(log_decisions)
     return signals
 
 
@@ -1152,12 +1293,18 @@ class PanoramaInspector:
             window_end = max(record_ts) if record_ts else 0
         duration_ms = max(0, window_end - window_start) if window_end else 0
 
-        # Filter app logs through correlation graph.
+        # Filter app logs through correlation graph, then bound to the
+        # session window so we don't drag in unrelated traffic that just
+        # happens to share a long-lived sessionKey or reused toolCallId.
         strict = bool(kwargs.get("strict_correlation"))
-        correlated_logs = filter_log_files(
+        raw_correlated_logs = filter_log_files(
             log_files, graph,
             strict=strict, max_records=DEFAULT_LOG_RECORD_CAP,
         ) if log_files else []
+        correlated_logs, logs_dropped_oow, logs_ts_less = _bound_logs_to_window(
+            raw_correlated_logs,
+            window_start=window_start, window_end=window_end,
+        )
 
         mask = bool(kwargs.get("mask")) and not (
             kwargs.get("unmask") or ctx.unmask
@@ -1166,20 +1313,8 @@ class PanoramaInspector:
         waterfall = _build_tool_waterfall(session_records, mask=mask)
         wf_stats = _waterfall_stats(waterfall)
 
-        timeline = _build_timeline(
-            session_records=session_records,
-            trajectory_runs=selected_runs or traj_runs,
-            correlated_logs=correlated_logs,
-        )
-        timeline_keys = _timeline_key_moments(timeline)
-
         runtime_blocks = [_runtime_context(r) for r in (selected_runs or traj_runs)]
-        decisions = _model_decisions(selected_runs or traj_runs, correlated_logs)
         children = [_summarize_child_task(row) for row in child_rows]
-        signals = _health_signals(
-            selected_runs or traj_runs, correlated_logs,
-            waterfall=waterfall, children=children,
-        )
         model_calls = _extract_model_calls(session_records)
         model_aggregate = _aggregate_model_calls(model_calls)
 
@@ -1206,6 +1341,36 @@ class PanoramaInspector:
                             cron_runs.append(rec)
             except OSError:
                 pass
+
+        # Build the run-level delivery summary (used by timeline + verdict).
+        delivery_run_summary: Optional[Dict[str, Any]] = None
+        if primary_runtime and primary_runtime.get("did_send_via_messaging_tool"):
+            delivery_run_summary = {
+                "did_send": True,
+                "ended_ms": (primary_run or {}).get("ended_ms") or 0,
+                "targets": primary_runtime.get("messaging_targets") or [],
+                "text_count": primary_runtime.get("messaging_text_count") or 0,
+            }
+
+        # Timeline (now folds in window-bounded logs + delivery events).
+        timeline, timeline_stats = _build_timeline(
+            session_records=session_records,
+            trajectory_runs=selected_runs or traj_runs,
+            correlated_logs=correlated_logs,
+            cron_runs=cron_runs,
+            delivery_run_summary=delivery_run_summary,
+        )
+        timeline_keys = _timeline_key_moments(timeline)
+
+        # Health signals (now also includes log-marker decisions and
+        # cron-delivery failures, replacing the standalone Model Decisions
+        # and Delivery sections respectively).
+        log_decisions = _log_marker_signals(correlated_logs)
+        signals = _health_signals(
+            selected_runs or traj_runs, correlated_logs,
+            waterfall=waterfall, children=children,
+            cron_runs=cron_runs, log_decisions=log_decisions,
+        )
 
         # ── Aggregated session stats (cross-section summary) ─────────────
         total_input = sum(c.get("input") or 0 for c in model_calls)
@@ -1249,12 +1414,14 @@ class PanoramaInspector:
         report.data["selected_runs"] = [r["runId"] for r in (selected_runs or [])]
         report.data["all_runs"] = [r["runId"] for r in traj_runs]
         report.data["timeline"] = timeline
+        report.data["timeline_stats"] = timeline_stats
         report.data["timeline_key_moments"] = timeline_keys
         report.data["tool_waterfall"] = waterfall
         report.data["tool_stats"] = wf_stats
+        # runtime_context kept on the JSON envelope for backward-compat —
+        # the standalone pretty section is gone (folded into Session Overview).
         report.data["runtime_context"] = runtime_blocks
         report.data["correlated_logs"] = correlated_logs
-        report.data["model_decisions"] = decisions
         report.data["model_calls"] = model_calls
         report.data["model_aggregate"] = model_aggregate
         report.data["health_signals"] = signals
@@ -1352,19 +1519,138 @@ class PanoramaInspector:
             data=sources_present,
         )
 
+        # ── Runtime Context (folded into Session Overview) ──────────────
+        # The v1.4.x standalone "Panorama · Runtime Context" section was
+        # removed in v1.4.3. Its fields live here as additional Overview
+        # lines. report.data["runtime_context"] is unchanged so JSON
+        # consumers keep the full per-run snapshot.
+        if primary_runtime:
+            rt = primary_runtime
+            hv = rt.get("harness_version")
+            node = rt.get("node")
+            if hv or node:
+                s_overview.ok(
+                    "runtime.harness",
+                    f"harness: {hv or '?'}"
+                    + (f" | node: {node}" if node else ""),
+                )
+            pa = rt.get("plugins_activated") or []
+            if pa:
+                s_overview.ok(
+                    "runtime.plugins",
+                    f"plugins activated: {', '.join(pa)}",
+                    data={"plugins_activated": pa},
+                )
+            for pe in (rt.get("plugin_errors") or [])[:5]:
+                s_overview.warn(
+                    f"runtime.plugin_error.{pe.get('id','?')}",
+                    f"plugin error: {pe.get('id')} — "
+                    f"{(pe.get('error') or '?')[:120]}",
+                    data=pe,
+                )
+            sk_count = rt.get("skill_count")
+            if sk_count is not None:
+                sn = rt.get("skill_names") or []
+                preview = ", ".join(sn[:8])
+                more = f" (+{len(sn) - 8} more)" if len(sn) > 8 else ""
+                s_overview.ok(
+                    "runtime.skills",
+                    f"skills: {sk_count}"
+                    + (f" — {preview}{more}" if preview else ""),
+                    data={"skill_count": sk_count, "skill_names": sn},
+                )
+            sp_chars = rt.get("system_prompt_chars")
+            pc_chars = rt.get("project_context_chars")
+            np_chars = rt.get("non_project_context_chars")
+            ts_chars = rt.get("tools_schema_chars")
+            if sp_chars or ts_chars:
+                pc_s = f" project={pc_chars:,}" if pc_chars else ""
+                np_s = f" nonProject={np_chars:,}" if np_chars else ""
+                ts_s = f" | tools_schema={ts_chars:,}" if ts_chars else ""
+                s_overview.ok(
+                    "runtime.prompt_budget",
+                    f"system prompt: {sp_chars or 0:,} chars{pc_s}{np_s}{ts_s}",
+                    data={
+                        "system_prompt_chars": sp_chars,
+                        "project_context_chars": pc_chars,
+                        "non_project_context_chars": np_chars,
+                        "tools_schema_chars": ts_chars,
+                    },
+                )
+            bt = rt.get("bootstrap_truncation")
+            if isinstance(bt, dict) and (
+                bt.get("truncated_files") or bt.get("near_limit_files")
+            ):
+                s_overview.warn(
+                    "runtime.bootstrap",
+                    f"bootstrap: truncated={bt.get('truncated_files')} "
+                    f"nearLimit={bt.get('near_limit_files')} "
+                    f"totalNearLimit={bt.get('total_near_limit')}",
+                    data=bt,
+                )
+            ctc = rt.get("compiled_tool_count")
+            cmc = rt.get("compiled_messages_count")
+            ss = rt.get("stream_strategy")
+            tp = rt.get("transport")
+            parts: List[str] = []
+            if ctc is not None:
+                parts.append(f"tools={ctc}")
+            if cmc is not None:
+                parts.append(f"messages={cmc}")
+            if ss:
+                parts.append(f"stream={ss}")
+            if tp:
+                parts.append(f"transport={tp}")
+            if parts:
+                s_overview.ok(
+                    "runtime.compiled",
+                    "compiled: " + " | ".join(parts),
+                    data={
+                        "compiled_tool_count": ctc,
+                        "compiled_messages_count": cmc,
+                        "stream_strategy": ss,
+                        "transport": tp,
+                    },
+                )
+        else:
+            s_overview.warn(
+                "runtime.missing", "no trajectory runs available",
+            )
+
         # 2. Timeline — show key moments, not just count
         s_timeline = report.section("Panorama · Timeline")
         if not timeline:
             s_timeline.warn("timeline.empty", "no timeline events")
         else:
             span_ms = timeline[-1]["ts_ms"] - timeline[0]["ts_ms"]
+            dropped_middle = timeline_stats.get("dropped_middle") or 0
+            cap_note = (
+                f" ({dropped_middle} dropped by cap)" if dropped_middle else ""
+            )
             s_timeline.ok(
                 "timeline.window",
-                f"{len(timeline)} events over {fmt_duration(span_ms / 1000)} "
+                f"{len(timeline)} events{cap_note} over "
+                f"{fmt_duration(span_ms / 1000)} "
                 f"({fmt_epoch_local(timeline[0]['ts_ms'])} → "
                 f"{fmt_epoch_local(timeline[-1]['ts_ms'])})",
-                data={"count": len(timeline)},
+                data={"count": len(timeline), **timeline_stats},
             )
+            if timeline_stats.get("truncated"):
+                s_timeline.warn(
+                    "timeline.truncated",
+                    f"timeline truncated: kept "
+                    f"{len(timeline)}/{timeline_stats['total_before_cap']} events; "
+                    f"{dropped_middle} dropped from middle "
+                    f"(head + tail preserved)",
+                    data=timeline_stats,
+                )
+            skipped = timeline_stats.get("skipped_no_ts") or 0
+            if skipped:
+                s_timeline.warn(
+                    "timeline.skipped_no_ts",
+                    f"skipped {skipped} record(s) with no parseable timestamp",
+                    data={"skipped_no_ts": skipped},
+                )
             # First / last event detail
             s_timeline.ok(
                 "timeline.first",
@@ -1411,119 +1697,23 @@ class PanoramaInspector:
                     data=lg,
                 )
 
-        # 3. Runtime Context — full picture
-        s_runtime = report.section("Panorama · Runtime Context")
-        for blk in runtime_blocks:
-            rid = blk.get("runId", "?")[:8]
-            s_runtime.ok(
-                f"runtime.model.{rid}",
-                f"run {rid} · model: {blk.get('provider')}/{blk.get('model_id')}"
-                + (f" · finalStatus={blk.get('final_status')}"
-                   if blk.get('final_status') else ""),
-                data=blk,
-            )
-            s_runtime.ok(
-                f"runtime.trigger.{rid}",
-                f"trigger: {blk.get('trigger')} | channel: {blk.get('channel')}"
-                + (f" | harness: {blk.get('harness_version')}"
-                   if blk.get('harness_version') else ""),
-            )
-            sp_chars = blk.get("system_prompt_chars")
-            pc_chars = blk.get("project_context_chars")
-            np_chars = blk.get("non_project_context_chars")
-            if sp_chars:
-                pc_s = f" project={pc_chars:,}" if pc_chars else ""
-                np_s = f" nonProject={np_chars:,}" if np_chars else ""
-                s_runtime.ok(
-                    f"runtime.prompt.{rid}",
-                    f"system prompt: {sp_chars:,} chars{pc_s}{np_s}",
-                )
-            tool_count = blk.get("tool_count")
-            skill_count = blk.get("skill_count")
-            plugin_count = blk.get("plugin_count")
-            cmsg = blk.get("compiled_messages_count")
-            s_runtime.ok(
-                f"runtime.tools.{rid}",
-                f"tools: {tool_count or '?'} | skills: {skill_count or '?'} "
-                f"| plugins: {plugin_count or '?'}"
-                + (f" | messages: {cmsg}" if cmsg is not None else ""),
-            )
-            schema_chars = blk.get("tools_schema_chars")
-            if schema_chars:
-                s_runtime.ok(
-                    f"runtime.schema.{rid}",
-                    f"tools schema: {schema_chars:,} chars",
-                )
-            ss = blk.get("stream_strategy")
-            tp = blk.get("transport")
-            ic = blk.get("images_count") or 0
-            if ss or tp or ic:
-                s_runtime.ok(
-                    f"runtime.stream.{rid}",
-                    f"streamStrategy: {ss or '?'} | transport: {tp or '?'} "
-                    f"| images: {ic}",
-                )
-            cc = blk.get("compaction_count") or 0
-            if cc:
-                s_runtime.warn(
-                    f"runtime.compaction.{rid}",
-                    f"compactions: {cc}"
-                    + (" | cache broke" if blk.get("cache_broke") else ""),
-                )
-            iwf = blk.get("injected_workspace_files") or []
-            if iwf:
-                names = ", ".join(
-                    f"{e.get('name')}({e.get('chars'):,})"
-                    + ("⚠truncated" if e.get('truncated') else "")
-                    for e in iwf
-                )
-                s_runtime.ok(
-                    f"runtime.workspace.{rid}",
-                    f"workspace files: {len(iwf)} — {names[:200]}",
-                    data={"files": iwf},
-                )
-            bt = blk.get("bootstrap_truncation")
-            if isinstance(bt, dict) and (
-                bt.get("truncated_files") or bt.get("near_limit_files")
-            ):
-                s_runtime.warn(
-                    f"runtime.bootstrap.{rid}",
-                    f"bootstrap: truncated={bt.get('truncated_files')} "
-                    f"nearLimit={bt.get('near_limit_files')} "
-                    f"totalNearLimit={bt.get('total_near_limit')}",
-                    data=bt,
-                )
-            # Skill names list
-            sn = blk.get("skill_names")
-            if sn:
-                preview = ", ".join(sn[:8])
-                more = f" (+{len(sn) - 8} more)" if len(sn) > 8 else ""
-                s_runtime.ok(
-                    f"runtime.skill_names.{rid}",
-                    f"skills: {preview}{more}",
-                    data={"skills": sn},
-                )
-            # Plugins activated
-            pa = blk.get("plugins_activated")
-            if pa:
-                s_runtime.ok(
-                    f"runtime.plugins.{rid}",
-                    f"plugins activated: {', '.join(pa)}",
-                    data={"plugins_activated": pa},
-                )
-            err_count = len(blk.get("plugin_errors") or [])
-            if err_count:
-                for pe in (blk.get("plugin_errors") or [])[:5]:
-                    s_runtime.warn(
-                        f"runtime.plugin_error.{pe.get('id','?')}",
-                        f"plugin error: {pe.get('id')} — "
-                        f"{(pe.get('error') or '?')[:120]}",
-                    )
-        if not runtime_blocks:
-            s_runtime.warn("runtime.missing", "no trajectory runs available")
+        # (Standalone "Runtime Context" section removed in v1.4.3 — its
+        # fields were folded into Session Overview above. The per-run
+        # block lives on under report.data["runtime_context"] for JSON
+        # consumers.)
 
-        # 4. Model Calls — with per-call duration + per-model performance
+        # 3. Model Calls — with per-call duration + per-model performance
         s_model = report.section("Panorama · Model Calls")
+        # Honest framing: durations come from the session.jsonl message gap,
+        # not from a real API timing channel. The trajectory has no native
+        # durationMs / TTFT, so this is round-trip wall-clock — a function of
+        # tool execution and queueing as much as model latency.
+        s_model.ok(
+            "model.duration_note",
+            "note: durations are round-trip wall-clock "
+            "(last input msg → assistant msg), NOT pure model API latency "
+            "(trajectory has no native durationMs/TTFT)",
+        )
         if not model_calls:
             s_model.ok("model.none", "no model calls in selected run")
         else:
@@ -1531,7 +1721,8 @@ class PanoramaInspector:
                       if isinstance(total_cost_usd, (int, float)) else "")
             s_model.ok(
                 "model.summary",
-                f"{len(model_calls)} calls | out={total_output:,} tok | "
+                f"{len(model_calls)} calls | in={total_input:,} | "
+                f"out={total_output:,} tok | "
                 f"cache_read={total_cache_read:,} | cache_write={total_cache_write:,}"
                 + cost_s,
                 data={
@@ -1565,17 +1756,64 @@ class PanoramaInspector:
                     f"stop[{stop_summary}]",
                     data=m,
                 )
-            # Per-call detail
+            # Per-call detail (with input tokens + per-call throughput).
             for idx, c in enumerate(model_calls, 1):
                 tools_s = ",".join(c["tools"][:3]) if c["tools"] else "→ final"
                 dur = c.get("duration_ms")
                 dur_s = fmt_duration(dur / 1000) if dur is not None else "?"
+                if dur and dur > 0 and c.get("output"):
+                    tok_per_s = round(c["output"] / (dur / 1000), 1)
+                    rate_s = f"{tok_per_s} tok/s"
+                else:
+                    rate_s = "n/a"
                 s_model.ok(
                     f"model.call.{idx}",
-                    f"#{idx} {dur_s} out={c['output']} ({c['stopReason']}) "
+                    f"#{idx} {dur_s} in={c.get('input', 0)} out={c['output']} "
+                    f"({rate_s}, {c['stopReason']}) "
                     f"[{tools_s}] cr={c['cacheRead']} cw={c['cacheWrite']}",
                     data=c,
                 )
+
+        # Surface model-call errors from runtime_context. promptErrorSource
+        # / aborted / timed_out / idle_timed_out come from trace.artifacts;
+        # if any are set, the model call returned an error or never finished.
+        # Best-effort: if runtime says something failed but model_calls is
+        # empty, we emit a "no usage record" hint — the trajectory loader
+        # doesn't always surface usage for failed completions.
+        for blk in runtime_blocks:
+            err_flags: List[str] = []
+            for k in (
+                "aborted", "external_abort", "timed_out", "idle_timed_out",
+                "timed_out_during_compaction",
+                "timed_out_during_tool_execution",
+            ):
+                if blk.get(k):
+                    err_flags.append(k)
+            pes = blk.get("prompt_error_source")
+            fs = (blk.get("final_status") or "").lower()
+            if err_flags or pes or fs in ("error", "errored", "failed"):
+                rid_s = (blk.get("runId") or "?")[:8]
+                bits: List[str] = []
+                if pes:
+                    bits.append(f"promptErrorSource={pes}")
+                if err_flags:
+                    bits.append(", ".join(f"{k}=true" for k in err_flags))
+                if fs and fs not in ("ok", "completed", "success"):
+                    bits.append(f"finalStatus={fs}")
+                s_model.fail(
+                    f"model.error.{rid_s}",
+                    f"run {rid_s} errored: " + " | ".join(bits),
+                    data=blk,
+                )
+                # If we have nothing at all, the failed call left no usage
+                # record — say so explicitly so readers don't think it
+                # silently succeeded.
+                if not model_calls:
+                    s_model.warn(
+                        f"model.error.no_usage.{rid_s}",
+                        "model call failed with no usage record "
+                        "(see Health Signals)",
+                    )
 
         # 5. Tool Execution — args + result summary inline
         s_tools = report.section("Panorama · Tool Execution")
@@ -1610,7 +1848,10 @@ class PanoramaInspector:
                     f"tools.call.{idx}", v, line, data=t,
                 )
 
-        # 6. Correlated Logs — show errors/warns + representative INFO
+        # 5. Correlated Logs — show ALL in-window errors (capped at safety
+        #    limit) + first WARN entries + representative INFO. Logs were
+        #    bounded to the session window above; the summary line records
+        #    how many entries fell outside (clock-skew / sessionKey reuse).
         s_logs = report.section("Panorama · Correlated Logs")
         if not log_files:
             s_logs.warn("logs.missing", "no app log files found in log_dir")
@@ -1628,34 +1869,66 @@ class PanoramaInspector:
             info_count = (
                 len(correlated_logs) - len(error_entries) - len(warn_entries)
             )
+            window_note = ""
+            if logs_dropped_oow or logs_ts_less:
+                bits = []
+                if logs_dropped_oow:
+                    bits.append(f"{logs_dropped_oow} out-of-window")
+                if logs_ts_less:
+                    bits.append(f"{logs_ts_less} ts-less kept")
+                window_note = " | window-filter: " + ", ".join(bits)
             s_logs.ok(
                 "logs.summary",
                 f"{len(correlated_logs)} correlated entries: "
                 f"{len(error_entries)} ERROR, {len(warn_entries)} WARN, "
-                f"{info_count} INFO",
-                data={"total": len(correlated_logs),
-                      "error": len(error_entries),
-                      "warn": len(warn_entries), "info": info_count},
+                f"{info_count} INFO" + window_note,
+                data={
+                    "total": len(correlated_logs),
+                    "error": len(error_entries),
+                    "warn": len(warn_entries),
+                    "info": info_count,
+                    "out_of_window_dropped": logs_dropped_oow,
+                    "ts_less_kept": logs_ts_less,
+                },
             )
-            for rec in error_entries[:10]:
+            # Render every in-window ERROR (with safety cap + "+N more").
+            shown_errors = error_entries[:MAX_RENDERED_ERROR_LINES]
+            for idx, rec in enumerate(shown_errors, 1):
                 msg_s = parse_log_msg(rec) or "?"
                 sub = get_log_subsystem(rec) or "?"
                 ts = _log_ts_ms(rec)
                 tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
                 s_logs.fail(
-                    f"logs.error.{sub}",
+                    f"logs.error.{idx:04d}.{sub}",
                     f"{tsfx}[ERROR] [{sub}] {msg_s[:200]}",
                     data={"correlation": rec.get("correlation")},
                 )
-            for rec in warn_entries[:10]:
+            if len(error_entries) > MAX_RENDERED_ERROR_LINES:
+                more = len(error_entries) - MAX_RENDERED_ERROR_LINES
+                s_logs.fail(
+                    "logs.error.more",
+                    f"+{more} more ERROR entries not shown "
+                    f"(safety cap {MAX_RENDERED_ERROR_LINES})",
+                    data={"more": more, "cap": MAX_RENDERED_ERROR_LINES},
+                )
+            # WARN list keeps the original cap (head only) + "+N more".
+            shown_warns = warn_entries[:MAX_RENDERED_WARN_LINES]
+            for idx, rec in enumerate(shown_warns, 1):
                 msg_s = parse_log_msg(rec) or "?"
                 sub = get_log_subsystem(rec) or "?"
                 ts = _log_ts_ms(rec)
                 tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
                 s_logs.warn(
-                    f"logs.warn.{sub}",
+                    f"logs.warn.{idx:04d}.{sub}",
                     f"{tsfx}[WARN] [{sub}] {msg_s[:200]}",
                     data={"correlation": rec.get("correlation")},
+                )
+            if len(warn_entries) > MAX_RENDERED_WARN_LINES:
+                more = len(warn_entries) - MAX_RENDERED_WARN_LINES
+                s_logs.warn(
+                    "logs.warn.more",
+                    f"+{more} more WARN entries not shown",
+                    data={"more": more, "cap": MAX_RENDERED_WARN_LINES},
                 )
             # Representative INFO entries when nothing failed
             if info_count and not error_entries and not warn_entries:
@@ -1675,26 +1948,12 @@ class PanoramaInspector:
                         data={"correlation": rec.get("correlation")},
                     )
 
-        # 7. Model Decisions
-        s_decisions = report.section("Panorama · Model Decisions")
-        if not decisions:
-            s_decisions.ok(
-                "decisions.none", "no model fallback or selection events",
-            )
-        else:
-            for d in decisions[:8]:
-                kind = d.get("kind", "?")
-                if kind == "model_select":
-                    msg_s = (
-                        f"model: {d.get('provider')}/{d.get('name')} "
-                        f"(api={d.get('api')})"
-                    )
-                    s_decisions.ok(f"decision.{kind}", msg_s, data=d)
-                else:
-                    msg_s = d.get("summary", "?")
-                    s_decisions.warn(f"decision.{kind}", msg_s, data=d)
+        # (Standalone "Model Decisions" section removed in v1.4.3 — log-marker
+        #  decisions are routed into Health Signals as kind=log_decision; the
+        #  duplicate trajectory model_select entry is gone because the model
+        #  identity is already shown in Session Overview.)
 
-        # 8. Child Tasks
+        # 6. Child Tasks
         s_children = report.section("Panorama · Child Tasks")
         if not children:
             s_children.ok("children.none", "no child tasks correlated")
@@ -1719,35 +1978,13 @@ class PanoramaInspector:
                     f"{len(succeeded)} child tasks succeeded",
                 )
 
-        # 9. Delivery
-        s_delivery = report.section("Panorama · Delivery")
-        delivery_seen = False
-        if cron_runs:
-            delivery_seen = True
-            last = cron_runs[-1]
-            s_delivery.ok(
-                "delivery.cron",
-                f"cron job {graph.cron_job_id}: "
-                f"action={last.get('action')} status={last.get('status')} "
-                f"deliveryStatus={last.get('deliveryStatus')}",
-                data=last,
-            )
-        if primary_runtime and primary_runtime.get("did_send_via_messaging_tool"):
-            delivery_seen = True
-            s_delivery.ok(
-                "delivery.messaging",
-                f"sent via messaging tool: targets="
-                f"{len(primary_runtime.get('messaging_targets') or [])} "
-                f"texts={primary_runtime.get('messaging_text_count')}",
-                data={
-                    "targets": primary_runtime.get("messaging_targets"),
-                    "text_count": primary_runtime.get("messaging_text_count"),
-                },
-            )
-        if not delivery_seen:
-            s_delivery.ok("delivery.none", "no delivery records correlated")
+        # (Standalone "Delivery" section removed in v1.4.3 — cron-run and
+        #  messaging-tool send events are emitted directly into the Timeline
+        #  with source="delivery" / event_type="delivery". Failed cron
+        #  deliveries surface as a kind=cron_delivery_failed health signal so
+        #  the verdict still degrades correctly.)
 
-        # 10. Health Signals — with timestamps + richer data
+        # 7. Health Signals — with timestamps + richer data
         s_health = report.section("Panorama · Health Signals")
         if not signals:
             s_health.ok(
@@ -1808,6 +2045,22 @@ class PanoramaInspector:
                         f"{tsfx}child task failed: "
                         f"{sig.get('agent_id')}/{sig.get('runtime')} — "
                         f"{sig.get('error')}",
+                        data=sig,
+                    )
+                elif kind == "cron_delivery_failed":
+                    s_health.fail(
+                        f"health.{kind}."
+                        f"{(str(sig.get('jobId')) or '?')[:8]}.{ts_ms}",
+                        f"{tsfx}cron delivery failed: "
+                        f"job={sig.get('jobId')} action={sig.get('action')} "
+                        f"status={sig.get('status')} "
+                        f"deliveryStatus={sig.get('deliveryStatus')}",
+                        data=sig,
+                    )
+                elif kind == "log_decision":
+                    s_health.warn(
+                        f"health.{kind}.{ts_ms}",
+                        f"{tsfx}decision: {sig.get('summary')}",
                         data=sig,
                     )
                 else:

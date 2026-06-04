@@ -705,6 +705,301 @@ def test_missing_sources_degrade_gracefully(tmp_path: Path):
     assert isinstance(report.data["timeline"], list)
 
 
+def test_runtime_context_data_kept_section_removed(tmp_path: Path):
+    """v1.4.3: runtime_context data is unchanged on the JSON envelope but
+    the standalone "Panorama · Runtime Context" pretty section is gone —
+    folded into Session Overview.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    # data still populated for JSON consumers
+    assert isinstance(report.data["runtime_context"], list)
+    assert report.data["runtime_context"], "runtime_context should be non-empty"
+    blk = report.data["runtime_context"][0]
+    assert blk["harness_version"] == "0.42.0"
+
+    section_titles = [s.title for s in report.sections]
+    assert "Panorama · Runtime Context" not in section_titles
+    # Session Overview now carries runtime fields (harness, plugins, etc).
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    keys = [c.name for c in overview.checks]
+    assert any(k.startswith("runtime.") for k in keys), (
+        "expected runtime.* lines folded into overview, got: " + str(keys)
+    )
+
+
+def test_model_decisions_section_removed_data_dropped(tmp_path: Path):
+    """v1.4.3: Model Decisions section is gone; report.data['model_decisions']
+    is no longer populated. Log-marker decisions live under health_signals.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    assert "model_decisions" not in report.data
+    section_titles = [s.title for s in report.sections]
+    assert "Panorama · Model Decisions" not in section_titles
+
+
+def test_delivery_section_removed_data_dropped(tmp_path: Path):
+    """v1.4.3: Delivery section is removed; delivery events live in the
+    timeline with event_type="delivery".
+    """
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    assert "delivery" not in report.data
+    section_titles = [s.title for s in report.sections]
+    assert "Panorama · Delivery" not in section_titles
+
+
+def test_model_call_input_and_throughput_fields(tmp_path: Path):
+    """v1.4.3: per-call lines show input tokens and tok/s throughput. Note
+    line about wall-clock vs API latency must be present.
+    """
+    from ocdiag.render.human import render
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    text = render(report, no_color=True)
+    # Wall-clock note
+    assert "round-trip wall-clock" in text
+    # First call: 1s gap, in=10 out=5 → 5/1 = 5.0 tok/s
+    assert "in=10" in text
+    assert "5.0 tok/s" in text or "5 tok/s" in text
+    # Second call: 2s gap, in=12 out=7 → 7/2 = 3.5 tok/s
+    assert "in=12" in text
+    assert "3.5 tok/s" in text
+
+
+def test_window_bound_logs_summary_carries_counters(tmp_path: Path):
+    """v1.4.3: logs.summary carries out_of_window_dropped + ts_less_kept."""
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    logs_section = next(
+        s for s in report.sections if s.title == "Panorama · Correlated Logs"
+    )
+    summary = next(
+        (c for c in logs_section.checks if c.name == "logs.summary"), None,
+    )
+    assert summary is not None
+    assert "out_of_window_dropped" in summary.data
+    assert "ts_less_kept" in summary.data
+
+
+def test_window_bound_drops_far_future_log(tmp_path: Path):
+    """A log entry whose timestamp falls far outside the session window must
+    be dropped from correlated_logs (and hence from the timeline).
+    """
+    ctx = _build_fixture_home(tmp_path)
+    log_dir = ctx.log_dir
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = log_dir / f"openclaw-{today}.log"
+    # Append a sessionId-bearing entry far past the window end (T8 + 1 day).
+    far_ts = T8 + 24 * 3600 * 1000
+    rec = {
+        "level": "INFO", "time": far_ts, "pid": 12345,
+        "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+        "msg": f"sessionId={SESSION_ID} reused-key noise",
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    logs_section = next(
+        s for s in report.sections if s.title == "Panorama · Correlated Logs"
+    )
+    summary = next(
+        c for c in logs_section.checks if c.name == "logs.summary"
+    )
+    assert summary.data["out_of_window_dropped"] >= 1
+    # Timeline should not contain the far-future entry
+    for entry in report.data["timeline"]:
+        assert entry["ts_ms"] < far_ts - 1000
+
+
+def test_timeline_truncation_records_dropped_middle():
+    """When _build_timeline exceeds its cap, dropped_middle is non-zero and
+    truncated is True. We exercise the helper directly to avoid building a
+    50k-record fixture.
+    """
+    from ocdiag.inspectors.panorama import _build_timeline
+    # Synthetic session_records that all carry timestamps; trigger the cap.
+    cap = 20
+    big = []
+    for i in range(cap * 3):  # 60 events → far above cap
+        big.append({
+            "type": "message",
+            "timestamp": _ms_to_iso(T0 + i),
+            "message": {"role": "user", "timestamp": T0 + i, "content": "x"},
+        })
+    timeline, stats = _build_timeline(
+        session_records=big,
+        trajectory_runs=[],
+        correlated_logs=[],
+        cap=cap,
+    )
+    assert stats["truncated"] is True
+    assert stats["dropped_middle"] > 0
+    assert stats["total_before_cap"] == cap * 3
+    assert len(timeline) == cap
+
+
+def test_timeline_skipped_no_ts_counted():
+    """Records with no timestamp must be counted, not silently swallowed."""
+    from ocdiag.inspectors.panorama import _build_timeline
+    bad = [
+        {"type": "message", "message": {"role": "user", "content": "no ts"}},
+        {"type": "message", "timestamp": _ms_to_iso(T0),
+         "message": {"role": "user", "timestamp": T0, "content": "ok"}},
+    ]
+    timeline, stats = _build_timeline(
+        session_records=bad,
+        trajectory_runs=[],
+        correlated_logs=[],
+    )
+    assert stats["skipped_no_ts"] == 1
+    assert len(timeline) == 1
+
+
+def test_delivery_in_timeline_via_messaging_tool(tmp_path: Path):
+    """When the run sent via messaging tool, the timeline gains a
+    source="delivery" entry.
+    """
+    home = tmp_path / "with-msg"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "deadbeef-1111-2222-3333-444444444444"
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T1)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T1),
+         "message": {"role": "user", "timestamp": T1, "content": "go"}},
+    ])
+
+    # Trajectory with messaging-tool send recorded in artifacts.
+    base = {
+        "schemaVersion": 1, "traceSchema": "openclaw-trajectory",
+        "runId": RUN_ID_A, "sessionId": sid, "sessionKey": SESSION_KEY,
+        "provider": "test", "modelId": "test-model",
+    }
+    traj = [
+        {**base, "type": "session.started", "ts": _ms_to_iso(T0),
+         "data": {"trigger": "user", "agentId": "main",
+                  "messageChannel": "feishu"}},
+        {**base, "type": "trace.metadata", "ts": _ms_to_iso(T0 + 1),
+         "data": {}},
+        {**base, "type": "trace.artifacts", "ts": _ms_to_iso(T6 - 1),
+         "data": {
+             "finalStatus": "ok", "didSendViaMessagingTool": True,
+             "messagingToolSentTargets": ["user-A"],
+             "messagingToolSentTexts": ["hi"],
+         }},
+        {**base, "type": "session.ended", "ts": _ms_to_iso(T6),
+         "data": {"status": "ok"}},
+    ]
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    paths_mod.CRON_RUNS_DIR = str(home / "cron" / "runs")
+
+    report = _run_panorama(ctx, session_id=sid)
+    delivery_entries = [
+        e for e in report.data["timeline"] if e.get("event_type") == "delivery"
+    ]
+    assert len(delivery_entries) >= 1
+    assert delivery_entries[0]["source"] == "delivery"
+    assert "messaging-tool" in delivery_entries[0]["summary"]
+
+
+def test_cron_delivery_failure_routes_to_health_signals(tmp_path: Path):
+    """A failed cron delivery must surface as a health signal (and therefore
+    influence verdict) even though the standalone Delivery section is gone.
+    """
+    # Build a session whose sessionKey carries cron:<jobId> and a cron-runs
+    # file with a failed delivery line.
+    home = tmp_path / "with-cron"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "ccccccc1-1111-2222-3333-444444444444"
+    job_id = "cccccccc-9999-9999-9999-999999999999"
+    cron_session_key = f"agent:main:cron:{job_id}"
+
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T1)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T1),
+         "message": {"role": "user", "timestamp": T1, "content": "ping"}},
+    ])
+    # sessions.json so build_graph discovers sessionKey → cron jobId
+    store = {cron_session_key: {"sessionId": sid}}
+    with open(main_sd / "sessions.json", "w") as f:
+        json.dump(store, f)
+
+    # Cron run record with an explicit failure.
+    cron_dir = home / "cron" / "runs"
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    cron_path = cron_dir / f"{job_id}.jsonl"
+    with open(cron_path, "w") as f:
+        f.write(json.dumps({
+            "ts": T0 + 5000, "jobId": job_id, "action": "finished",
+            "status": "ok", "deliveryStatus": "failed",
+            "summary": "delivery exploded",
+        }) + "\n")
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    paths_mod.CRON_RUNS_DIR = str(cron_dir)
+
+    report = _run_panorama(ctx, session_id=sid)
+    signals = report.data["health_signals"]
+    assert any(s.get("kind") == "cron_delivery_failed" for s in signals)
+    # Verdict should degrade to FAIL (cron_delivery_failed routes via fail()).
+    assert report.verdict in (Verdict.FAIL, Verdict.WARN)
+
+
+def test_log_decision_routed_to_health_signals(tmp_path: Path):
+    """A correlated log line containing a known decision marker must surface
+    under health_signals as kind="log_decision" — there is no separate
+    Model Decisions section anymore.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    log_dir = ctx.log_dir
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = log_dir / f"openclaw-{today}.log"
+    # Append an in-window line that will be correlated AND mentions the marker
+    rec = {
+        "level": "INFO", "time": T0 + 4000, "pid": 12345,
+        "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+        "msg": f"sessionId={SESSION_ID} model_fallback_decision: fallback to alt",
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec) + "\n")
+
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    signals = report.data["health_signals"]
+    assert any(s.get("kind") == "log_decision" for s in signals)
+
+
 def test_perf_100k_lines_under_5s(tmp_path: Path):
     """A 100k-line app log should still be filterable in well under 5s."""
     ctx = _build_fixture_home(tmp_path)

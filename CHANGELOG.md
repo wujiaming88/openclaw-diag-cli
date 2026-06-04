@@ -1,5 +1,72 @@
 # Changelog
 
+## v1.4.3 — panorama section consolidation + honest truncation (2026-06-04)
+
+`panorama` is restructured from 10 sections to a tighter 7-section layout.
+Three sections were folded into adjacent ones; redundant data was dropped;
+log filtering and timeline truncation became honest about what they
+discard. JSON envelope `report.data["runtime_context"]` is preserved for
+backward-compat; `report.data["model_decisions"]` and
+`report.data["delivery"]` are removed (their content lives elsewhere now).
+
+### Changed
+
+- **Window-bound correlated logs.** `filter_log_files` matches against the
+  whole log file regardless of time. Panorama now bounds the result to
+  `[window_start − 5s, window_end + 5s]` so reused `sessionKey` /
+  `toolCallId` no longer drags in noise from a different conversation
+  hours later. Entries with no parseable timestamp are kept (we can't
+  prove they belong elsewhere) but counted separately. The same
+  window-bounded list feeds the timeline.
+  - `logs.summary.data` adds `out_of_window_dropped` and `ts_less_kept`.
+- **Surface ALL in-window ERROR log entries**, not just the first 10.
+  Safety cap of 200 with an explicit `+N more` line; WARN entries keep
+  the head-10 cap with the same `+N more` treatment.
+- **Timeline truncation honesty.** When the cap drops the middle of the
+  timeline, `dropped_middle` and `truncated:true` ride on the JSON
+  envelope and a WARN line surfaces in the section. Records with no
+  parseable timestamp are now counted (`skipped_no_ts`) instead of being
+  silently dropped.
+- **Runtime Context merged into Session Overview.** The standalone
+  "Panorama · Runtime Context" pretty section is removed; useful fields
+  (harness version + node, plugins activated + plugin load errors,
+  skill count + names, system prompt budget, bootstrap truncation,
+  compiled tool/message counts, stream strategy) are folded into Session
+  Overview. `report.data["runtime_context"]` remains unchanged.
+- **Model Calls per-call enrichment.**
+  - Per-call line now shows input tokens (`in=…`) alongside `out=…`, plus
+    per-call throughput `tok/s` (or `n/a` when duration is zero).
+  - One-line note clarifies durations are round-trip wall-clock (last
+    input msg → assistant msg), NOT pure model API latency — the
+    trajectory has no native `durationMs`/TTFT.
+  - **Model-call errors surfaced.** When a run shows
+    `promptErrorSource`, `aborted`, `externalAbort`, `timedOut`,
+    `idleTimedOut`, `timedOutDuringCompaction`, or
+    `timedOutDuringToolExecution`, a FAIL line names the flags. When
+    that happens with no `model_calls` recorded, an extra WARN states
+    "model call failed with no usage record (see Health Signals)" — a
+    best-effort inference noted in code as such.
+- **Model Decisions removed; signals folded into Health Signals.** The
+  redundant `model_select` entries (model identity is already in Session
+  Overview) are gone. Log-marker decisions
+  (`model_fallback_decision` / `harness_select` / `context_overflow` /
+  `compaction_triggered`) are emitted as `health_signals` entries with
+  `kind="log_decision"`. `report.data["model_decisions"]` is removed.
+- **Delivery removed; events folded into Timeline.** Cron run records and
+  messaging-tool sends now appear in the timeline with `source="delivery"`
+  and `event_type="delivery"`. Failed cron deliveries
+  (`deliveryStatus` ∈ failed/error/errored/undelivered) emit a
+  `kind="cron_delivery_failed"` health signal so the verdict still
+  degrades correctly. `report.data["delivery"]` is no longer set.
+
+### Tests
+- 11 new tests in `tests/test_panorama.py` covering window-bound logs,
+  out-of-window drop counters, timeline `dropped_middle` / `skipped_no_ts`,
+  Session-Overview-with-runtime-fields, removed-section/data assertions,
+  per-call `in=`/`tok/s` rendering, delivery-in-timeline, cron-delivery
+  failure routed to health signals, and log-marker → health signal
+  routing. Total: 48 passing (was 37).
+
 ## v1.4.2 — panorama duration unit fix (2026-06-04)
 
 ### Fixed

@@ -104,6 +104,11 @@ def _build_session_records() -> List[Dict[str, Any]]:
             "message": {
                 "role": "assistant",
                 "timestamp": T2,
+                "model": "test-model",
+                "provider": "test",
+                "stopReason": "toolUse",
+                "usage": {"input": 10, "output": 5,
+                          "cacheRead": 0, "cacheWrite": 0},
                 "content": [
                     {"type": "text", "text": "running"},
                     {"type": "toolCall", "id": TOOL_CALL_ID_1,
@@ -131,6 +136,11 @@ def _build_session_records() -> List[Dict[str, Any]]:
             "message": {
                 "role": "assistant",
                 "timestamp": T4,
+                "model": "test-model",
+                "provider": "test",
+                "stopReason": "toolUse",
+                "usage": {"input": 12, "output": 7,
+                          "cacheRead": 0, "cacheWrite": 0},
                 "content": [
                     {"type": "toolCall", "id": TOOL_CALL_ID_2,
                      "name": "Read", "input": {"path": "/etc/hosts"}},
@@ -487,6 +497,30 @@ def test_tool_waterfall_and_stats(tmp_path: Path):
     assert stats["completed"] == 2
     assert stats["errors"] == 1
     assert stats["max_ms"] == 3000
+
+
+def test_model_call_duration_renders_in_seconds(tmp_path: Path):
+    """Regression: model-call durations are stored in ms but fmt_duration()
+    expects seconds. A missing `/1000` rendered a 1-2s call as ~17-33 minutes
+    (e.g. 547ms gap → "9.1m"). Lock the unit so it never regresses.
+    """
+    from ocdiag.render.human import render
+
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+
+    # Underlying data carries true millisecond gaps (1000ms, 2000ms).
+    model_calls = report.data["model_calls"]
+    durations = {c.get("duration_ms") for c in model_calls}
+    assert 1000 in durations and 2000 in durations
+
+    text = render(report, no_color=True)
+    # Buggy unit-as-seconds would have printed minutes for sub-3s calls.
+    assert "16.7m" not in text  # would be fmt_duration(1000) == 16.7m
+    assert "33.3m" not in text  # would be fmt_duration(2000) == 33.3m
+    # Correct rendering keeps these in the seconds bucket.
+    assert "#1 1s" in text
+    assert "#2 2s" in text
 
 
 def test_timeline_ordering_and_sources(tmp_path: Path):

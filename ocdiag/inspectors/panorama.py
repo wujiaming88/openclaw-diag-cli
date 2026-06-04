@@ -1556,7 +1556,7 @@ class PanoramaInspector:
                     )
                 )
                 avg_dur = m.get("avg_duration_ms")
-                avg_dur_s = (f" | avg_dur={fmt_duration(avg_dur)}"
+                avg_dur_s = (f" | avg_dur={fmt_duration(avg_dur / 1000)}"
                              if avg_dur else "")
                 s_model.ok(
                     f"model.by.{m['model']}",
@@ -1569,7 +1569,7 @@ class PanoramaInspector:
             for idx, c in enumerate(model_calls, 1):
                 tools_s = ",".join(c["tools"][:3]) if c["tools"] else "→ final"
                 dur = c.get("duration_ms")
-                dur_s = fmt_duration(dur) if dur is not None else "?"
+                dur_s = fmt_duration(dur / 1000) if dur is not None else "?"
                 s_model.ok(
                     f"model.call.{idx}",
                     f"#{idx} {dur_s} out={c['output']} ({c['stopReason']}) "
@@ -1792,7 +1792,7 @@ class PanoramaInspector:
                     s_health.warn(
                         f"health.{kind}.{ts_ms}",
                         f"{tsfx}long tool call: {sig.get('name')} "
-                        f"{fmt_duration((sig.get('duration_ms') or 0))}"
+                        f"{fmt_duration((sig.get('duration_ms') or 0) / 1000)}"
                         f"{err_s}",
                         data=sig,
                     )

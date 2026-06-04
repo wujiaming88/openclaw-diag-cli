@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.4.2 — panorama duration unit fix (2026-06-04)
+
+### Fixed
+- `panorama` Model Calls / health `long_tool_call` durations were stored in
+  milliseconds but passed straight to `fmt_duration()` (which expects seconds),
+  so a sub-second model call (e.g. 547ms gap) rendered as `9.1m` and a 2s call
+  as `33.3m`. Added the missing `/1000` at all three render sites
+  (per-model `avg_dur`, per-call `dur`, and `long_tool_call` health signal).
+- Underlying `model_calls[].duration_ms` data was already correct; only the
+  pretty/text rendering was wrong.
+
+### Added
+- Regression test `test_model_call_duration_renders_in_seconds` — verifies a
+  1s/2s call renders as `1s`/`2s`, never `16.7m`/`33.3m`. Proven to fail on the
+  pre-fix code.
+
 ## v1.1.0 — format modes, structured errors, skill auto-install (2026-06-02)
 
 ### Added

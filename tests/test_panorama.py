@@ -499,28 +499,31 @@ def test_tool_waterfall_and_stats(tmp_path: Path):
     assert stats["max_ms"] == 3000
 
 
-def test_model_call_duration_renders_in_seconds(tmp_path: Path):
-    """Regression: model-call durations are stored in ms but fmt_duration()
-    expects seconds. A missing `/1000` rendered a 1-2s call as ~17-33 minutes
-    (e.g. 547ms gap → "9.1m"). Lock the unit so it never regresses.
+def test_model_call_duration_removed_from_render(tmp_path: Path):
+    """v1.4.7: per-call duration was removed from the rendered Model Calls
+    line (it came from an unreliable message-gap proxy). The raw duration_ms
+    is still kept in JSON data for consumers. Also guards that the old
+    ms-as-seconds rendering bug (547ms -> "9.1m") can never reappear in the
+    per-call line, since the per-call duration is no longer printed at all.
     """
     from ocdiag.render.human import render
 
     ctx = _build_fixture_home(tmp_path)
     report = _run_panorama(ctx, session_id=SESSION_ID)
 
-    # Underlying data carries true millisecond gaps (1000ms, 2000ms).
+    # Underlying data still carries true millisecond gaps (1000ms, 2000ms).
     model_calls = report.data["model_calls"]
     durations = {c.get("duration_ms") for c in model_calls}
     assert 1000 in durations and 2000 in durations
 
     text = render(report, no_color=True)
-    # Buggy unit-as-seconds would have printed minutes for sub-3s calls.
-    assert "16.7m" not in text  # would be fmt_duration(1000) == 16.7m
-    assert "33.3m" not in text  # would be fmt_duration(2000) == 33.3m
-    # Correct rendering keeps these in the seconds bucket.
-    assert "#1 1s" in text
-    assert "#2 2s" in text
+    # Per-call duration prefix is gone: no "#1 1s"/"#2 2s" and no bogus minutes.
+    assert "#1 1s" not in text
+    assert "#2 2s" not in text
+    assert "16.7m" not in text
+    assert "33.3m" not in text
+    # The per-call line still shows token usage + stop reason.
+    assert "#1 in=" in text
 
 
 def test_model_call_throughput_removed(tmp_path: Path):
@@ -801,22 +804,22 @@ def test_delivery_section_removed_data_dropped(tmp_path: Path):
 
 
 def test_model_call_input_and_throughput_fields(tmp_path: Path):
-    """v1.4.6: per-call lines show input/output tokens and stop reason. The
-    unreliable per-call tok/s throughput was removed (round-trip wall-clock
-    gaps are not real generation time), so no tok/s must appear. The
-    wall-clock duration note must still be present.
+    """v1.4.7: per-call lines show input/output tokens and stop reason only.
+    Both the unreliable per-call tok/s throughput AND the per-call duration
+    (message-gap proxy) were removed, along with the wall-clock note. The
+    authoritative gateway-log run wall time may still appear elsewhere.
     """
     from ocdiag.render.human import render
     ctx = _build_fixture_home(tmp_path)
     report = _run_panorama(ctx, session_id=SESSION_ID)
     text = render(report, no_color=True)
-    # Wall-clock note still present (durations are still shown)
-    assert "round-trip wall-clock" in text
     # Input/output tokens still shown per call
     assert "in=10" in text
     assert "in=12" in text
     # Throughput removed entirely — no tok/s anywhere
     assert "tok/s" not in text
+    # Per-call duration + its note removed (unreliable message-gap proxy)
+    assert "round-trip wall-clock" not in text
 
 
 def test_window_bound_logs_summary_carries_counters(tmp_path: Path):

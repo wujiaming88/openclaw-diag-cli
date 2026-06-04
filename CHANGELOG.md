@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.4.8 — remove unreliable per-call duration too (2026-06-04)
+
+### Changed
+- **Removed the per-call duration** from the Model Calls render (the `0s` /
+  `20.2m` prefix), the per-model `avg_dur`, and the round-trip wall-clock
+  note. Like the throughput removed in v1.4.7, the per-call duration came from
+  a session.jsonl message-gap proxy (previous message → assistant message),
+  not a real model-timing channel, so it was not trustworthy. Per-call lines
+  now show `in=` / `out=` / stop reason / cache only.
+- **Kept** the genuinely accurate timings: the authoritative gateway-log
+  `run wall time` (a real measurement), the retry per-attempt durations
+  (from trajectory `session.started`→`session.ended` spans), the session
+  time window, and tool-execution durations (from toolCall→toolResult). The
+  raw per-call `duration_ms` is still kept in JSON data for consumers.
+
+### Tests
+- `test_model_call_duration_removed_from_render`: per-call line shows no
+  duration prefix and no ms-as-seconds artifact; `duration_ms` stays in data.
+- Updated `test_model_call_input_and_throughput_fields` accordingly.
+
 ## v1.4.7 — remove unreliable throughput entirely (2026-06-04)
 
 ### Changed

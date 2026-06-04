@@ -144,19 +144,18 @@ and `delivery` data keys were removed (their content lives under
 - Records with no parseable timestamp are counted under `skipped_no_ts`
 
 ### 3. model_calls
-- Per-call: `ts_ms`, `duration_ms` (round-trip wall-clock — see note),
-  `provider`, `model`, `stopReason`, `input`, `output`, `cacheRead`,
-  `cacheWrite`, `tools[]`, `cost?`
-- Per-call render carries `in=`, `out=`, and stop reason. (Per-call
-  throughput `tok/s` was removed in v1.4.6/1.4.7: it was derived from an
-  unreliable round-trip wall-clock gap and is not real generation rate.)
-- Note line: durations are round-trip wall-clock (last input msg →
-  assistant msg), NOT pure model API latency — the trajectory has no
-  native durationMs/TTFT
-- **v1.4.4 authoritative run wall time** (from gateway log
+- Per-call data: `ts_ms`, `duration_ms` (round-trip wall-clock proxy — kept
+  in JSON only, not rendered), `provider`, `model`, `stopReason`, `input`,
+  `output`, `cacheRead`, `cacheWrite`, `tools[]`, `cost?`
+- Per-call render carries `in=`, `out=`, and stop reason only. Removed:
+  per-call throughput `tok/s` (v1.4.6/1.4.7) and per-call duration prefix +
+  the wall-clock note + per-model `avg_dur` (v1.4.8) — all derived from the
+  unreliable message-gap proxy, not real model timing.
+- **Authoritative run wall time** (from gateway log
   `embedded run prompt end ... durationMs=N`): a `run wall time: <duration>
-  (<N>ms, from gateway log)` line. Stored on `runtime_context.log_run_duration_ms`.
-- Per-model breakdown (avg_output, avg_duration, stop reasons)
+  (<N>ms, from gateway log)` line — this IS a real measurement and is kept.
+  Stored on `runtime_context.log_run_duration_ms`.
+- Per-model breakdown (avg_output, stop reasons)
 - **Model-call errors:** when trace.artifacts show `aborted`,
   `externalAbort`, `timedOut`, `idleTimedOut`,
   `timedOutDuringCompaction`, `timedOutDuringToolExecution`, or a non-null

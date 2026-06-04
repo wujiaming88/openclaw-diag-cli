@@ -2529,18 +2529,13 @@ class PanoramaInspector:
         # block lives on under report.data["runtime_context"] for JSON
         # consumers.)
 
-        # 3. Model Calls — with per-call duration + per-model performance
+        # 3. Model Calls — per-call token usage + per-model performance.
+        # NOTE: per-call duration was removed in v1.4.7 — it came from the
+        # session.jsonl message gap (round-trip wall-clock), not a real API
+        # timing channel, so it was not trustworthy as model latency. The
+        # authoritative gateway-log run wall time below IS a real measurement
+        # and is kept.
         s_model = report.section("Panorama · Model Calls")
-        # Honest framing: durations come from the session.jsonl message gap,
-        # not from a real API timing channel. The trajectory has no native
-        # durationMs / TTFT, so this is round-trip wall-clock — a function of
-        # tool execution and queueing as much as model latency.
-        s_model.ok(
-            "model.duration_note",
-            "note: durations are round-trip wall-clock "
-            "(last input msg → assistant msg), NOT pure model API latency "
-            "(trajectory has no native durationMs/TTFT)",
-        )
         # v1.4.4 task F: surface the gateway-log run wall time when we
         # parsed it (authoritative, captures everything the gateway saw).
         if primary_runtime and primary_runtime.get("log_run_duration_ms"):
@@ -2578,8 +2573,9 @@ class PanoramaInspector:
                     )
                 )
                 avg_dur = m.get("avg_duration_ms")
-                avg_dur_s = (f" | avg_dur={fmt_duration(avg_dur / 1000)}"
-                             if avg_dur else "")
+                # avg_dur removed from display in v1.4.7 (derived from the
+                # unreliable per-call message-gap proxy); kept in JSON data.
+                avg_dur_s = ""
                 s_model.ok(
                     f"model.by.{m['model']}",
                     f"{m['model']}: {m['calls']} calls | "
@@ -2588,13 +2584,13 @@ class PanoramaInspector:
                     data=m,
                 )
             # Per-call detail (input/output tokens + stop reason).
+            # Per-call duration was removed in v1.4.7 (message-gap proxy, not
+            # real model latency); duration_ms stays in JSON data.
             for idx, c in enumerate(model_calls, 1):
                 tools_s = ",".join(c["tools"][:3]) if c["tools"] else "→ final"
-                dur = c.get("duration_ms")
-                dur_s = fmt_duration(dur / 1000) if dur is not None else "?"
                 s_model.ok(
                     f"model.call.{idx}",
-                    f"#{idx} {dur_s} in={c.get('input', 0)} out={c['output']} "
+                    f"#{idx} in={c.get('input', 0)} out={c['output']} "
                     f"({c['stopReason']}) "
                     f"[{tools_s}] cr={c['cacheRead']} cw={c['cacheWrite']}",
                     data=c,

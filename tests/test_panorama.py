@@ -523,6 +523,58 @@ def test_model_call_duration_renders_in_seconds(tmp_path: Path):
     assert "#2 2s" in text
 
 
+def test_model_call_throughput_suppresses_impossible_rate(tmp_path: Path):
+    """Regression: per-call tok/s is derived from a round-trip wall-clock gap
+    (previous message -> assistant message), not real API latency. In
+    multi-step runs consecutive messages are written ms apart, so a large
+    output over a ~6ms gap implied physically impossible throughput
+    (e.g. 4096 tok / 0.006s = 682,666 tok/s). Rates above
+    MAX_PLAUSIBLE_TOK_PER_S must render as 'n/a', never a bogus number.
+    """
+    import json as _json
+    from ocdiag.render.human import render
+    from ocdiag.inspectors.panorama import MAX_PLAUSIBLE_TOK_PER_S
+
+    ctx = _build_fixture_home(tmp_path)
+    # Lay down a second session: user msg, then assistant 6ms later emitting
+    # 4096 output tokens -> 682,666 tok/s if computed naively.
+    sid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
+    base = T0
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(base)},
+        {"type": "message", "id": "u1", "timestamp": _ms_to_iso(base),
+         "message": {"role": "user", "timestamp": base, "content": "go"}},
+        {"type": "message", "id": "a1", "timestamp": _ms_to_iso(base + 6),
+         "message": {"role": "assistant", "timestamp": base + 6,
+                     "model": "test-model", "provider": "test",
+                     "stopReason": "length",
+                     "usage": {"input": 2, "output": 4096,
+                               "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "text", "text": "x"}]}},
+    ]
+    sess_file = ctx.sessions_base / "main" / "sessions" / f"{sid}.jsonl"
+    with open(sess_file, "w", encoding="utf-8") as f:
+        for r in records:
+            f.write(_json.dumps(r) + "\n")
+
+    report = _run_panorama(ctx, session_id=sid)
+    calls = report.data["model_calls"]
+    # Data accuracy: the raw gap is truly 6ms (computed value would be huge).
+    assert any(c.get("duration_ms") == 6 and c.get("output") == 4096
+               for c in calls)
+
+    text = render(report, no_color=True)
+    # The impossible rate must be suppressed, not printed.
+    assert "682666" not in text
+    assert "tok/s, length)" not in text  # the bogus rate slot is now n/a
+    assert "(n/a, length)" in text
+    # No rendered per-call rate may exceed the plausibility ceiling.
+    import re as _re
+    for m in _re.findall(r"([0-9]+(?:\.[0-9]+)?) tok/s", text):
+        assert float(m) <= MAX_PLAUSIBLE_TOK_PER_S, f"impossible rate {m}"
+
+
 def test_timeline_ordering_and_sources(tmp_path: Path):
     ctx = _build_fixture_home(tmp_path)
     report = _run_panorama(ctx, session_id=SESSION_ID)

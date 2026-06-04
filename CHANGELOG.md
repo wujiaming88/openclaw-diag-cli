@@ -1,5 +1,25 @@
 # Changelog
 
+## v1.4.6 — suppress impossible per-call/aggregate throughput (2026-06-04)
+
+### Fixed
+- Model Calls throughput (`tok/s`) is derived from a round-trip wall-clock gap
+  (previous message → assistant message), not a real API timing channel. In
+  multi-step / cron runs consecutive messages are written milliseconds apart,
+  so a large output over a ~6ms gap produced physically impossible rates
+  (e.g. `4096 tok / 0.006s = 682,666 tok/s`). Both the **per-call** rate and the
+  **`avg output rate`** aggregate now suppress any value above
+  `MAX_PLAUSIBLE_TOK_PER_S` (1000 tok/s — well above any real model's sustained
+  output) and render `n/a` instead. Calls with a genuine measurable gap still
+  show a real rate (e.g. a 7s tool turn → 130 tok/s).
+- The Model Calls section note now states per-call tok/s is a rough estimate,
+  shown `n/a` when the gap is too small to be real generation time.
+
+### Added
+- Regression test `test_model_call_throughput_suppresses_impossible_rate`
+  (6ms gap, 4096 out → must render `n/a`, never a bogus number; asserts no
+  rendered rate exceeds the ceiling).
+
 ## v1.4.5 — surface hidden failed attempts behind a recovered runId (2026-06-04)
 
 A single `runId` can carry MULTIPLE attempt-cycles when the run retries

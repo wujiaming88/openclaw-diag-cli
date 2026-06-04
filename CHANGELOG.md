@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.4.9 — remove misleading "longest gap" timeline metric (2026-06-04)
+
+### Changed
+- **Removed the Timeline `longest gap` key-moment.** It reported the largest
+  time span between any two consecutive merged-timeline events across the
+  whole session. The arithmetic was correct, but it did not distinguish an
+  in-run stall (a real problem, seconds–minutes) from idle time between
+  separate conversations (normal, hours). On a long-lived/reused session it
+  just surfaced overnight idle (e.g. "23.0h") as a "key moment" — accurate but
+  diagnostically meaningless. Consistent with v1.4.6–1.4.8: don't show data
+  we can't stand behind. The rest of the Timeline section (event span,
+  first/last, first error/warn, first stall) is unchanged.
+
 ## v1.4.8 — remove unreliable per-call duration too (2026-06-04)
 
 ### Changed

@@ -1740,24 +1740,12 @@ def _timeline_key_moments(timeline: List[Dict[str, Any]]) -> Dict[str, Any]:
          or "long running" in (e.get("summary") or "")),
         None,
     )
-    longest_gap = {"ms": 0, "after_ts_ms": 0, "before_ts_ms": 0}
-    for a, b in zip(timeline, timeline[1:]):
-        gap = b["ts_ms"] - a["ts_ms"]
-        if gap > longest_gap["ms"]:
-            longest_gap = {
-                "ms": gap, "after_ts_ms": a["ts_ms"],
-                "before_ts_ms": b["ts_ms"],
-                "after_summary": a.get("summary"),
-                "before_summary": b.get("summary"),
-            }
     if first_error:
         out["first_error"] = first_error
     if first_warn:
         out["first_warn"] = first_warn
     if first_stall:
         out["first_stall"] = first_stall
-    if longest_gap["ms"]:
-        out["longest_gap"] = longest_gap
     return out
 
 
@@ -2513,15 +2501,6 @@ class PanoramaInspector:
                     f"first stall: [{fmt_epoch_local(fs['ts_ms'])}] "
                     f"{fs.get('summary', '')[:140]}",
                     data=fs,
-                )
-            lg = timeline_keys.get("longest_gap")
-            if lg and lg["ms"] > 5000:
-                s_timeline.ok(
-                    "timeline.longest_gap",
-                    f"longest gap: {fmt_duration(lg['ms'] / 1000)} "
-                    f"({fmt_epoch_local(lg['after_ts_ms'])} → "
-                    f"{fmt_epoch_local(lg['before_ts_ms'])})",
-                    data=lg,
                 )
 
         # (Standalone "Runtime Context" section removed in v1.4.3 — its

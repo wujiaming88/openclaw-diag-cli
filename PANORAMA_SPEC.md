@@ -5,7 +5,7 @@
 ```bash
 openclaw-diag panorama <session-id> [--format json|pretty|ndjson] [--mask] [--unmask]
                                      [--run-index N] [--all-runs]
-                                     [--include-ambient] [--strict-correlation]
+                                     [--strict-correlation]
 ```
 
 ## Purpose
@@ -51,9 +51,7 @@ Each included entry is annotated with its `correlation.path` explaining WHY it w
 
 No whitelist/blacklist. No subjective value judgment. Correlation IS the proof of relevance.
 
-### Ambient mode (`--include-ambient`)
-
-Additionally include WARN/ERROR log entries within the session time window that have NO correlation key. These are ambient system events that MIGHT be related but cannot be proven. Excluded by default.
+Log entries with NO correlation key are always excluded — relevance must be provable via the correlation graph, never inferred from a time window alone.
 
 ### Strict mode (`--strict-correlation`)
 

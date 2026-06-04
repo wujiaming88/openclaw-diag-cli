@@ -317,7 +317,7 @@ def _build_app_log(path: Path, *, lines: int = 50,
                 text = f"sessionId={SESSION_ID} runId={RUN_ID_A} working"
             if include_warn_unrelated and i == 20:
                 level = "WARN"
-                text = "ambient warning, no correlation key"
+                text = "uncorrelated warning, no correlation key"
             rec = {
                 "level": level,
                 "time": ts,

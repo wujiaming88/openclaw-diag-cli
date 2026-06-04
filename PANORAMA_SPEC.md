@@ -147,8 +147,9 @@ and `delivery` data keys were removed (their content lives under
 - Per-call: `ts_ms`, `duration_ms` (round-trip wall-clock — see note),
   `provider`, `model`, `stopReason`, `input`, `output`, `cacheRead`,
   `cacheWrite`, `tools[]`, `cost?`
-- Per-call render carries `in=`, `out=`, throughput `tok/s` (or `n/a` when
-  duration is zero), and stop reason
+- Per-call render carries `in=`, `out=`, and stop reason. (Per-call
+  throughput `tok/s` was removed in v1.4.6/1.4.7: it was derived from an
+  unreliable round-trip wall-clock gap and is not real generation rate.)
 - Note line: durations are round-trip wall-clock (last input msg →
   assistant msg), NOT pure model API latency — the trajectory has no
   native durationMs/TTFT

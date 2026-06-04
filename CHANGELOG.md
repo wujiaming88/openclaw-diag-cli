@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.4.7 — remove unreliable throughput entirely (2026-06-04)
+
+### Changed
+- **Removed model-call throughput (`tok/s`) entirely** — both the per-call rate
+  and the `avg output rate` aggregate. It was derived from a round-trip
+  wall-clock gap (previous message → assistant message), not a real API timing
+  channel, so it was never trustworthy (v1.4.6 only capped the impossible
+  values). Simpler and honest: don't show a number we can't stand behind.
+  Per-call lines now show `in=` / `out=` / stop reason; duration (with its
+  wall-clock caveat note) and the authoritative gateway-log run wall time stay.
+- Dropped the now-unused `MAX_PLAUSIBLE_TOK_PER_S` ceiling.
+
+### Tests
+- `test_model_call_throughput_removed`: a 6ms/4096-token call must render NO
+  `tok/s` and no bogus value; `out=`/stop reason still present.
+- Updated `test_model_call_input_and_throughput_fields` to assert throughput
+  is absent while input/output tokens remain.
+
 ## v1.4.6 — suppress impossible per-call/aggregate throughput (2026-06-04)
 
 ### Fixed

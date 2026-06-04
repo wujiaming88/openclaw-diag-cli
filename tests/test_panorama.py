@@ -523,21 +523,18 @@ def test_model_call_duration_renders_in_seconds(tmp_path: Path):
     assert "#2 2s" in text
 
 
-def test_model_call_throughput_suppresses_impossible_rate(tmp_path: Path):
-    """Regression: per-call tok/s is derived from a round-trip wall-clock gap
-    (previous message -> assistant message), not real API latency. In
-    multi-step runs consecutive messages are written ms apart, so a large
-    output over a ~6ms gap implied physically impossible throughput
-    (e.g. 4096 tok / 0.006s = 682,666 tok/s). Rates above
-    MAX_PLAUSIBLE_TOK_PER_S must render as 'n/a', never a bogus number.
+def test_model_call_throughput_removed(tmp_path: Path):
+    """v1.4.6: per-call tok/s throughput was REMOVED. It was derived from a
+    round-trip wall-clock gap (previous message -> assistant message), not
+    real API latency; in multi-step runs consecutive messages are ms apart,
+    so a large output over a ~6ms gap implied physically impossible rates
+    (e.g. 4096 tok / 0.006s = 682,666 tok/s). Rather than show an unreliable
+    number, throughput is no longer displayed at all.
     """
     import json as _json
     from ocdiag.render.human import render
-    from ocdiag.inspectors.panorama import MAX_PLAUSIBLE_TOK_PER_S
 
     ctx = _build_fixture_home(tmp_path)
-    # Lay down a second session: user msg, then assistant 6ms later emitting
-    # 4096 output tokens -> 682,666 tok/s if computed naively.
     sid = "99999999-aaaa-bbbb-cccc-dddddddddddd"
     base = T0
     records = [
@@ -560,19 +557,18 @@ def test_model_call_throughput_suppresses_impossible_rate(tmp_path: Path):
 
     report = _run_panorama(ctx, session_id=sid)
     calls = report.data["model_calls"]
-    # Data accuracy: the raw gap is truly 6ms (computed value would be huge).
+    # Data still carries the raw gap + tokens (consumers can derive if needed).
     assert any(c.get("duration_ms") == 6 and c.get("output") == 4096
                for c in calls)
 
     text = render(report, no_color=True)
-    # The impossible rate must be suppressed, not printed.
+    # No throughput shown anywhere; no bogus value leaks.
+    assert "tok/s" not in text
     assert "682666" not in text
-    assert "tok/s, length)" not in text  # the bogus rate slot is now n/a
-    assert "(n/a, length)" in text
-    # No rendered per-call rate may exceed the plausibility ceiling.
-    import re as _re
-    for m in _re.findall(r"([0-9]+(?:\.[0-9]+)?) tok/s", text):
-        assert float(m) <= MAX_PLAUSIBLE_TOK_PER_S, f"impossible rate {m}"
+    assert "avg output rate" not in text
+    # The per-call line still shows out tokens + stop reason.
+    assert "out=4096" in text
+    assert "(length)" in text
 
 
 def test_timeline_ordering_and_sources(tmp_path: Path):
@@ -805,21 +801,22 @@ def test_delivery_section_removed_data_dropped(tmp_path: Path):
 
 
 def test_model_call_input_and_throughput_fields(tmp_path: Path):
-    """v1.4.3: per-call lines show input tokens and tok/s throughput. Note
-    line about wall-clock vs API latency must be present.
+    """v1.4.6: per-call lines show input/output tokens and stop reason. The
+    unreliable per-call tok/s throughput was removed (round-trip wall-clock
+    gaps are not real generation time), so no tok/s must appear. The
+    wall-clock duration note must still be present.
     """
     from ocdiag.render.human import render
     ctx = _build_fixture_home(tmp_path)
     report = _run_panorama(ctx, session_id=SESSION_ID)
     text = render(report, no_color=True)
-    # Wall-clock note
+    # Wall-clock note still present (durations are still shown)
     assert "round-trip wall-clock" in text
-    # First call: 1s gap, in=10 out=5 → 5/1 = 5.0 tok/s
+    # Input/output tokens still shown per call
     assert "in=10" in text
-    assert "5.0 tok/s" in text or "5 tok/s" in text
-    # Second call: 2s gap, in=12 out=7 → 7/2 = 3.5 tok/s
     assert "in=12" in text
-    assert "3.5 tok/s" in text
+    # Throughput removed entirely — no tok/s anywhere
+    assert "tok/s" not in text
 
 
 def test_window_bound_logs_summary_carries_counters(tmp_path: Path):

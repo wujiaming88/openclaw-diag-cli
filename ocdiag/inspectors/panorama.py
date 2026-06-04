@@ -72,14 +72,6 @@ LOG_WINDOW_GRACE_MS = 5_000
 MAX_RENDERED_ERROR_LINES = 200
 MAX_RENDERED_WARN_LINES = 10
 
-# Per-call throughput (tok/s) is derived from a round-trip wall-clock proxy
-# (the gap between the previous message and this assistant message), not from
-# a real API timing channel. In multi-step runs consecutive messages are
-# written milliseconds apart, which would imply physically impossible
-# throughput (e.g. 4096 tok in 6ms = 682,666 tok/s). No current frontier model
-# sustains anywhere near 1000 tok/s, so a computed rate above this ceiling is
-# treated as a measurement artifact and shown as "n/a" instead of a bogus value.
-MAX_PLAUSIBLE_TOK_PER_S = 1000
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -2547,9 +2539,7 @@ class PanoramaInspector:
             "model.duration_note",
             "note: durations are round-trip wall-clock "
             "(last input msg → assistant msg), NOT pure model API latency "
-            "(trajectory has no native durationMs/TTFT); per-call tok/s is a "
-            "rough estimate and shown n/a when the gap is too small to be "
-            "real generation time",
+            "(trajectory has no native durationMs/TTFT)",
         )
         # v1.4.4 task F: surface the gateway-log run wall time when we
         # parsed it (authoritative, captures everything the gateway saw).
@@ -2579,19 +2569,6 @@ class PanoramaInspector:
                     "cost_usd": total_cost_usd,
                 },
             )
-            if duration_ms and total_output:
-                rate = round(total_output / (duration_ms / 1000), 1)
-                # Same guard as per-call: when the session window is tiny
-                # (e.g. a single sub-second run) the wall-clock rate is a
-                # measurement artifact, not real throughput. Show n/a above
-                # the plausibility ceiling instead of a bogus number.
-                rate_disp = (f"{rate} tok/s"
-                             if rate <= MAX_PLAUSIBLE_TOK_PER_S else "n/a")
-                s_model.ok(
-                    "model.rate", f"avg output rate: {rate_disp}",
-                    data={"tokens_per_sec": rate,
-                          "plausible": rate <= MAX_PLAUSIBLE_TOK_PER_S},
-                )
             # Per-model performance breakdown
             for m in model_aggregate.get("models", []):
                 stop_summary = ", ".join(
@@ -2610,26 +2587,15 @@ class PanoramaInspector:
                     f"stop[{stop_summary}]",
                     data=m,
                 )
-            # Per-call detail (with input tokens + per-call throughput).
+            # Per-call detail (input/output tokens + stop reason).
             for idx, c in enumerate(model_calls, 1):
                 tools_s = ",".join(c["tools"][:3]) if c["tools"] else "→ final"
                 dur = c.get("duration_ms")
                 dur_s = fmt_duration(dur / 1000) if dur is not None else "?"
-                if dur and dur > 0 and c.get("output"):
-                    tok_per_s = round(c["output"] / (dur / 1000), 1)
-                    # Suppress physically impossible rates: a sub-second
-                    # message gap is not real generation time, so the implied
-                    # throughput is meaningless. See MAX_PLAUSIBLE_TOK_PER_S.
-                    if tok_per_s > MAX_PLAUSIBLE_TOK_PER_S:
-                        rate_s = "n/a"
-                    else:
-                        rate_s = f"{tok_per_s} tok/s"
-                else:
-                    rate_s = "n/a"
                 s_model.ok(
                     f"model.call.{idx}",
                     f"#{idx} {dur_s} in={c.get('input', 0)} out={c['output']} "
-                    f"({rate_s}, {c['stopReason']}) "
+                    f"({c['stopReason']}) "
                     f"[{tools_s}] cr={c['cacheRead']} cw={c['cacheWrite']}",
                     data=c,
                 )

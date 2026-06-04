@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -46,7 +47,7 @@ from ..core.types import Report, Section, Verdict
 from ..correlation import (
     CorrelationGraph,
     build_graph,
-    filter_log_files,
+    filter_log_files_with_otel,
 )
 from ..jsonlog import get_log_subsystem, parse_log_msg
 from ..recent_logs import discover_recent_logs
@@ -471,6 +472,7 @@ def _build_timeline(
     correlated_logs: List[Dict[str, Any]],
     cron_runs: Optional[List[Dict[str, Any]]] = None,
     delivery_run_summary: Optional[Dict[str, Any]] = None,
+    log_parsed: Optional[Dict[str, Any]] = None,
     cap: int = DEFAULT_TIMELINE_CAP,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Merge all sources into one chronological list.
@@ -614,6 +616,54 @@ def _build_timeline(
                     "targets": targets,
                     "text_count": text_count,
                 },
+            })
+
+    # v1.4.4 task H: state transitions become first-class timeline entries.
+    # We only fold the parsed transitions in (already window-bounded by
+    # virtue of the correlated-log filter feeding this stage).
+    if log_parsed:
+        for tr in log_parsed.get("state_transitions") or []:
+            ts = tr.get("ts_ms") or 0
+            if not ts:
+                skipped_no_ts += 1
+                continue
+            reason = (tr.get("reason") or "").strip()
+            reason_s = f' reason="{reason}"' if reason else ""
+            out.append({
+                "ts_ms": int(ts),
+                "source": "state",
+                "event_type": "state",
+                "summary": (
+                    f"state {tr.get('prev')} → {tr.get('new')}"
+                    f"{reason_s} qd={tr.get('queue_depth')}"
+                ),
+                "state": tr,
+            })
+        # v1.4.4 task I: applied/skipped config-reload events join the
+        # timeline. Failed reloads also appear under health_signals so the
+        # verdict still degrades; here they simply mark the moment.
+        for rl in log_parsed.get("config_reloads") or []:
+            ts = rl.get("ts_ms") or 0
+            if not ts:
+                skipped_no_ts += 1
+                continue
+            outcome = rl.get("outcome") or "?"
+            if outcome == "applied":
+                summary = (
+                    f"config reload applied: "
+                    f"{', '.join(rl.get('keys') or []) or '(none)'}"
+                )
+            else:
+                summary = (
+                    f"config reload SKIPPED (invalid): "
+                    f"{(rl.get('reason') or '')[:120]}"
+                )
+            out.append({
+                "ts_ms": int(ts),
+                "source": "config",
+                "event_type": "config_reload",
+                "summary": summary,
+                "config_reload": rl,
             })
 
     out.sort(key=lambda r: r["ts_ms"])
@@ -767,7 +817,21 @@ def _runtime_context(run: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(pc, dict):
             obs = pc.get("observation") or {}
             if isinstance(obs, dict):
+                # v1.4.4 task A: capture broke + cacheRead + previousCacheRead
+                # so we can render the full picture (lost-token magnitude).
+                # Older runs may lack `observation` entirely — leave keys
+                # absent rather than None when we have no signal at all.
                 ctx["cache_broke"] = obs.get("broke")
+                cr = obs.get("cacheRead")
+                pcr = obs.get("previousCacheRead")
+                if cr is not None:
+                    ctx["cache_read_observed"] = cr
+                if pcr is not None:
+                    ctx["cache_read_previous"] = pcr
+                if isinstance(cr, (int, float)) and isinstance(
+                        pcr, (int, float)):
+                    # Lost = previous − current, never negative.
+                    ctx["cache_read_lost"] = max(0, int(pcr) - int(cr))
         ctx["compaction_count"] = ad.get("compactionCount") or 0
         il = ad.get("itemLifecycle") or {}
         if isinstance(il, dict):
@@ -825,8 +889,264 @@ def _log_marker_signals(
 
 LONG_TOOL_CALL_THRESHOLD_MS = 60_000
 
+# v1.4.4 task E: a queue wait above this threshold gets a WARN.
+SLOW_QUEUE_WAIT_MS = 2_000
 
 _FAILED_DELIVERY_STATUSES = {"failed", "error", "errored", "undelivered"}
+
+
+# ── log-line parsers (v1.4.4) ──────────────────────────────────────────────
+#
+# All of these run over already-correlated, window-bounded log records, so
+# they inherit window/strict/mask handling for free. Each parser is a tiny
+# regex over the rendered text from ``parse_log_msg`` — values are echoed
+# into structured dicts so JSON consumers see typed numbers, not strings.
+
+# E. lane queue / concurrency
+_LANE_DEQUEUE_RE = re.compile(
+    r"lane dequeue: lane=(?P<lane>\S+) waitMs=(?P<wait>\d+) "
+    r"queueSize=(?P<qs>\d+)"
+)
+_LANE_ENQUEUE_RE = re.compile(
+    r"lane enqueue: lane=(?P<lane>\S+) queueSize=(?P<qs>\d+)"
+)
+_RUN_REGISTERED_RE = re.compile(
+    r"run registered: sessionId=(?P<sid>[0-9a-fA-F-]+) "
+    r"totalActive=(?P<active>\d+)"
+)
+_SESSION_STATE_RE = re.compile(
+    r"session state: sessionId=(?P<sid>[0-9a-fA-F-]+) "
+    r"sessionKey=(?P<sk>\S+) prev=(?P<prev>\S+) new=(?P<new>\S+) "
+    r'reason="(?P<reason>[^"]*)" queueDepth=(?P<qd>\d+)'
+)
+
+# F. authoritative run duration
+_RUN_PROMPT_END_RE = re.compile(
+    r"embedded run prompt end: runId=(?P<rid>[0-9a-fA-F-]+) "
+    r"sessionId=(?P<sid>[0-9a-fA-F-]+) durationMs=(?P<dur>\d+)"
+)
+
+# G. context-overflow precheck
+_CONTEXT_PRECHECK_RE = re.compile(
+    r"\[context-overflow-precheck\] pre-prompt check sessionKey=\S+ "
+    r"provider=(?P<prov>\S+) route=(?P<route>\S+) "
+    r"estimatedPromptTokens=(?P<est>\d+)"
+)
+
+# I. config hot reload
+_CONFIG_RELOAD_APPLIED_RE = re.compile(
+    r"config hot reload applied \((?P<keys>[^)]*)\)"
+)
+_CONFIG_RELOAD_SKIPPED_RE = re.compile(
+    r"config reload skipped \(invalid config\): (?P<reason>.+)"
+)
+
+# Routes from precheck that indicate the run had to compact / would overflow.
+_COMPACTION_ROUTES = {"compact", "compacting", "overflow", "overflowing"}
+
+
+def _parse_log_lines(
+    correlated_logs: List[Dict[str, Any]],
+    *,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pull queue/run/precheck/state/reload data from already-correlated logs.
+
+    Single linear pass — every record is parsed once and routed by regex
+    into the appropriate bucket. The returned dict is keyed by parser name
+    so callers can pluck individual buckets without re-walking the list.
+
+    Optional ``session_id`` filters the run-prompt-end and run-registered
+    matches to ones whose ``sessionId`` field equals the seed. Those messages
+    can carry sibling sessionIds in multi-session contention reports, so we
+    enforce a strict equality at parse time.
+    """
+    queue_events: List[Dict[str, Any]] = []
+    run_registered: List[Dict[str, Any]] = []
+    state_transitions: List[Dict[str, Any]] = []
+    run_durations: List[Dict[str, Any]] = []
+    prechecks: List[Dict[str, Any]] = []
+    reloads: List[Dict[str, Any]] = []
+
+    for rec in correlated_logs:
+        text = parse_log_msg(rec) or ""
+        if not text:
+            continue
+        ts = _log_ts_ms(rec)
+        sub = get_log_subsystem(rec) or ""
+
+        m = _LANE_DEQUEUE_RE.search(text)
+        if m:
+            queue_events.append({
+                "kind": "dequeue",
+                "ts_ms": ts,
+                "lane": m.group("lane"),
+                "wait_ms": int(m.group("wait")),
+                "queue_size": int(m.group("qs")),
+            })
+            continue
+
+        m = _LANE_ENQUEUE_RE.search(text)
+        if m:
+            queue_events.append({
+                "kind": "enqueue",
+                "ts_ms": ts,
+                "lane": m.group("lane"),
+                "queue_size": int(m.group("qs")),
+            })
+            continue
+
+        m = _RUN_REGISTERED_RE.search(text)
+        if m:
+            sid = m.group("sid")
+            if session_id and sid != session_id:
+                continue
+            run_registered.append({
+                "ts_ms": ts,
+                "session_id": sid,
+                "total_active": int(m.group("active")),
+            })
+            continue
+
+        m = _SESSION_STATE_RE.search(text)
+        if m:
+            sid = m.group("sid")
+            if session_id and sid != session_id:
+                continue
+            state_transitions.append({
+                "ts_ms": ts,
+                "session_id": sid,
+                "session_key": m.group("sk"),
+                "prev": m.group("prev"),
+                "new": m.group("new"),
+                "reason": m.group("reason"),
+                "queue_depth": int(m.group("qd")),
+            })
+            continue
+
+        m = _RUN_PROMPT_END_RE.search(text)
+        if m:
+            sid = m.group("sid")
+            if session_id and sid != session_id:
+                continue
+            run_durations.append({
+                "ts_ms": ts,
+                "run_id": m.group("rid"),
+                "session_id": sid,
+                "duration_ms": int(m.group("dur")),
+            })
+            continue
+
+        m = _CONTEXT_PRECHECK_RE.search(text)
+        if m:
+            prechecks.append({
+                "ts_ms": ts,
+                "provider": m.group("prov"),
+                "route": m.group("route"),
+                "estimated_prompt_tokens": int(m.group("est")),
+            })
+            continue
+
+        m = _CONFIG_RELOAD_APPLIED_RE.search(text)
+        if m:
+            keys = [k.strip() for k in m.group("keys").split(",") if k.strip()]
+            reloads.append({
+                "ts_ms": ts,
+                "subsystem": sub,
+                "outcome": "applied",
+                "keys": keys,
+            })
+            continue
+
+        m = _CONFIG_RELOAD_SKIPPED_RE.search(text)
+        if m:
+            reloads.append({
+                "ts_ms": ts,
+                "subsystem": sub,
+                "outcome": "skipped",
+                "reason": m.group("reason").strip(),
+            })
+            continue
+
+    # Compute derived queue-summary so renderers don't have to.
+    queue_summary: Optional[Dict[str, Any]] = None
+    dequeues = [q for q in queue_events if q["kind"] == "dequeue"]
+    if dequeues or run_registered:
+        max_wait = max((q["wait_ms"] for q in dequeues), default=0)
+        max_queue = max(
+            (q["queue_size"] for q in queue_events), default=0,
+        )
+        max_active = max(
+            (r["total_active"] for r in run_registered), default=0,
+        )
+        queue_summary = {
+            "dequeues": len(dequeues),
+            "enqueues": sum(
+                1 for q in queue_events if q["kind"] == "enqueue"
+            ),
+            "max_wait_ms": max_wait,
+            "max_queue_size": max_queue,
+            "max_concurrent_runs": max_active,
+        }
+
+    return {
+        "queue_events": queue_events,
+        "queue_summary": queue_summary,
+        "run_registered": run_registered,
+        "state_transitions": state_transitions,
+        "run_durations": run_durations,
+        "context_prechecks": prechecks,
+        "config_reloads": reloads,
+    }
+
+
+# C. timeout/abort flag → human "where it hung" line
+_FLAG_TO_HUMAN = [
+    ("idle_timed_out", "went idle (no progress within idle timeout)"),
+    ("timed_out_during_tool_execution", "hung during tool execution"),
+    ("timed_out_during_compaction", "hung during context compaction"),
+    ("timed_out", "exceeded turn timeout"),
+    ("external_abort", "cancelled externally"),
+    ("aborted", "aborted (internal)"),
+]
+
+
+def _classify_timeout_flags(
+    artifacts_data: Dict[str, Any],
+) -> List[str]:
+    """Translate raw artifact flags into ordered human messages.
+
+    Order matters: ``idle_timed_out`` / tool / compaction subsume the bare
+    ``timed_out`` flag, so we emit the most specific reason first and only
+    fall through to the generic one when no specialization applies.
+    """
+    out: List[str] = []
+    flags = {
+        "idle_timed_out": bool(artifacts_data.get("idleTimedOut")),
+        "timed_out_during_tool_execution": bool(
+            artifacts_data.get("timedOutDuringToolExecution")),
+        "timed_out_during_compaction": bool(
+            artifacts_data.get("timedOutDuringCompaction")),
+        "timed_out": bool(artifacts_data.get("timedOut")),
+        "external_abort": bool(artifacts_data.get("externalAbort")),
+        "aborted": bool(artifacts_data.get("aborted")),
+    }
+    # Suppress the bare "timed_out" line when a more specific flag fired —
+    # otherwise we'd say both "exceeded turn timeout" AND "hung during tool
+    # execution" for the same event.
+    if (flags["idle_timed_out"] or flags["timed_out_during_tool_execution"]
+            or flags["timed_out_during_compaction"]):
+        flags["timed_out"] = False
+    # Same for "aborted" when externalAbort took over.
+    if flags["external_abort"]:
+        flags["aborted"] = False
+    for key, msg in _FLAG_TO_HUMAN:
+        if flags[key]:
+            out.append(msg)
+    pes = artifacts_data.get("promptErrorSource")
+    if pes:
+        out.append(f"prompt error source: {pes}")
+    return out
 
 
 def _health_signals(
@@ -837,6 +1157,7 @@ def _health_signals(
     children: Optional[List[Dict[str, Any]]] = None,
     cron_runs: Optional[List[Dict[str, Any]]] = None,
     log_decisions: Optional[List[Dict[str, Any]]] = None,
+    log_parsed: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
     for run in runs:
@@ -851,25 +1172,44 @@ def _health_signals(
         ):
             if ad.get(k):
                 flags.append(k)
-        if flags:
+        if flags or ad.get("promptErrorSource"):
+            # v1.4.4 task C: alongside the raw flag list we attach a human
+            # "where it hung" summary so renderers can drop the cryptic
+            # camelCase boolean dump.
             signals.append({
                 "kind": "trajectory_artifact",
                 "runId": run["runId"],
                 "flags": flags,
+                "human_summary": _classify_timeout_flags(ad),
                 "final_status": ad.get("finalStatus"),
                 "prompt_error_source": ad.get("promptErrorSource"),
                 "ts_ms": run.get("ended_ms") or run.get("started_ms") or 0,
             })
         il = ad.get("itemLifecycle") or {}
-        if isinstance(il, dict) and il.get("activeCount"):
-            signals.append({
-                "kind": "tool_call_leak",
-                "runId": run["runId"],
-                "active": il.get("activeCount"),
-                "started": il.get("startedCount"),
-                "completed": il.get("completedCount"),
-                "ts_ms": run.get("ended_ms") or 0,
-            })
+        if isinstance(il, dict):
+            started = il.get("startedCount") or 0
+            completed = il.get("completedCount") or 0
+            active = il.get("activeCount") or 0
+            if active:
+                signals.append({
+                    "kind": "tool_call_leak",
+                    "runId": run["runId"],
+                    "active": active,
+                    "started": started,
+                    "completed": completed,
+                    "ts_ms": run.get("ended_ms") or 0,
+                })
+            elif started and completed < started:
+                # v1.4.4 task B: items started but never completed and no
+                # active leak — they were dropped or errored silently.
+                signals.append({
+                    "kind": "items_incomplete",
+                    "runId": run["runId"],
+                    "started": started,
+                    "completed": completed,
+                    "dropped": started - completed,
+                    "ts_ms": run.get("ended_ms") or 0,
+                })
         lte = ad.get("lastToolError")
         if lte:
             signals.append({
@@ -963,6 +1303,90 @@ def _health_signals(
     # section in v1.4.x; they live here as WARN-level operational signals.
     if log_decisions:
         signals.extend(log_decisions)
+    # v1.4.4 task A: per-run prompt-cache breakage signals (broke==true) and
+    # cache hit notes (broke==false with non-zero cacheRead). The data lives
+    # on runtime_context already; we surface a health entry per run so it
+    # also drives the verdict.
+    for run in runs:
+        artifacts = run.get("artifacts") or {}
+        ad = artifacts.get("data") or {}
+        if not isinstance(ad, dict):
+            continue
+        pc = ad.get("promptCache") or {}
+        if not isinstance(pc, dict):
+            continue
+        obs = pc.get("observation")
+        if not isinstance(obs, dict):
+            continue
+        cr = obs.get("cacheRead")
+        pcr = obs.get("previousCacheRead")
+        if obs.get("broke"):
+            lost = (
+                max(0, int(pcr) - int(cr))
+                if isinstance(cr, (int, float))
+                and isinstance(pcr, (int, float))
+                else None
+            )
+            signals.append({
+                "kind": "prompt_cache_broke",
+                "runId": run["runId"],
+                "cache_read": cr,
+                "previous_cache_read": pcr,
+                "lost_tokens": lost,
+                "ts_ms": run.get("ended_ms") or 0,
+            })
+    # v1.4.4 task E: queue-latency signal — emit a WARN when any single
+    # dequeue waited longer than SLOW_QUEUE_WAIT_MS.
+    if log_parsed:
+        for q in log_parsed.get("queue_events") or []:
+            if q.get("kind") != "dequeue":
+                continue
+            wait_ms = q.get("wait_ms") or 0
+            if wait_ms < SLOW_QUEUE_WAIT_MS:
+                continue
+            signals.append({
+                "kind": "queue_wait_slow",
+                "ts_ms": q.get("ts_ms") or 0,
+                "lane": q.get("lane"),
+                "wait_ms": wait_ms,
+                "queue_size": q.get("queue_size"),
+            })
+        # v1.4.4 task G: WARN when a precheck routed to compaction/overflow.
+        for pc_ in log_parsed.get("context_prechecks") or []:
+            route = (pc_.get("route") or "").lower()
+            if route in _COMPACTION_ROUTES:
+                signals.append({
+                    "kind": "context_precheck_overflow",
+                    "ts_ms": pc_.get("ts_ms") or 0,
+                    "route": pc_.get("route"),
+                    "estimated_prompt_tokens":
+                        pc_.get("estimated_prompt_tokens"),
+                    "provider": pc_.get("provider"),
+                })
+        # v1.4.4 task H: an abnormal terminal state (aborted/error/failed)
+        # in the state-transition stream surfaces as a WARN.
+        for tr in log_parsed.get("state_transitions") or []:
+            new = (tr.get("new") or "").lower()
+            if new in ("aborted", "error", "errored", "failed"):
+                signals.append({
+                    "kind": "state_transition_abnormal",
+                    "ts_ms": tr.get("ts_ms") or 0,
+                    "prev": tr.get("prev"),
+                    "new": tr.get("new"),
+                    "reason": tr.get("reason"),
+                    "session_id": tr.get("session_id"),
+                })
+        # v1.4.4 task I: failed config reloads are WARN; successful reloads
+        # are info — the WARN drives the verdict, the OK shows up in the
+        # timeline.
+        for rl in log_parsed.get("config_reloads") or []:
+            if rl.get("outcome") == "skipped":
+                signals.append({
+                    "kind": "config_reload_failed",
+                    "ts_ms": rl.get("ts_ms") or 0,
+                    "subsystem": rl.get("subsystem"),
+                    "reason": rl.get("reason"),
+                })
     return signals
 
 
@@ -1296,11 +1720,16 @@ class PanoramaInspector:
         # Filter app logs through correlation graph, then bound to the
         # session window so we don't drag in unrelated traffic that just
         # happens to share a long-lived sessionKey or reused toolCallId.
+        # v1.4.4 task D: a second pass admits any log line whose OTel
+        # ``traceId`` was harvested from a pass-1 hit. Strict mode flows
+        # through and gates the harvest to sessionId/runId-seeded lines.
         strict = bool(kwargs.get("strict_correlation"))
-        raw_correlated_logs = filter_log_files(
-            log_files, graph,
-            strict=strict, max_records=DEFAULT_LOG_RECORD_CAP,
-        ) if log_files else []
+        raw_correlated_logs, harvested_trace_ids = (
+            filter_log_files_with_otel(
+                log_files, graph,
+                strict=strict, max_records=DEFAULT_LOG_RECORD_CAP,
+            ) if log_files else ([], [])
+        )
         correlated_logs, logs_dropped_oow, logs_ts_less = _bound_logs_to_window(
             raw_correlated_logs,
             window_start=window_start, window_end=window_end,
@@ -1352,13 +1781,23 @@ class PanoramaInspector:
                 "text_count": primary_runtime.get("messaging_text_count") or 0,
             }
 
-        # Timeline (now folds in window-bounded logs + delivery events).
+        # v1.4.4 tasks E/F/G/H/I: parse correlated logs once into typed
+        # buckets (queue events, state transitions, run durations, context
+        # prechecks, config reloads). Each parser is window-aware via the
+        # already-bounded ``correlated_logs`` source.
+        log_parsed = _parse_log_lines(
+            correlated_logs, session_id=full_session_id,
+        )
+
+        # Timeline (now folds in window-bounded logs + delivery events,
+        # plus log-derived state transitions and config reloads).
         timeline, timeline_stats = _build_timeline(
             session_records=session_records,
             trajectory_runs=selected_runs or traj_runs,
             correlated_logs=correlated_logs,
             cron_runs=cron_runs,
             delivery_run_summary=delivery_run_summary,
+            log_parsed=log_parsed,
         )
         timeline_keys = _timeline_key_moments(timeline)
 
@@ -1370,7 +1809,21 @@ class PanoramaInspector:
             selected_runs or traj_runs, correlated_logs,
             waterfall=waterfall, children=children,
             cron_runs=cron_runs, log_decisions=log_decisions,
+            log_parsed=log_parsed,
         )
+
+        # v1.4.4 task F: the gateway log carries an authoritative end-to-
+        # end run duration. When we have one for the primary run, expose it
+        # on runtime_context so JSON consumers see it and renderers can
+        # reference it next to the synthetic round-trip note.
+        if primary_runtime and log_parsed.get("run_durations"):
+            primary_rid = primary_runtime.get("runId")
+            for rd in log_parsed["run_durations"]:
+                if rd.get("run_id") == primary_rid:
+                    primary_runtime["log_run_duration_ms"] = (
+                        rd.get("duration_ms")
+                    )
+                    break
 
         # ── Aggregated session stats (cross-section summary) ─────────────
         total_input = sum(c.get("input") or 0 for c in model_calls)
@@ -1427,6 +1880,12 @@ class PanoramaInspector:
         report.data["health_signals"] = signals
         report.data["child_tasks"] = children
         report.data["session_stats"] = session_stats
+        # v1.4.4: surface the parsed log buckets and the OTel traceIds we
+        # used to expand correlation, so JSON consumers can do their own
+        # analysis without re-walking the log.
+        report.data["log_parsed"] = log_parsed
+        if harvested_trace_ids:
+            report.data["otel_trace_ids"] = harvested_trace_ids
         if cron_runs:
             report.data["cron_runs"] = cron_runs
 
@@ -1494,6 +1953,86 @@ class PanoramaInspector:
                 "stats.compaction",
                 f"compactions: {compaction}",
             )
+        # v1.4.4 task A: prompt-cache observation. Three states:
+        #   - broke=True  → WARN with lost-token magnitude
+        #   - broke=False & cacheRead>0 → OK "cache hit"
+        #   - missing observation (older runs)  → no line
+        if primary_runtime is not None:
+            broke = primary_runtime.get("cache_broke")
+            cr_obs = primary_runtime.get("cache_read_observed")
+            pcr_obs = primary_runtime.get("cache_read_previous")
+            lost = primary_runtime.get("cache_read_lost")
+            if broke is True:
+                lost_s = (
+                    f"~{lost:,} cached tokens"
+                    if isinstance(lost, int) and lost > 0
+                    else "cached tokens"
+                )
+                pcr_s = (
+                    f" (prev cacheRead {pcr_obs:,} → {cr_obs:,})"
+                    if isinstance(pcr_obs, int) and isinstance(cr_obs, int)
+                    else ""
+                )
+                s_overview.warn(
+                    "stats.cache_broke",
+                    f"cache broke: lost {lost_s}{pcr_s}",
+                    data={
+                        "broke": True,
+                        "cache_read": cr_obs,
+                        "previous_cache_read": pcr_obs,
+                        "lost_tokens": lost,
+                    },
+                )
+            elif broke is False and isinstance(cr_obs, int) and cr_obs > 0:
+                s_overview.ok(
+                    "stats.cache_hit",
+                    f"cache hit: cacheRead={cr_obs:,}",
+                    data={"broke": False, "cache_read": cr_obs},
+                )
+        # v1.4.4 task B: item-lifecycle counts always rendered when present.
+        if primary_runtime is not None:
+            lc = primary_runtime.get("lifecycle")
+            if isinstance(lc, dict) and (
+                lc.get("started") or lc.get("completed") or lc.get("active")
+            ):
+                s_overview.ok(
+                    "stats.lifecycle",
+                    f"items: started={lc.get('started') or 0} "
+                    f"completed={lc.get('completed') or 0} "
+                    f"active={lc.get('active') or 0}",
+                    data=lc,
+                )
+        # v1.4.4 task E: queue/concurrency one-liner (only when we actually
+        # parsed events for this run). Surfaces queue latency separately
+        # from model latency.
+        qs = log_parsed.get("queue_summary") if log_parsed else None
+        if qs:
+            s_overview.ok(
+                "stats.queue",
+                f"queue: max wait={qs['max_wait_ms']}ms, "
+                f"max queueSize={qs['max_queue_size']}, "
+                f"max concurrentRuns={qs['max_concurrent_runs']}",
+                data=qs,
+            )
+        # v1.4.4 task G: precheck route + estimated tokens (latest one in
+        # the run wins — that's the value the model actually saw).
+        prechecks = (log_parsed or {}).get("context_prechecks") or []
+        if prechecks:
+            last_pc = prechecks[-1]
+            route = last_pc.get("route")
+            est = last_pc.get("estimated_prompt_tokens") or 0
+            verdict_warn = (route or "").lower() in _COMPACTION_ROUTES
+            line = (
+                f"context precheck: route={route} estPromptTokens={est:,}"
+            )
+            if verdict_warn:
+                s_overview.warn(
+                    "stats.precheck", line, data=last_pc,
+                )
+            else:
+                s_overview.ok(
+                    "stats.precheck", line, data=last_pc,
+                )
         # Correlation IDs (collapsed into one line each)
         s_overview.ok(
             "ids",
@@ -1714,6 +2253,16 @@ class PanoramaInspector:
             "(last input msg → assistant msg), NOT pure model API latency "
             "(trajectory has no native durationMs/TTFT)",
         )
+        # v1.4.4 task F: surface the gateway-log run wall time when we
+        # parsed it (authoritative, captures everything the gateway saw).
+        if primary_runtime and primary_runtime.get("log_run_duration_ms"):
+            log_dur = primary_runtime["log_run_duration_ms"]
+            s_model.ok(
+                "model.run_wall_time",
+                f"run wall time: {fmt_duration(log_dur / 1000)} "
+                f"({log_dur}ms, from gateway log)",
+                data={"log_run_duration_ms": log_dur},
+            )
         if not model_calls:
             s_model.ok("model.none", "no model calls in selected run")
         else:
@@ -1997,11 +2546,17 @@ class PanoramaInspector:
                 ts_ms = sig.get("ts_ms") or 0
                 tsfx = f"[{fmt_epoch_local(ts_ms)}] " if ts_ms else ""
                 if kind == "trajectory_artifact":
+                    # v1.4.4 task C: render the human-friendly "where it
+                    # hung" line; raw flags stay on the data block for
+                    # JSON consumers.
+                    human = sig.get("human_summary") or []
+                    detail = " | ".join(human) if human else (
+                        ",".join(sig.get("flags") or []) or "?"
+                    )
                     s_health.fail(
                         f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
                         f"{tsfx}run {(sig.get('runId') or '?')[:8]}: "
-                        f"{','.join(sig.get('flags') or [])} "
-                        f"finalStatus={sig.get('final_status')}",
+                        f"{detail} | finalStatus={sig.get('final_status')}",
                         data=sig,
                     )
                 elif kind == "tool_call_leak":
@@ -2061,6 +2616,63 @@ class PanoramaInspector:
                     s_health.warn(
                         f"health.{kind}.{ts_ms}",
                         f"{tsfx}decision: {sig.get('summary')}",
+                        data=sig,
+                    )
+                elif kind == "items_incomplete":
+                    s_health.warn(
+                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                        f"{tsfx}incomplete items: "
+                        f"{sig.get('started')} started, "
+                        f"{sig.get('completed')} completed "
+                        f"({sig.get('dropped')} dropped/errored)",
+                        data=sig,
+                    )
+                elif kind == "prompt_cache_broke":
+                    lost = sig.get("lost_tokens")
+                    lost_s = (
+                        f", lost ~{lost:,} tokens"
+                        if isinstance(lost, int) and lost > 0 else ""
+                    )
+                    s_health.warn(
+                        f"health.{kind}.{(sig.get('runId') or '?')[:8]}",
+                        f"{tsfx}prompt cache broke{lost_s} "
+                        f"(prev cacheRead={sig.get('previous_cache_read')} "
+                        f"→ {sig.get('cache_read')})",
+                        data=sig,
+                    )
+                elif kind == "queue_wait_slow":
+                    s_health.warn(
+                        f"health.{kind}.{ts_ms}",
+                        f"{tsfx}queued {sig.get('wait_ms')}ms behind "
+                        f"other turns "
+                        f"(queueSize={sig.get('queue_size')}, "
+                        f"lane={(sig.get('lane') or '?')[:80]})",
+                        data=sig,
+                    )
+                elif kind == "context_precheck_overflow":
+                    s_health.warn(
+                        f"health.{kind}.{ts_ms}",
+                        f"{tsfx}context precheck route="
+                        f"{sig.get('route')} "
+                        f"estTokens={sig.get('estimated_prompt_tokens')}",
+                        data=sig,
+                    )
+                elif kind == "state_transition_abnormal":
+                    s_health.warn(
+                        f"health.{kind}.{ts_ms}",
+                        f"{tsfx}abnormal state transition: "
+                        f"{sig.get('prev')} → {sig.get('new')}"
+                        + (
+                            f' reason="{sig.get("reason")}"'
+                            if sig.get("reason") else ""
+                        ),
+                        data=sig,
+                    )
+                elif kind == "config_reload_failed":
+                    s_health.warn(
+                        f"health.{kind}.{ts_ms}",
+                        f"{tsfx}config reload FAILED (invalid): "
+                        f"{(sig.get('reason') or '')[:160]}",
                         data=sig,
                     )
                 else:

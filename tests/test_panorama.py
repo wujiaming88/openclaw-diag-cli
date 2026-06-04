@@ -1029,5 +1029,853 @@ def test_perf_100k_lines_under_5s(tmp_path: Path):
     assert len(report.data["correlated_logs"]) <= 5000
 
 
+# ── v1.4.4 task A: prompt-cache breakage ──────────────────────────────────
+
+
+def _trajectory_with_artifact_overrides(
+    sid: str, run_id: str, started_ms: int, ended_ms: int,
+    *, artifacts_data_overrides: Dict[str, Any],
+    final_status: str = "ok",
+) -> List[Dict[str, Any]]:
+    """Build a trajectory whose trace.artifacts.data field can be
+    surgically overridden by the test. Used by the v1.4.4 tests to inject
+    promptCache.observation broke states, itemLifecycle counts, and
+    timeout-flag combinations without touching the shared helper.
+    """
+    base = {
+        "schemaVersion": 1, "traceSchema": "openclaw-trajectory",
+        "runId": run_id, "sessionId": sid, "sessionKey": SESSION_KEY,
+        "provider": "test", "modelId": "test-model",
+    }
+    artifacts_data = {
+        "finalStatus": final_status,
+        "aborted": False, "externalAbort": False,
+        "timedOut": False, "idleTimedOut": False,
+        "timedOutDuringCompaction": False,
+        "timedOutDuringToolExecution": False,
+        "promptErrorSource": None,
+        "usage": {"input": 0, "output": 0,
+                  "cacheRead": 0, "cacheWrite": 0, "total": 0},
+        "compactionCount": 0,
+        "didSendViaMessagingTool": False,
+        "messagingToolSentTargets": [],
+        "messagingToolSentTexts": [],
+        "successfulCronAdds": 0,
+    }
+    artifacts_data.update(artifacts_data_overrides)
+    return [
+        {**base, "type": "session.started", "ts": _ms_to_iso(started_ms),
+         "data": {"trigger": "user", "agentId": "main",
+                  "messageChannel": "feishu"}},
+        {**base, "type": "trace.metadata", "ts": _ms_to_iso(started_ms + 1),
+         "data": {}},
+        {**base, "type": "trace.artifacts",
+         "ts": _ms_to_iso(ended_ms - 100), "data": artifacts_data},
+        {**base, "type": "session.ended", "ts": _ms_to_iso(ended_ms),
+         "data": {"status": final_status}},
+    ]
+
+
+def _make_minimal_session_jsonl(main_sd: Path, sid: str) -> None:
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T1)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T1),
+         "message": {"role": "user", "timestamp": T1, "content": "go"}},
+    ])
+
+
+def _ctx_for_session(home: Path, log_dir: Path) -> DiagContext:
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=home / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    paths_mod.CRON_RUNS_DIR = str(home / "cron" / "runs")
+    return ctx
+
+
+def _bare_home(tmp_path: Path, sid: str, traj: List[Dict[str, Any]]
+               ) -> DiagContext:
+    home = tmp_path / "home"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_minimal_session_jsonl(main_sd, sid)
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+    return _ctx_for_session(home, log_dir)
+
+
+def test_prompt_cache_broke_extracted_and_warns(tmp_path: Path):
+    """task A: broke=True with prev/cur cacheRead emits a warn signal +
+    overview line, and the lost-token math is correct.
+    """
+    sid = "11111111-aaaa-aaaa-aaaa-111111111aaa"
+    rid = "aaaaaaaa-1111-1111-1111-aaaaaaaaaaaa"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "promptCache": {
+                "observation": {
+                    "broke": True,
+                    "previousCacheRead": 1_000_000,
+                    "cacheRead": 250_000,
+                },
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    rt = report.data["runtime_context"][0]
+    assert rt["cache_broke"] is True
+    assert rt["cache_read_observed"] == 250_000
+    assert rt["cache_read_previous"] == 1_000_000
+    assert rt["cache_read_lost"] == 750_000  # exact math
+    sigs = report.data["health_signals"]
+    cache_sigs = [s for s in sigs if s.get("kind") == "prompt_cache_broke"]
+    assert len(cache_sigs) == 1
+    assert cache_sigs[0]["lost_tokens"] == 750_000
+    # Verdict should be at least WARN, since broke routed via warn().
+    assert report.verdict in (Verdict.WARN, Verdict.FAIL)
+    # Overview emits the warn line with a recognizable message.
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    assert any(
+        "cache broke" in c.message and "750,000" in c.message
+        for c in overview.checks
+    )
+
+
+def test_prompt_cache_hit_renders_ok_line(tmp_path: Path):
+    """task A: broke=False with non-zero cacheRead emits an OK overview
+    line and no health signal (cache is healthy).
+    """
+    sid = "22222222-bbbb-bbbb-bbbb-222222222bbb"
+    rid = "bbbbbbbb-2222-2222-2222-bbbbbbbbbbbb"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "promptCache": {
+                "observation": {
+                    "broke": False,
+                    "cacheRead": 480_000,
+                },
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    assert not any(s.get("kind") == "prompt_cache_broke" for s in sigs)
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    assert any(
+        "cache hit" in c.message and "480,000" in c.message
+        for c in overview.checks
+    )
+
+
+def test_prompt_cache_observation_missing_no_render(tmp_path: Path):
+    """task A: older runs with no observation block must not crash and
+    must not render a cache line.
+    """
+    sid = "33333333-cccc-cccc-cccc-333333333ccc"
+    rid = "cccccccc-3333-3333-3333-cccccccccccc"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "promptCache": {
+                "lastCallUsage": {
+                    "input": 1, "output": 2, "cacheRead": 0,
+                    "cacheWrite": 100, "total": 103,
+                },
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    rt = report.data["runtime_context"][0]
+    assert "cache_broke" not in rt or rt["cache_broke"] is None
+    assert "cache_read_lost" not in rt
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    assert not any(
+        "cache broke" in c.message or "cache hit" in c.message
+        for c in overview.checks
+    )
+
+
+# ── v1.4.4 task B: itemLifecycle render + incomplete ─────────────────────
+
+
+def test_item_lifecycle_renders_in_overview(tmp_path: Path):
+    sid = "44444444-dddd-dddd-dddd-444444444ddd"
+    rid = "dddddddd-4444-4444-4444-dddddddddddd"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "itemLifecycle": {
+                "startedCount": 8, "completedCount": 8, "activeCount": 0,
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    line = next(
+        (c for c in overview.checks if c.name == "stats.lifecycle"), None,
+    )
+    assert line is not None
+    assert "started=8" in line.message and "completed=8" in line.message
+
+
+def test_item_lifecycle_incomplete_warns(tmp_path: Path):
+    """task B: started>completed and active==0 → items_incomplete signal.
+    """
+    sid = "55555555-eeee-eeee-eeee-555555555eee"
+    rid = "eeeeeeee-5555-5555-5555-eeeeeeeeeeee"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "itemLifecycle": {
+                "startedCount": 12, "completedCount": 7, "activeCount": 0,
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    inc = next(
+        (s for s in sigs if s.get("kind") == "items_incomplete"), None,
+    )
+    assert inc is not None
+    assert inc["dropped"] == 5
+    assert inc["started"] == 12 and inc["completed"] == 7
+    assert report.verdict in (Verdict.WARN, Verdict.FAIL)
+
+
+def test_item_lifecycle_active_leak_still_warns(tmp_path: Path):
+    """task B regression: active>0 still produces the existing tool_call_leak
+    signal even with the new incomplete code path. Both can fire for the
+    same run if completed<started AND active>0 — the active leak takes
+    precedence (we only emit the incomplete signal when active==0).
+    """
+    sid = "66666666-ffff-ffff-ffff-666666666fff"
+    rid = "ffffffff-6666-6666-6666-ffffffffffff"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        artifacts_data_overrides={
+            "itemLifecycle": {
+                "startedCount": 27, "completedCount": 25, "activeCount": 2,
+            },
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    leak = next(
+        (s for s in sigs if s.get("kind") == "tool_call_leak"), None,
+    )
+    assert leak is not None and leak["active"] == 2
+    assert not any(
+        s.get("kind") == "items_incomplete" for s in sigs
+    ), "incomplete should be suppressed when active>0"
+
+
+# ── v1.4.4 task C: timeout/abort classification ──────────────────────────
+
+
+def test_timeout_classification_idle(tmp_path: Path):
+    """task C: idleTimedOut maps to 'went idle...' and suppresses the
+    bare timedOut message even when timedOut is also true (real data has
+    both flags set in idle-timeout cases).
+    """
+    sid = "77777777-1234-5678-9abc-77777777aaaa"
+    rid = "77777777-1111-2222-3333-77777777aaaa"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        final_status="error",
+        artifacts_data_overrides={
+            "aborted": True, "timedOut": True, "idleTimedOut": True,
+            "promptErrorSource": "prompt", "finalStatus": "error",
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    art = next(s for s in sigs if s.get("kind") == "trajectory_artifact")
+    human = art.get("human_summary") or []
+    assert any("went idle" in h for h in human)
+    assert not any("exceeded turn timeout" in h for h in human)
+    assert any("prompt error source: prompt" in h for h in human)
+    # Raw flags still kept on JSON envelope.
+    assert "idleTimedOut" in art["flags"]
+    assert "timedOut" in art["flags"]
+
+
+def test_timeout_classification_during_tool_execution(tmp_path: Path):
+    sid = "77777777-2222-2222-2222-77777777bbbb"
+    rid = "77777777-3333-3333-3333-77777777bbbb"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        final_status="error",
+        artifacts_data_overrides={
+            "timedOut": True, "timedOutDuringToolExecution": True,
+            "finalStatus": "error",
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    art = next(
+        s for s in report.data["health_signals"]
+        if s.get("kind") == "trajectory_artifact"
+    )
+    human = art.get("human_summary") or []
+    assert any("hung during tool execution" in h for h in human)
+    assert not any("exceeded turn timeout" in h for h in human)
+
+
+def test_timeout_classification_external_abort_only(tmp_path: Path):
+    sid = "77777777-4444-4444-4444-77777777cccc"
+    rid = "77777777-5555-5555-5555-77777777cccc"
+    traj = _trajectory_with_artifact_overrides(
+        sid, rid, T0, T6,
+        final_status="error",
+        artifacts_data_overrides={
+            "aborted": True, "externalAbort": True, "finalStatus": "error",
+        },
+    )
+    ctx = _bare_home(tmp_path, sid, traj)
+    report = _run_panorama(ctx, session_id=sid)
+    art = next(
+        s for s in report.data["health_signals"]
+        if s.get("kind") == "trajectory_artifact"
+    )
+    human = art.get("human_summary") or []
+    assert any("cancelled externally" in h for h in human)
+    assert not any("aborted (internal)" in h for h in human)
+
+
+# ── v1.4.4 task D: OTel traceId correlation ──────────────────────────────
+
+
+def test_otel_trace_id_correlation_pulls_in_orphan_lines(tmp_path: Path):
+    """A log line that shares the OTel traceId but does NOT mention
+    sessionId/runId must be admitted by the second pass and tagged
+    with path=otel-trace.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    log_dir = ctx.log_dir
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = log_dir / f"openclaw-{today}.log"
+    # Append a sessionId-bearing line WITH a traceId, then an orphan that
+    # only carries the same traceId — the orphan must be admitted via OTel.
+    trace_id = "abcdef1234567890" + "0" * 16  # exactly 32 hex
+    sid_line = {
+        "level": "INFO", "time": T0 + 4500, "pid": 1,
+        "traceId": trace_id, "spanId": "1111111111111111", "traceFlags": "01",
+        "_meta": {"name": json.dumps({"subsystem": "agent/embedded"})},
+        "msg": f"sessionId={SESSION_ID} provider=bedrock",
+    }
+    orphan = {
+        "level": "INFO", "time": T0 + 4600, "pid": 1,
+        "traceId": trace_id, "spanId": "2222222222222222", "traceFlags": "01",
+        "_meta": {"name": json.dumps({"subsystem": "harness/internal"})},
+        "msg": "deep stack frame: bedrock-converse adapter started",
+    }
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(sid_line) + "\n")
+        f.write(json.dumps(orphan) + "\n")
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    logs = report.data["correlated_logs"]
+    paths = [
+        rec.get("correlation", {}).get("path") for rec in logs
+    ]
+    # The orphan must show up with an otel-trace path.
+    otel_only = [p for p in paths if p and p.startswith("otel-trace:")]
+    assert otel_only, (
+        f"orphan line via OTel traceId not admitted; paths={paths}"
+    )
+    assert report.data.get("otel_trace_ids") == [trace_id]
+
+
+def test_otel_trace_id_correlation_strict_blocks_session_key_seed(
+        tmp_path: Path):
+    """In strict mode the harvest only accepts traceIds discovered on a
+    sessionId/runId-seeded line — sessionKey-seeded lines must not expand.
+    """
+    home = tmp_path / "strict-otel"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "88888888-1111-1111-1111-888888888888"
+    sk = "agent:main:feishu:user:U-strict"
+    _make_minimal_session_jsonl(main_sd, sid)
+    # sessions.json gives us the sessionKey for matching.
+    with open(main_sd / "sessions.json", "w") as f:
+        json.dump({sk: {"sessionId": sid}}, f)
+
+    # Trajectory makes the run window valid.
+    traj = _trajectory_with_artifact_overrides(
+        sid, "88888888-aaaa-aaaa-aaaa-888888888888", T0, T6,
+        artifacts_data_overrides={},
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", traj)
+
+    # Build today-dated log: a sessionKey-only line carrying a traceId,
+    # and an orphan sharing that traceId. Under strict the orphan must
+    # NOT be admitted.
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = log_dir / f"openclaw-{today}.log"
+    trace_id = "deadbeef" + "0" * 24
+    sk_line = {
+        "level": "INFO", "time": T0 + 1000, "pid": 1,
+        "traceId": trace_id, "spanId": "aaaaaaaaaaaaaaaa", "traceFlags": "01",
+        "_meta": {"name": json.dumps({"subsystem": "channel/feishu"})},
+        "msg": f"sessionKey={sk} arrived",
+    }
+    orphan = {
+        "level": "INFO", "time": T0 + 2000, "pid": 1,
+        "traceId": trace_id, "spanId": "bbbbbbbbbbbbbbbb", "traceFlags": "01",
+        "_meta": {"name": json.dumps({"subsystem": "harness/internal"})},
+        "msg": "deep stack: no key in this line",
+    }
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(sk_line) + "\n")
+        f.write(json.dumps(orphan) + "\n")
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    paths_mod.CRON_RUNS_DIR = str(home / "cron" / "runs")
+
+    strict = _run_panorama(ctx, session_id=sid, strict_correlation=True)
+    paths = [
+        rec.get("correlation", {}).get("path")
+        for rec in strict.data["correlated_logs"]
+    ]
+    assert not any(p and p.startswith("otel-trace:") for p in paths), (
+        f"strict mode wrongly expanded traceId via sessionKey seed: {paths}"
+    )
+
+
+# ── v1.4.4 task E: lane queue latency / concurrency ──────────────────────
+
+
+def _append_log_lines(log_path: Path, lines: List[Dict[str, Any]]) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a", encoding="utf-8") as f:
+        for rec in lines:
+            f.write(json.dumps(rec) + "\n")
+
+
+def _diag_subsystem_log(text: str, ts_ms: int, sid: str = SESSION_ID
+                        ) -> Dict[str, Any]:
+    """OpenClaw shape: positional "0" carries the subsystem JSON, "1"
+    carries the message string. We always include a sessionId substring
+    so pass-1 correlation pulls it in.
+    """
+    return {
+        "0": json.dumps({"subsystem": "diagnostic"}),
+        "1": text + f" sessionId={sid}",
+        "_meta": {"name": json.dumps({"subsystem": "diagnostic"})},
+        "level": "INFO", "time": ts_ms, "pid": 1,
+    }
+
+
+def test_queue_events_parsed_and_summarized(tmp_path: Path):
+    """task E: lane dequeue/enqueue and run-registered lines must be
+    parsed into typed records, with the summary on session overview.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    lane = f"session:agent:main:feishu:run:{RUN_ID_A}"
+    _append_log_lines(log_path, [
+        _diag_subsystem_log(
+            f"lane enqueue: lane={lane} queueSize=2", T0 + 100),
+        _diag_subsystem_log(
+            f"lane dequeue: lane={lane} waitMs=350 queueSize=1", T0 + 600),
+        _diag_subsystem_log(
+            f"run registered: sessionId={SESSION_ID} totalActive=3",
+            T0 + 700),
+    ])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    parsed = report.data["log_parsed"]
+    deq = [q for q in parsed["queue_events"] if q["kind"] == "dequeue"]
+    assert len(deq) == 1
+    assert deq[0]["wait_ms"] == 350  # exact value
+    assert deq[0]["queue_size"] == 1
+    assert parsed["queue_summary"]["max_concurrent_runs"] == 3
+    assert parsed["queue_summary"]["max_queue_size"] == 2
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    queue_line = next(
+        (c for c in overview.checks if c.name == "stats.queue"), None,
+    )
+    assert queue_line is not None
+    assert "max wait=350ms" in queue_line.message
+    assert "max concurrentRuns=3" in queue_line.message
+
+
+def test_queue_wait_slow_warns(tmp_path: Path):
+    """task E: a dequeue with waitMs above SLOW_QUEUE_WAIT_MS (>2000) must
+    emit a queue_wait_slow signal and a 'queued <N>ms' warn line.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    lane = f"session:agent:main:feishu:run:{RUN_ID_A}"
+    _append_log_lines(log_path, [
+        _diag_subsystem_log(
+            f"lane dequeue: lane={lane} waitMs=4500 queueSize=2", T0 + 800),
+    ])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sigs = report.data["health_signals"]
+    slow = [s for s in sigs if s.get("kind") == "queue_wait_slow"]
+    assert len(slow) == 1
+    assert slow[0]["wait_ms"] == 4500
+
+
+# ── v1.4.4 task F: authoritative run duration from logs ──────────────────
+
+
+def test_log_run_duration_extracted(tmp_path: Path):
+    """task F: 'embedded run prompt end ... durationMs=N' for the primary
+    run id must surface as runtime_context.log_run_duration_ms and as a
+    Model Calls line.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "agent/embedded"}),
+        "1": (
+            f"embedded run prompt end: runId={RUN_ID_A} "
+            f"sessionId={SESSION_ID} durationMs=236421"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "agent/embedded"})},
+        "level": "INFO", "time": T0 + 9500, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    rt = report.data["runtime_context"][-1]  # primary run is last selected
+    assert rt.get("log_run_duration_ms") == 236421
+    section = next(
+        s for s in report.sections if s.title == "Panorama · Model Calls"
+    )
+    line = next(
+        (c for c in section.checks if c.name == "model.run_wall_time"),
+        None,
+    )
+    assert line is not None
+    assert "236421ms" in line.message
+
+
+# ── v1.4.4 task G: context-overflow precheck ─────────────────────────────
+
+
+def test_context_precheck_route_fits_renders_ok(tmp_path: Path):
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "agent/embedded"}),
+        "1": (
+            f"[context-overflow-precheck] pre-prompt check "
+            f"sessionKey=agent:main:feishu:run:{RUN_ID_A} "
+            f"provider=test/test-model route=fits "
+            f"estimatedPromptTokens=17688 sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "agent/embedded"})},
+        "level": "INFO", "time": T0 + 1500, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    parsed = report.data["log_parsed"]
+    assert parsed["context_prechecks"][0]["route"] == "fits"
+    assert parsed["context_prechecks"][0]["estimated_prompt_tokens"] == 17688
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    line = next(
+        (c for c in overview.checks if c.name == "stats.precheck"), None,
+    )
+    assert line is not None
+    assert "route=fits" in line.message
+
+
+def test_context_precheck_route_compact_warns(tmp_path: Path):
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "agent/embedded"}),
+        "1": (
+            f"[context-overflow-precheck] pre-prompt check "
+            f"sessionKey=agent:main:feishu:run:{RUN_ID_A} "
+            f"provider=test/test-model route=compact "
+            f"estimatedPromptTokens=950000 sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "agent/embedded"})},
+        "level": "INFO", "time": T0 + 1500, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sigs = report.data["health_signals"]
+    pc = [s for s in sigs if s.get("kind") == "context_precheck_overflow"]
+    assert len(pc) == 1
+    assert pc[0]["route"] == "compact"
+    assert pc[0]["estimated_prompt_tokens"] == 950000
+
+
+# ── v1.4.4 task H: session state transitions ─────────────────────────────
+
+
+def test_state_transitions_parsed_and_in_timeline(tmp_path: Path):
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "diagnostic"}),
+        "1": (
+            f"session state: sessionId={SESSION_ID} "
+            f"sessionKey=agent:main:feishu prev=idle new=processing "
+            f'reason="" queueDepth=1'
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "diagnostic"})},
+        "level": "INFO", "time": T0 + 200, "pid": 1,
+    }, {
+        "0": json.dumps({"subsystem": "diagnostic"}),
+        "1": (
+            f"session state: sessionId={SESSION_ID} "
+            f"sessionKey=agent:main:feishu prev=processing new=aborted "
+            f'reason="external" queueDepth=0'
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "diagnostic"})},
+        "level": "INFO", "time": T0 + 8000, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    parsed = report.data["log_parsed"]
+    assert len(parsed["state_transitions"]) == 2
+    assert parsed["state_transitions"][1]["new"] == "aborted"
+    # Aborted transition surfaces under health.
+    sigs = report.data["health_signals"]
+    abnormal = [
+        s for s in sigs if s.get("kind") == "state_transition_abnormal"
+    ]
+    assert len(abnormal) == 1
+    assert abnormal[0]["new"] == "aborted"
+    # Timeline carries source="state" entries.
+    states = [e for e in report.data["timeline"] if e.get("source") == "state"]
+    assert len(states) == 2
+
+
+# ── v1.4.4 task I: config hot-reload events ──────────────────────────────
+
+
+def test_config_reload_applied_in_timeline(tmp_path: Path):
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    # We need this line correlated, so include sessionId substring.
+    # Real reload lines do NOT carry sessionId — but they share the OTel
+    # traceId of an in-window run. For unit testing we cheat by appending
+    # the sessionId to the message; the parser only cares about the
+    # 'config hot reload applied (...)' substring.
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "gateway/reload"}),
+        "1": (
+            "config hot reload applied (agents.list, plugins.allow) "
+            f"sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "gateway/reload"})},
+        "level": "INFO", "time": T0 + 3000, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    parsed = report.data["log_parsed"]
+    reloads = parsed["config_reloads"]
+    assert len(reloads) == 1
+    assert reloads[0]["outcome"] == "applied"
+    assert "agents.list" in reloads[0]["keys"]
+    timeline = report.data["timeline"]
+    assert any(e.get("event_type") == "config_reload" for e in timeline)
+
+
+def test_config_reload_skipped_warns(tmp_path: Path):
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "gateway/reload"}),
+        "1": (
+            "config reload skipped (invalid config): JSON5 parse error: "
+            "trailing comma at line 23 "
+            f"sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "gateway/reload"})},
+        "level": "WARN", "time": T0 + 4000, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sigs = report.data["health_signals"]
+    failed = [s for s in sigs if s.get("kind") == "config_reload_failed"]
+    assert len(failed) == 1
+    assert "JSON5 parse error" in failed[0]["reason"]
+
+
+# ── v1.4.4 task J: window-bound + strict + mask compose ──────────────────
+
+
+def test_log_parsed_inherits_window_bound(tmp_path: Path):
+    """task J: log lines outside the session window must NOT appear in
+    log_parsed buckets — they're filtered by the same window pass that
+    produces correlated_logs.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    far_future = T8 + 24 * 3600 * 1000  # one day after the window
+    # In-window queue dequeue (this should appear).
+    _append_log_lines(log_path, [{
+        "0": json.dumps({"subsystem": "diagnostic"}),
+        "1": (
+            f"lane dequeue: lane=session:agent:main:feishu "
+            f"waitMs=42 queueSize=1 sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "diagnostic"})},
+        "level": "INFO", "time": T0 + 500, "pid": 1,
+    }, {
+        # Out-of-window queue dequeue (this must be dropped).
+        "0": json.dumps({"subsystem": "diagnostic"}),
+        "1": (
+            f"lane dequeue: lane=session:agent:main:feishu "
+            f"waitMs=999 queueSize=9 sessionId={SESSION_ID}"
+        ),
+        "_meta": {"name": json.dumps({"subsystem": "diagnostic"})},
+        "level": "INFO", "time": far_future, "pid": 1,
+    }])
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    deq = [
+        q for q in report.data["log_parsed"]["queue_events"]
+        if q["kind"] == "dequeue"
+    ]
+    assert len(deq) == 1
+    assert deq[0]["wait_ms"] == 42, "out-of-window dequeue leaked through"
+
+
+# ── v1.4.4: perf — two-pass traceId scan stays linear ────────────────────
+
+
+def test_perf_100k_lines_with_otel_under_6s(tmp_path: Path):
+    """Two-pass OTel correlation must be O(n) not O(n^2). Build a 100k-line
+    log with ~1% sessionId mentions and ~5% extra trace-only siblings, then
+    assert the panorama call stays under a generous wall-clock cap.
+    """
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    trace_id = "f00ba7" + "0" * 26
+    with open(log_path, "a", encoding="utf-8") as f:
+        for i in range(100_000):
+            ts = T0 + i
+            if i % 100 == 0:
+                rec = {
+                    "level": "INFO", "time": ts, "pid": 1,
+                    "traceId": trace_id, "spanId": f"{i:016x}",
+                    "msg": f"sessionId={SESSION_ID} step {i}",
+                }
+            elif i % 20 == 0:
+                # Sibling trace line — orphan that pass 2 will admit.
+                rec = {
+                    "level": "INFO", "time": ts, "pid": 1,
+                    "traceId": trace_id, "spanId": f"{i:016x}",
+                    "msg": f"deep stack step {i}",
+                }
+            else:
+                rec = {
+                    "level": "INFO", "time": ts, "pid": 1,
+                    "msg": f"unrelated step {i}",
+                }
+            f.write(json.dumps(rec) + "\n")
+    t0 = time.time()
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    elapsed = time.time() - t0
+    assert report.error is None
+    assert elapsed < 6.0, f"two-pass scan took {elapsed:.1f}s on 100k lines"
+    # The cap stays in force.
+    assert len(report.data["correlated_logs"]) <= 5000
+
+
+# ── v1.4.4: end-to-end smoke against a real session ──────────────────────
+
+
+REAL_SESSION_ID = "63d70b29-1a14-4a2b-83c5-9432f9987f40"
+REAL_SESSIONS_DIR = Path("/root/.openclaw/agents/main/sessions")
+REAL_LOG_DIR = Path("/tmp/openclaw")
+REAL_HOME = Path("/root/.openclaw")
+
+
+@pytest.mark.skipif(
+    not (REAL_SESSIONS_DIR / f"{REAL_SESSION_ID}.jsonl").is_file(),
+    reason="real session fixture not present on this host",
+)
+def test_e2e_real_session_smoke():
+    """Smoke: run panorama against the actual session 63d70b29 and assert
+    it produces a Report with the expected sections, no error, and a
+    parsed log_parsed dict (queue/run-duration/etc may be empty depending
+    on what's in today's log — we only check structure).
+    """
+    cfg = REAL_HOME / "config.json"
+    ctx = DiagContext(
+        openclaw_home=REAL_HOME,
+        config_path=cfg if cfg.is_file() else REAL_HOME / "openclaw.json",
+        log_dir=REAL_LOG_DIR,
+        sessions_base=REAL_HOME / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(REAL_HOME)
+    paths_mod.CRON_RUNS_DIR = str(REAL_HOME / "cron" / "runs")
+    report = _run_panorama(ctx, session_id=REAL_SESSION_ID)
+    assert report.error is None, f"unexpected error: {report.error}"
+    section_titles = [s.title for s in report.sections]
+    for required in (
+        "Panorama · Session Overview",
+        "Panorama · Timeline",
+        "Panorama · Model Calls",
+        "Panorama · Tool Execution",
+        "Panorama · Correlated Logs",
+        "Panorama · Health Signals",
+    ):
+        assert required in section_titles, (
+            f"missing section {required}; got {section_titles}"
+        )
+    assert isinstance(report.data.get("log_parsed"), dict)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

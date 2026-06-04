@@ -421,3 +421,192 @@ def filter_log_files(
             lf, graph, strict=strict, max_records=remaining,
         ))
     return out
+
+
+# OTel traceId expansion ────────────────────────────────────────────────────
+#
+# OpenClaw emits OTel ``traceId`` (32-hex) on every gateway log line. Lines
+# that text-mention our sessionId/runId carry it, but ~70% of lines for the
+# same trace (deep-stack provider/plugin/harness logs) do NOT mention the
+# session text — they share only the traceId. To pull those in we run a two-
+# pass scan: first the existing graph-id filter; then a second pass that re-
+# admits any line whose traceId is in the set we harvested from pass 1.
+
+# 32-hex matches OpenTelemetry W3C trace-ids. The all-zero id is OTel's
+# "unset" sentinel — it must never count as a real trace.
+_OTEL_TRACE_RE = re.compile(r'"traceId"\s*:\s*"([0-9a-fA-F]{32})"')
+_OTEL_ALL_ZERO = "0" * 32
+
+
+def _harvest_trace_ids_from_records(
+    records: Iterable[Dict[str, Any]],
+    *,
+    strict: bool,
+) -> Set[str]:
+    """Collect non-zero ``traceId``s from already-correlated records.
+
+    In ``strict`` mode we only trust traceIds that came from a line whose
+    primary correlation match was the sessionId or a runId — because those
+    are the only IDs we believe represent THIS run. (sessionKey can be reused
+    across runs; toolCallId is per-call but rarely substring-unique.)
+    """
+    out: Set[str] = set()
+    for rec in records:
+        tid = rec.get("traceId")
+        if not isinstance(tid, str):
+            continue
+        if len(tid) != 32 or tid == _OTEL_ALL_ZERO:
+            continue
+        if strict:
+            corr = rec.get("correlation") or {}
+            primary = corr.get("primary")
+            if primary is None:
+                continue
+            # Accept only when primary id is the seed sessionId or a runId
+            # discovered via the graph.
+            # Caller passes ``strict_seed_ids``; we read it off the record's
+            # correlation block. Keep API simple: if the primary id is
+            # acceptable, the path will be an empty filter handled below.
+            if not corr.get("_otel_seed_ok"):
+                continue
+        out.add(tid)
+    return out
+
+
+def _scan_file_for_otel_lines(
+    log_file: str,
+    trace_ids: Set[str],
+    already_seen_keys: Set[Tuple[int, str]],
+    graph: CorrelationGraph,
+    *,
+    max_records: Optional[int],
+) -> List[Dict[str, Any]]:
+    """Single linear pass over ``log_file`` returning lines whose ``traceId``
+    is in ``trace_ids`` and which have NOT already been admitted by pass 1.
+
+    Cheapness: we substring-test the line for any trace id before running
+    a regex / JSON parse. Trace ids are 32-hex unique tokens, so a substring
+    hit is overwhelmingly the actual field — we still parse the JSON to
+    confirm and to attach the rich record to the output.
+
+    Dedup uses ``already_seen_keys = {(time_ms, line_hash)}``-ish identity.
+    We keep it as a content-key on the cheap: ``(traceId, spanId, time, ts)``.
+    Anything matching pass 1 will reproduce the same key here and be skipped.
+    """
+    if not trace_ids:
+        return []
+    out: List[Dict[str, Any]] = []
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if max_records is not None and len(out) >= max_records:
+                    break
+                # Cheap substring pre-filter: any trace id present at all?
+                hit_id: Optional[str] = None
+                for tid in trace_ids:
+                    if tid in line:
+                        hit_id = tid
+                        break
+                if hit_id is None:
+                    continue
+                # Confirm via regex on the actual JSON field — keeps us from
+                # admitting lines where a 32-hex appears in free text.
+                m = _OTEL_TRACE_RE.search(line)
+                if not m or m.group(1) != hit_id:
+                    continue
+                try:
+                    rec = json.loads(line.strip())
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                # Skip lines pass 1 already collected (graph-id text hit).
+                seen_key = _record_identity(rec)
+                if seen_key in already_seen_keys:
+                    continue
+                # Skip if the line ALSO mentions any graph id — it would
+                # have been collected by pass 1, just with a different
+                # cap/order. Belt-and-braces.
+                if matched_ids(line, graph.all_ids()):
+                    continue
+                rec = dict(rec)
+                rec["correlation"] = {
+                    "ids": [hit_id],
+                    "primary": hit_id,
+                    "path": f"otel-trace:{hit_id}",
+                    "paths": {hit_id: f"otel-trace:{hit_id}"},
+                }
+                out.append(rec)
+    except OSError:
+        return out
+    return out
+
+
+def _record_identity(rec: Dict[str, Any]) -> Tuple[Any, Any, Any]:
+    """Cheap content-key for dedup between pass 1 and pass 2.
+
+    OpenClaw lines carry ``time`` (ms epoch) plus a unique ``spanId`` —
+    together they form a stable identity. ``traceId`` is included so even
+    spanless lines collide consistently.
+    """
+    return (rec.get("traceId"), rec.get("spanId"), rec.get("time"))
+
+
+def filter_log_files_with_otel(
+    log_files: Iterable[str],
+    graph: CorrelationGraph,
+    *,
+    strict: bool = False,
+    max_records: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Two-pass log correlation: graph-id text match, then OTel-traceId expand.
+
+    Returns ``(records, harvested_trace_ids)``. The records list contains all
+    pass-1 hits followed by pass-2 OTel-only hits, each carrying a
+    ``correlation`` block. Pass-2 entries have ``correlation.path`` shaped as
+    ``otel-trace:<traceId>``.
+
+    ``strict`` mode flows through to pass 1 (sessionId / runId only) AND
+    restricts traceId harvesting: only traceIds observed on a line whose
+    correlation primary is the seed sessionId or a known runId are trusted.
+    Other IDs (sessionKey, toolCallId) can survive a non-session run reuse,
+    so we don't expand from those even when they happen to carry a traceId.
+    """
+    primary = filter_log_files(
+        log_files, graph, strict=strict, max_records=max_records,
+    )
+    # Tag each primary record with whether its primary id is acceptable as
+    # an OTel seed under strict rules. Done here (not in filter_log_file)
+    # so the existing API stays unchanged.
+    seed_ids = {graph.session_id, *graph.run_ids}
+    seed_ids.discard("")
+    for rec in primary:
+        corr = rec.get("correlation") or {}
+        if corr.get("primary") in seed_ids:
+            corr["_otel_seed_ok"] = True
+            rec["correlation"] = corr
+    harvested = _harvest_trace_ids_from_records(primary, strict=strict)
+    if not harvested:
+        # Drop the internal flag before returning to callers.
+        for rec in primary:
+            corr = rec.get("correlation") or {}
+            corr.pop("_otel_seed_ok", None)
+        return primary, []
+    seen = {_record_identity(rec) for rec in primary}
+    extras: List[Dict[str, Any]] = []
+    for lf in log_files:
+        if not os.path.isfile(lf):
+            continue
+        remaining: Optional[int] = None
+        if max_records is not None:
+            remaining = max_records - len(primary) - len(extras)
+            if remaining <= 0:
+                break
+        extras.extend(_scan_file_for_otel_lines(
+            lf, harvested, seen, graph, max_records=remaining,
+        ))
+    # Drop the internal flag before returning to callers.
+    for rec in primary:
+        corr = rec.get("correlation") or {}
+        corr.pop("_otel_seed_ok", None)
+    return primary + extras, sorted(harvested)

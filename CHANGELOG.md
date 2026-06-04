@@ -1,5 +1,106 @@
 # Changelog
 
+## v1.4.4 — lifecycle log mining + cache/lifecycle/timeout fidelity (2026-06-04)
+
+`panorama` now mines the gateway log for the data the trajectory leaves on
+the floor: per-run wall time, queue wait, prompt-cache breakage, context
+overflow, state transitions, and config hot-reloads. Correlation expands
+through OTel `traceId` so deep-stack provider/plugin lines that don't
+text-mention the sessionId are still pulled into the picture. Existing
+flag-based health signals get a human "where it hung" summary instead of
+a camelCase boolean dump.
+
+### Added
+
+- **Prompt cache breakage detection (task A).** `trace.artifacts.data.
+  promptCache.observation` is now fully extracted: when `broke==true`,
+  Session Overview emits a WARN line with the lost-token magnitude
+  (`lost = max(0, previousCacheRead − cacheRead)`) and a
+  `prompt_cache_broke` health signal carries the numbers. When
+  `broke==false` and `cacheRead>0`, an OK "cache hit" line shows up.
+  Older runs without the `observation` block render no cache line.
+  Data keys: `runtime_context.cache_broke`, `cache_read_observed`,
+  `cache_read_previous`, `cache_read_lost`.
+- **Item-lifecycle render + incomplete detection (task B).** Always
+  rendered: `items: started=S completed=C active=A`. The existing
+  `tool_call_leak` signal still fires on `activeCount>0`. New
+  `items_incomplete` signal fires when `startedCount > completedCount`
+  AND `activeCount == 0` — items dropped or errored silently.
+- **Granular timeout/abort classification (task C).** Health signal
+  `trajectory_artifact` gains a `human_summary` array translating the
+  flag combo into messages like "went idle (no progress within idle
+  timeout)", "hung during tool execution", "hung during context
+  compaction", "exceeded turn timeout", "cancelled externally", "aborted
+  (internal)", and "prompt error source: <value>". More-specific flags
+  subsume the bare `timed_out` / `aborted` text. Raw flags stay on the
+  `flags` array for JSON consumers.
+- **OTel traceId correlation (task D).** Log filtering is now two-pass:
+  pass 1 runs the existing graph-id substring match; we then harvest
+  every non-zero 32-hex `traceId` field from those records and a second
+  pass admits any line whose `traceId` is in that set. Pass-2 entries
+  carry `correlation.path = "otel-trace:<traceId>"`. Linear time
+  (single extra scan with a precomputed set), window-bounded by the
+  same `[start − 5s, end + 5s]` filter as pass 1. In `--strict-correlation`
+  mode the harvest only trusts traceIds discovered on a sessionId/runId-
+  seeded line — sessionKey-seeded lines (which can survive run reuse)
+  cannot expand the trace. Harvested ids surface as
+  `report.data["otel_trace_ids"]`.
+- **Lane queue latency / concurrency (task E).** Parses `lane dequeue
+  ... waitMs=N queueSize=N`, `lane enqueue`, `run registered: ...
+  totalActive=N` from correlated logs. Session Overview emits
+  `queue: max wait=Wms, max queueSize=Q, max concurrentRuns=R`. Any
+  single dequeue with `waitMs > 2000` becomes a `queue_wait_slow` WARN
+  signal. Distinguishes queue wait from model/compute latency.
+- **Authoritative run wall time (task F).** Parses
+  `embedded run prompt end: runId=... durationMs=N` from the gateway log
+  and renders `run wall time: <duration> (<N>ms, from gateway log)` in
+  the Model Calls section. Preserved on
+  `runtime_context.log_run_duration_ms`. Coexists with the v1.4.2
+  per-call round-trip duration note.
+- **Context-overflow precheck (task G).** Parses
+  `[context-overflow-precheck] pre-prompt check ... route=<r>
+  estimatedPromptTokens=N`. Renders an Overview line; routes in
+  `{compact, compacting, overflow, overflowing}` add a
+  `context_precheck_overflow` WARN signal.
+- **Session state transitions (task H).** Parses `session state:
+  sessionId=... prev=X new=Y reason="..." queueDepth=N` from correlated
+  logs. Each transition becomes a timeline entry with `source="state"`.
+  Transitions whose `new` is `aborted`/`error`/`errored`/`failed` add a
+  `state_transition_abnormal` WARN signal.
+- **Config hot-reload events (task I).** Parses
+  `config hot reload applied (<keys>)` and
+  `config reload skipped (invalid config): <reason>` from correlated
+  logs. Both go into the timeline as `event_type="config_reload"`.
+  Skipped reloads add a `config_reload_failed` WARN signal carrying
+  the parser's reason string.
+- **`log_parsed` JSON envelope key.** Single dict carrying every parsed
+  log bucket: `queue_events`, `queue_summary`, `run_registered`,
+  `state_transitions`, `run_durations`, `context_prechecks`,
+  `config_reloads`. Parsed once per run, in linear time over the
+  already-correlated, window-bounded log.
+
+### Changed
+
+- All log-derived signals from the new parsers compose with the existing
+  v1.4.3 window bound (`[start − 5s, end + 5s]`) automatically — they run
+  on the post-window list. Strict mode flows through to OTel expansion
+  (sessionId/runId-seeded only). Mask handling is unchanged: tool args
+  / results still respect `--mask`; correlated log content is preserved
+  as-is, consistent with v1.4.3.
+
+### Verified
+
+- `python3 -m pytest tests/` — 70 passed (was 48 in v1.4.3; 22 new tests
+  cover tasks A–J plus the perf and e2e cases).
+- 100k-line synthetic log perf test (`test_perf_100k_lines_with_otel_under_6s`)
+  completes in ~0.4s — the two-pass scan is single-pass-equivalent thanks
+  to the harvested-id set lookup.
+- End-to-end smoke against real session
+  `63d70b29-1a14-4a2b-83c5-9432f9987f40` (clean run) and the longer
+  `7d31725b-da60-4dd6-ac33-bfec21222f46` (cache breaks + queue waits)
+  produces all 7 sections, no error, and renders cache/queue/precheck/
+  state lines as expected.
+
 ## v1.4.3 — panorama section consolidation + honest truncation (2026-06-04)
 
 `panorama` is restructured from 10 sections to a tighter 7-section layout.

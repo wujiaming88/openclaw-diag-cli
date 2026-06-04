@@ -53,9 +53,19 @@ No whitelist/blacklist. No subjective value judgment. Correlation IS the proof o
 
 Log entries with NO correlation key are always excluded — relevance must be provable via the correlation graph, never inferred from a time window alone.
 
+### OTel traceId expansion (v1.4.4)
+
+OpenClaw emits an OTel `traceId` (32-hex W3C) on every gateway log line. Lines that text-mention our sessionId or a runId carry the same traceId as deep-stack provider/plugin/harness lines that don't mention any session text. v1.4.4 runs a second pass:
+
+1. **Pass 1**: existing graph-id substring filter.
+2. **Harvest**: collect every non-zero `traceId` that appears on a pass-1 record.
+3. **Pass 2**: re-scan log files; admit any line whose `traceId` is in the harvested set, ignoring lines already admitted by pass 1.
+
+Pass-2 entries carry `correlation.path = "otel-trace:<traceId>"`. The harvested ids are emitted on the JSON envelope as `otel_trace_ids`. The two-pass scan is window-bounded (same `[start − 5s, end + 5s]` filter) and runs in linear time — verified at 100k lines under 6s.
+
 ### Strict mode (`--strict-correlation`)
 
-Only include entries matching `sessionId` or `runIds`. Exclude sessionKey-only and toolCallId-only matches.
+Only include entries matching `sessionId` or `runIds`. Exclude sessionKey-only and toolCallId-only matches. **In strict mode, OTel traceId expansion is also gated**: only traceIds discovered on a sessionId/runId-seeded line are trusted; sessionKey-seeded lines (which can survive run reuse) cannot expand the trace.
 
 ## Output Structure (JSON envelope)
 
@@ -96,6 +106,16 @@ and `delivery` data keys were removed (their content lives under
 - Model, provider, total tokens, cost
 - Channel, origin
 - Activity / token / child-task summary stats
+- **v1.4.4 prompt cache observation** (when `trace.artifacts.promptCache.observation` is present):
+  - `broke==true` → WARN line "cache broke: lost ~N cached tokens (prev cacheRead M → N)" with `lost = max(0, prev−cur)`
+  - `broke==false` and `cacheRead>0` → OK "cache hit: cacheRead=N"
+  - missing observation → no line
+  Data keys on `runtime_context`: `cache_broke`, `cache_read_observed`, `cache_read_previous`, `cache_read_lost`.
+- **v1.4.4 itemLifecycle** — always rendered when any count is non-zero:
+  `items: started=S completed=C active=A`
+- **v1.4.4 queue/concurrency** (parsed from app log) — one line:
+  `queue: max wait=Wms, max queueSize=Q, max concurrentRuns=R`
+- **v1.4.4 context precheck** (parsed from app log) — `context precheck: route=<r> estPromptTokens=N`; WARN when route is `compact`/`overflow`.
 - **Runtime context fields (folded in v1.4.3):**
   - harness version + node runtime
   - plugins activated + plugin load errors (errors as WARN)
@@ -108,10 +128,16 @@ and `delivery` data keys were removed (their content lives under
 ### 2. timeline (incl. delivery)
 - Unified chronological timeline merging ALL correlated events
 - Each entry: `{ts_ms, ts_local, source, event_type, summary, correlation?}`
-- Sources: `session.jsonl`, `trajectory.jsonl`, `app_log`, `delivery`
+- Sources: `session.jsonl`, `trajectory.jsonl`, `app_log`, `delivery`,
+  `state` (v1.4.4 — parsed `session state` log lines), `config`
+  (v1.4.4 — parsed `config hot reload` log lines)
 - **Delivery events (folded in v1.4.3):** cron run records and
   messaging-tool sends are emitted with `source="delivery"` /
   `event_type="delivery"`
+- **v1.4.4 state transitions:** `event_type="state"` entries with
+  `state: prev → new reason="..." qd=N`
+- **v1.4.4 config reloads:** `event_type="config_reload"`. Applied reloads
+  list affected keys; skipped reloads carry the parser's reason
 - Truncation honesty: when the cap drops events, `dropped_middle` and
   `truncated:true` are reported on the JSON envelope and surfaced as a WARN
   line in the section
@@ -126,6 +152,9 @@ and `delivery` data keys were removed (their content lives under
 - Note line: durations are round-trip wall-clock (last input msg →
   assistant msg), NOT pure model API latency — the trajectory has no
   native durationMs/TTFT
+- **v1.4.4 authoritative run wall time** (from gateway log
+  `embedded run prompt end ... durationMs=N`): a `run wall time: <duration>
+  (<N>ms, from gateway log)` line. Stored on `runtime_context.log_run_duration_ms`.
 - Per-model breakdown (avg_output, avg_duration, stop reasons)
 - **Model-call errors:** when trace.artifacts show `aborted`,
   `externalAbort`, `timedOut`, `idleTimedOut`,
@@ -154,14 +183,23 @@ and `delivery` data keys were removed (their content lives under
 - Per child: task_id, runtime, agent_id, status, duration, error
 
 ### 7. health_signals (incl. model decisions)
-- trace.artifacts: aborted, externalAbort, timedOut, idleTimedOut,
-  timedOutDuringCompaction, timedOutDuringToolExecution
-- itemLifecycle leak (active > 0 at run end)
-- last_tool_error
-- log_stall (long-running / stalled session log markers)
-- gateway_pid_change (multiple gateway PIDs in the correlated logs)
-- long_tool_call (any tool > 60s)
-- child_task_failed
+- `trajectory_artifact` — abort/timeout flags. v1.4.4 attaches a
+  `human_summary` array translating the flag combo into messages like
+  "went idle", "hung during tool execution", "hung during context
+  compaction", "exceeded turn timeout", "cancelled externally", "aborted
+  (internal)". Specific flags subsume the bare `timed_out` / `aborted`
+  messages so the same event is reported once. Raw flag list still on
+  `flags`.
+- `tool_call_leak` — `itemLifecycle.activeCount > 0` at run end
+- `items_incomplete` (v1.4.4) — `startedCount > completedCount` and
+  `activeCount == 0`: items dropped or errored silently
+- `prompt_cache_broke` (v1.4.4) — `promptCache.observation.broke == true`;
+  carries `cache_read`, `previous_cache_read`, `lost_tokens`
+- `last_tool_error`
+- `log_stall` (long-running / stalled session log markers)
+- `gateway_pid_change` (multiple gateway PIDs in the correlated logs)
+- `long_tool_call` (any tool > 60s)
+- `child_task_failed`
 - **cron_delivery_failed (folded in v1.4.3):** failed cron deliveries
   (`deliveryStatus` ∈ failed/error/errored/undelivered) influence verdict
   via this signal, not via a separate Delivery section
@@ -169,14 +207,34 @@ and `delivery` data keys were removed (their content lives under
   `model_fallback_decision`, `harness_select`, `context_overflow`, or
   `compaction_triggered`. The trajectory `model_select` entries were
   dropped because the model identity is already in Session Overview.
+- **v1.4.4 log-derived signals** (parsed from correlated, window-bounded logs):
+  - `queue_wait_slow` — any single dequeue with `waitMs > 2000`
+  - `context_precheck_overflow` — precheck route in `{compact, compacting,
+    overflow, overflowing}`
+  - `state_transition_abnormal` — `session state` line whose `new` is
+    `aborted`/`error`/`errored`/`failed`
+  - `config_reload_failed` — `config reload skipped (invalid config): ...`
 
 ## Verdict Logic
 
 | Condition | Verdict |
 |---|---|
 | trace.artifacts shows abort/timeout OR child task failed OR ERROR-level correlated log OR cron delivery failure OR model-call error | **fail** |
-| WARN-level correlated log OR log-marker decision (fallback/overflow/compaction) OR stall detected OR E2E > 5min OR plugin load error OR bootstrap truncation | **warn** |
+| WARN-level correlated log OR log-marker decision (fallback/overflow/compaction) OR stall detected OR E2E > 5min OR plugin load error OR bootstrap truncation OR (v1.4.4) prompt cache broke / items incomplete / queue wait > 2s / context precheck overflow / abnormal state transition / config reload failed | **warn** |
 | All clean | **ok** |
+
+## v1.4.4 JSON envelope additions
+
+- `runtime_context[i]`: `cache_broke`, `cache_read_observed`,
+  `cache_read_previous`, `cache_read_lost`, `log_run_duration_ms`
+- `log_parsed`: `{queue_events[], queue_summary, run_registered[],
+  state_transitions[], run_durations[], context_prechecks[],
+  config_reloads[]}` — parsed once from correlated, window-bounded logs
+- `otel_trace_ids`: list of OTel traceIds harvested for second-pass
+  expansion
+- `health_signals[]` gains kinds: `prompt_cache_broke`, `items_incomplete`,
+  `queue_wait_slow`, `context_precheck_overflow`,
+  `state_transition_abnormal`, `config_reload_failed`
 
 ## Multi-run handling (persistent sessions)
 

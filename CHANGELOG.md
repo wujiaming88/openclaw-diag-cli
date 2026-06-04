@@ -1,5 +1,74 @@
 # Changelog
 
+## v1.4.5 — surface hidden failed attempts behind a recovered runId (2026-06-04)
+
+A single `runId` can carry MULTIPLE attempt-cycles when the run retries
+internally — each cycle is a full event sequence (`session.started` →
+`trace.metadata` → `context.compiled` → `prompt.submitted` →
+`model.completed` → `trace.artifacts` → `session.ended`) with `seq`
+resetting to 1 each cycle, all sharing the same `runId`. Before v1.4.5
+the trajectory grouper overwrote `run["artifacts"]` on each occurrence,
+keeping only the LAST cycle. So a failed attempt-1 (e.g. a 5-minute idle
+timeout) followed by a successful attempt-2 retry rendered as a clean
+"success" — the failure was completely erased. Of 120 recently
+inspected sessions, 13 carried multi-artifact-per-runId and 12 of those
+hid an early failed attempt behind the eventual success (~10%). This
+also defeated the v1.4.4 timeout classification: a real attempt-1
+timeout never surfaced if attempt-2 succeeded.
+
+### Added
+
+- **Multi-attempt grouping.** `_group_trajectory_runs` now collects
+  every attempt-cycle of a runId into `run["attempts"]`. A new attempt
+  is signaled by a repeated `session.started` for the same runId (or,
+  defensively, by a `seq` reset when no cycle is open). The top-level
+  `run["artifacts"]`, `session_started`, and `trace_metadata` keys
+  still point at the LAST cycle, preserving every consumer that reads
+  them. Per-attempt entries carry `index`, `started_ms`, `ended_ms`,
+  `duration_ms`, `final_status`, `failure_flags[]`,
+  `prompt_error_source`, and a `failed` boolean. `run["attempt_count"]`
+  and `run["had_failed_attempt"]` aggregate over the list. An attempt
+  that produces no `trace.artifacts` is flagged `failed=true` with
+  `failure_flags=["noArtifacts"]` (the run died mid-flight).
+- **`retried_after_failure` health signal.** Fires per multi-attempt
+  run when any earlier attempt failed. WARN-level when the final
+  attempt succeeded (the run recovered), FAIL-level when the final
+  attempt also failed. The signal carries `attempt_count`,
+  `failed_count`, `final_status`, `final_failed`, and a `per_attempt[]`
+  list of human reasons per cycle. The classification reuses the v1.4.4
+  vocabulary — `idleTimedOut`→"went idle (no progress within idle
+  timeout)", `timedOutDuringToolExecution`→"hung during tool
+  execution", etc. Verdict degrades to WARN when the run recovered;
+  stays FAIL when the final attempt also failed (the existing
+  `trajectory_artifact` signal handles that case independently).
+- **Session Overview "attempts" line.** When any selected run has
+  `attempt_count > 1`, Overview adds a one-line summary
+  `attempts: N (M failed, final=<status>) [run <rid8>]` per such run
+  (WARN when any attempt failed, OK otherwise) so the hidden retry is
+  visible without scrolling to Health Signals.
+- **`report.data["run_attempts"]`.** Per-run attempt details for JSON
+  consumers — list of
+  `{runId, attempt_count, had_failed_attempt, attempts[]}` so
+  downstream tools can do their own per-attempt analysis.
+
+### Verified
+
+- All 70 prior tests stay green; 6 new tests added (5 unit + 1 e2e
+  against the real e37602da session that exhibits the bug, +1 e2e
+  against single-cycle 63d70b29 confirming no regression). 75 tests
+  collected total (the e37602da/63d70b29 e2e tests skip if the real
+  fixtures aren't on the host).
+- End-to-end against session `e37602da-ce25-45c6-97d9-2cffa237d1ba` with
+  `--all-runs`: TWO previously-hidden retries surface — runId 7b06f3d9
+  (#1 went idle 5.1m → #2 success 52s) and runId 2e4f50df (#1 went idle
+  20.3m → #2 success 5.9m). Both rendered as `retried_after_failure`
+  WARN signals carrying the classified per-attempt chain.
+- Single-cycle 63d70b29 confirmed clean: no `attempts` line, no
+  `retried_after_failure` signal.
+- Perf: 100k-line correlation scan stays linear — 0.35s and 0.44s on
+  the two perf tests (well under their 5s/6s caps). The grouper change
+  is also linear in the number of trajectory events.
+
 ## v1.4.4 — lifecycle log mining + cache/lifecycle/timeout fidelity (2026-06-04)
 
 `panorama` now mines the gateway log for the data the trajectory leaves on

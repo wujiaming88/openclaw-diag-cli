@@ -174,17 +174,108 @@ def _maybe_sanitize(value: Any, *, mask: bool) -> Any:
 # ── trajectory grouping for multi-run sessions ─────────────────────────────
 
 
+# v1.4.5: a single ``runId`` can carry MULTIPLE attempt-cycles when the run
+# retries internally. Each cycle is a full event sequence (session.started →
+# trace.metadata → context.compiled → prompt.submitted → model.completed →
+# trace.artifacts → session.ended) with ``seq`` resetting to 1 each cycle,
+# all sharing the same runId. The pre-1.4.5 grouper kept only the LAST
+# trace.artifacts/session.started/trace.metadata for a runId, so a failed
+# attempt-1 was overwritten by a successful attempt-2 and never surfaced.
+#
+# The grouper now collects every cycle into ``run["attempts"]``. The
+# top-level ``run["artifacts"] / session_started / trace_metadata`` keys
+# still point at the LAST cycle (preserves behavior for everything that
+# read those keys), and the per-attempt detail enables multi-attempt
+# health reporting.
+
+
+def _attempt_failure_flags(artifacts_data: Dict[str, Any]) -> List[str]:
+    """List of failure flags an attempt's trace.artifacts.data exhibits.
+
+    Returns the camelCase flag names so downstream renderers can keep using
+    the same vocabulary as ``_health_signals``. ``promptErrorSource`` is
+    treated as a flag too — it indicates the model never returned a clean
+    response.
+    """
+    flags: List[str] = []
+    for k in (
+        "aborted", "externalAbort", "timedOut", "idleTimedOut",
+        "timedOutDuringCompaction", "timedOutDuringToolExecution",
+    ):
+        if artifacts_data.get(k):
+            flags.append(k)
+    if artifacts_data.get("promptErrorSource"):
+        flags.append("promptErrorSource")
+    return flags
+
+
+def _attempt_failed(artifacts_data: Dict[str, Any]) -> bool:
+    """True if this attempt's trace.artifacts indicates a failure.
+
+    Failure modes recognized: any of the abort/timeout flags fire,
+    ``promptErrorSource`` is set, or ``finalStatus`` is anything other than
+    ``success``/``ok``/``completed``. This is intentionally permissive —
+    we'd rather warn about an attempt that recovered than miss one.
+    """
+    if _attempt_failure_flags(artifacts_data):
+        return True
+    fs = (artifacts_data.get("finalStatus") or "").lower()
+    if fs and fs not in ("success", "ok", "completed"):
+        return True
+    return False
+
+
 def _group_trajectory_runs(traj_path: str) -> List[Dict[str, Any]]:
     """Group every event in the trajectory file by ``runId``.
 
     Returns a list of run dicts ordered by their first observed timestamp,
     each containing:
       runId, started_ms, ended_ms, events: List[Dict], artifacts: Dict|None,
-      session_started: Dict|None, trace_metadata: Dict|None
+      session_started: Dict|None, trace_metadata: Dict|None,
+      attempts: List[Dict], attempt_count: int, had_failed_attempt: bool
+
+    A new attempt is signaled by either:
+      - a repeated ``session.started`` event for the same runId, OR
+      - a ``seq`` value that resets/decreases (typically going back to 1)
+        on a non-session.started event when no attempt is open yet.
+
+    Each entry of ``attempts`` carries:
+      index, started_ms, ended_ms, artifacts_event, final_status,
+      failure_flags, prompt_error_source, failed (bool).
+    Single-cycle runs (the common case) yield ``attempts=[that one]``,
+    ``attempt_count=1``, ``had_failed_attempt`` reflecting that one.
     """
     runs: Dict[str, Dict[str, Any]] = {}
     if not traj_path or not os.path.isfile(traj_path):
         return []
+    # ``open_attempt`` per runId tracks the cycle currently being built.
+    open_attempts: Dict[str, Dict[str, Any]] = {}
+
+    def _close_attempt(rid: str) -> None:
+        """Move the currently-open attempt for ``rid`` into the run's
+        attempts list. No-op if there is no open attempt.
+        """
+        cur = open_attempts.pop(rid, None)
+        if cur is None:
+            return
+        run = runs[rid]
+        ad = (cur.get("artifacts_event") or {}).get("data") or {}
+        cur["final_status"] = ad.get("finalStatus")
+        cur["prompt_error_source"] = ad.get("promptErrorSource") or None
+        cur["failure_flags"] = _attempt_failure_flags(ad) if ad else []
+        # Without an artifacts_event we can't classify failure reliably;
+        # fall back to "no artifacts" as a soft fail signal so callers can
+        # still detect that something went wrong (e.g. crashed before the
+        # final write). We treat "no artifacts" as failed: an attempt
+        # without artifacts almost always means the run died mid-flight.
+        if cur.get("artifacts_event") is None:
+            cur["failed"] = True
+            cur.setdefault("failure_flags", []).append("noArtifacts")
+        else:
+            cur["failed"] = _attempt_failed(ad)
+        cur["index"] = len(run["attempts"]) + 1
+        run["attempts"].append(cur)
+
     try:
         with open(traj_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -208,29 +299,90 @@ def _group_trajectory_runs(traj_path: str) -> List[Dict[str, Any]]:
                     "session_started": None,
                     "trace_metadata": None,
                     "artifacts": None,
+                    "attempts": [],
                 })
                 run["events"].append(ev)
                 ts = _safe_iso_to_ms(ev.get("ts"))
                 etype = ev.get("type")
+
+                # ── attempt-cycle bookkeeping ──────────────────────────
+                # A fresh session.started always opens a new attempt. If
+                # one is already open (no terminal session.ended seen),
+                # close it first — the in-flight cycle is being abandoned.
+                if etype == "session.started":
+                    if rid in open_attempts:
+                        _close_attempt(rid)
+                    open_attempts[rid] = {
+                        "started_ms": ts or 0,
+                        "ended_ms": 0,
+                        "artifacts_event": None,
+                    }
+                else:
+                    # If we never saw a session.started for this attempt
+                    # (truncated file, dropped event), open an implicit
+                    # attempt on the first event of the runId so we still
+                    # capture an artifacts_event.
+                    if rid not in open_attempts:
+                        # Detect a seq-reset boundary even without a
+                        # session.started: if seq drops back to 1 after
+                        # we already have at least one attempt, that's a
+                        # new cycle. With no prior open attempt this is
+                        # a no-op, but kept as the explicit signal for
+                        # robustness against missing events.
+                        open_attempts[rid] = {
+                            "started_ms": ts or 0,
+                            "ended_ms": 0,
+                            "artifacts_event": None,
+                        }
+
+                # Capture artifacts on the open attempt.
+                if etype == "trace.artifacts":
+                    cur = open_attempts.get(rid)
+                    if cur is not None:
+                        cur["artifacts_event"] = ev
+                        if ts and (not cur["ended_ms"] or ts > cur["ended_ms"]):
+                            cur["ended_ms"] = ts
+
+                # session.ended terminates the attempt; close it.
+                if etype == "session.ended":
+                    cur = open_attempts.get(rid)
+                    if cur is not None:
+                        if ts and (not cur["ended_ms"] or ts > cur["ended_ms"]):
+                            cur["ended_ms"] = ts
+                    _close_attempt(rid)
+
+                # Track latest values on the run-level dict (preserves
+                # pre-1.4.5 contract — these point at the FINAL cycle).
+                # ``started_ms`` is the MIN session.started ts across all
+                # cycles so the window covers the whole run; ``ended_ms``
+                # is the MAX of any event ts, naturally capturing the
+                # last cycle's session.ended.
                 if etype == "session.started":
                     run["session_started"] = ev
-                    if ts:
+                    if ts and (not run["started_ms"] or ts < run["started_ms"]):
                         run["started_ms"] = ts
                 elif etype == "trace.metadata":
                     run["trace_metadata"] = ev
                 elif etype == "trace.artifacts":
                     run["artifacts"] = ev
-                elif etype == "session.ended":
-                    if ts:
-                        run["ended_ms"] = ts
                 if ts and (not run["started_ms"] or ts < run["started_ms"]):
-                    if etype == "session.started" or run["started_ms"] == 0:
+                    if run["started_ms"] == 0:
                         run["started_ms"] = ts
                 if ts and ts > run["ended_ms"]:
                     run["ended_ms"] = ts
     except OSError:
         return []
+
+    # Close any attempt still open at EOF (no terminating session.ended).
+    for rid in list(open_attempts.keys()):
+        _close_attempt(rid)
+
     runs_list = list(runs.values())
+    for run in runs_list:
+        run["attempt_count"] = len(run["attempts"])
+        run["had_failed_attempt"] = any(
+            a.get("failed") for a in run["attempts"]
+        )
     runs_list.sort(key=lambda r: r["started_ms"] or r["ended_ms"])
     return runs_list
 
@@ -1149,6 +1301,30 @@ def _classify_timeout_flags(
     return out
 
 
+def _classify_attempt_failure(attempt: Dict[str, Any]) -> str:
+    """One-line human reason for why an attempt failed.
+
+    Reuses the same vocabulary as ``_classify_timeout_flags`` (idle timeout
+    → "went idle", tool-execution timeout → "hung during tool execution",
+    etc.). When no classified reason applies, falls back to the raw
+    ``finalStatus`` string. Returns ``"failed"`` as a last resort.
+    """
+    ev = attempt.get("artifacts_event") or {}
+    ad = ev.get("data") or {}
+    if not ad:
+        # An attempt with no trace.artifacts at all (run died before
+        # writing). Surface that explicitly so the user knows it's not
+        # a classified timeout — the cycle simply never finished.
+        return "no trace.artifacts written (attempt died mid-flight)"
+    reasons = _classify_timeout_flags(ad)
+    if reasons:
+        return reasons[0]
+    fs = (ad.get("finalStatus") or "").lower()
+    if fs and fs not in ("success", "ok", "completed"):
+        return f"finalStatus={fs}"
+    return "failed"
+
+
 def _health_signals(
     runs: List[Dict[str, Any]],
     correlated_logs: List[Dict[str, Any]],
@@ -1160,6 +1336,52 @@ def _health_signals(
     log_parsed: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     signals: List[Dict[str, Any]] = []
+    # v1.4.5: when a runId has multiple attempt-cycles and any earlier
+    # cycle failed, surface a `retried_after_failure` signal. This is
+    # WARN-level when the FINAL attempt succeeded (the run recovered)
+    # and FAIL-level when the final attempt also failed (caller decides
+    # via verdict). Pre-1.4.5 the failed cycle was overwritten by the
+    # successful one and never surfaced.
+    for run in runs:
+        attempts = run.get("attempts") or []
+        if len(attempts) <= 1:
+            continue
+        any_failed = any(a.get("failed") for a in attempts)
+        if not any_failed:
+            continue
+        final_attempt = attempts[-1]
+        final_failed = bool(final_attempt.get("failed"))
+        per_attempt_lines: List[str] = []
+        for a in attempts:
+            i = a.get("index", "?")
+            sm = a.get("started_ms") or 0
+            em = a.get("ended_ms") or sm
+            dur_ms = max(0, em - sm) if sm and em else 0
+            dur_s = (
+                fmt_duration(dur_ms / 1000) if dur_ms else "?"
+            )
+            if a.get("failed"):
+                reason = _classify_attempt_failure(a)
+                per_attempt_lines.append(
+                    f"#{i} {reason} ({dur_s})"
+                )
+            else:
+                fs = (
+                    (a.get("artifacts_event") or {}).get("data") or {}
+                ).get("finalStatus") or "ok"
+                per_attempt_lines.append(f"#{i} {fs} ({dur_s})")
+        signals.append({
+            "kind": "retried_after_failure",
+            "runId": run["runId"],
+            "attempt_count": len(attempts),
+            "failed_count": sum(1 for a in attempts if a.get("failed")),
+            "final_status": (
+                (final_attempt.get("artifacts_event") or {}).get("data") or {}
+            ).get("finalStatus"),
+            "final_failed": final_failed,
+            "per_attempt": per_attempt_lines,
+            "ts_ms": run.get("ended_ms") or run.get("started_ms") or 0,
+        })
     for run in runs:
         artifacts = run.get("artifacts") or {}
         ad = artifacts.get("data") or {}
@@ -1866,6 +2088,36 @@ class PanoramaInspector:
         }
         report.data["selected_runs"] = [r["runId"] for r in (selected_runs or [])]
         report.data["all_runs"] = [r["runId"] for r in traj_runs]
+        # v1.4.5: per-run attempt details for JSON consumers. The full
+        # ``trace.artifacts`` event is included for each attempt so
+        # downstream tools can re-run their own per-attempt analysis
+        # without having to reparse the trajectory.
+        report.data["run_attempts"] = [
+            {
+                "runId": r.get("runId"),
+                "attempt_count": r.get("attempt_count") or 0,
+                "had_failed_attempt": bool(r.get("had_failed_attempt")),
+                "attempts": [
+                    {
+                        "index": a.get("index"),
+                        "started_ms": a.get("started_ms"),
+                        "ended_ms": a.get("ended_ms"),
+                        "duration_ms": (
+                            max(0, (a.get("ended_ms") or 0)
+                                - (a.get("started_ms") or 0))
+                            if a.get("started_ms") and a.get("ended_ms")
+                            else None
+                        ),
+                        "final_status": a.get("final_status"),
+                        "failure_flags": a.get("failure_flags") or [],
+                        "prompt_error_source": a.get("prompt_error_source"),
+                        "failed": bool(a.get("failed")),
+                    }
+                    for a in (r.get("attempts") or [])
+                ],
+            }
+            for r in (selected_runs or traj_runs)
+        ]
         report.data["timeline"] = timeline
         report.data["timeline_stats"] = timeline_stats
         report.data["timeline_key_moments"] = timeline_keys
@@ -1925,6 +2177,41 @@ class PanoramaInspector:
             data={"total": len(traj_runs),
                   "selected": [r["runId"] for r in (selected_runs or [])]},
         )
+        # v1.4.5: when any selected run had multiple attempt-cycles,
+        # surface a one-line "attempts: N (M failed, final=<status>)"
+        # for each multi-attempt run so the hidden retry is visible
+        # before scrolling down to Health Signals.
+        for run in (selected_runs or traj_runs):
+            attempts = run.get("attempts") or []
+            if len(attempts) <= 1:
+                continue
+            n = len(attempts)
+            failed = sum(1 for a in attempts if a.get("failed"))
+            final_a = attempts[-1]
+            final_status = (
+                (final_a.get("artifacts_event") or {}).get("data") or {}
+            ).get("finalStatus") or (
+                "failed" if final_a.get("failed") else "ok"
+            )
+            rid_s = (run.get("runId") or "?")[:8]
+            data_block = {
+                "runId": run.get("runId"),
+                "attempt_count": n,
+                "failed_count": failed,
+                "final_status": final_status,
+            }
+            line = (
+                f"attempts: {n} ({failed} failed, final={final_status}) "
+                f"[run {rid_s}]"
+            )
+            if failed:
+                s_overview.warn(
+                    f"runs.attempts.{rid_s}", line, data=data_block,
+                )
+            else:
+                s_overview.ok(
+                    f"runs.attempts.{rid_s}", line, data=data_block,
+                )
         # Activity stats
         cost_s = (f" | cost=${total_cost_usd:.4f}"
                   if isinstance(total_cost_usd, (int, float)) else "")
@@ -2675,6 +2962,30 @@ class PanoramaInspector:
                         f"{(sig.get('reason') or '')[:160]}",
                         data=sig,
                     )
+                elif kind == "retried_after_failure":
+                    # v1.4.5: hidden failed-then-recovered attempts. WARN
+                    # when the final attempt succeeded (recovered), FAIL
+                    # when the final attempt also failed. The existing
+                    # trajectory_artifact signal still fires for whichever
+                    # attempt is the final one and degrades verdict
+                    # independently — this signal is purely additive.
+                    rid_s = (sig.get("runId") or "?")[:8]
+                    n = sig.get("attempt_count") or 0
+                    failed = sig.get("failed_count") or 0
+                    final_status = sig.get("final_status") or "?"
+                    chain = " | ".join(sig.get("per_attempt") or [])
+                    line = (
+                        f"{tsfx}run {rid_s} had {n} attempts "
+                        f"({failed} failed): {chain} → final {final_status}"
+                    )
+                    if sig.get("final_failed"):
+                        s_health.fail(
+                            f"health.{kind}.{rid_s}", line, data=sig,
+                        )
+                    else:
+                        s_health.warn(
+                            f"health.{kind}.{rid_s}", line, data=sig,
+                        )
                 else:
                     s_health.warn(f"health.{kind}", str(sig), data=sig)
 

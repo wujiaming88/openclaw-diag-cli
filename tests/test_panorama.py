@@ -1877,5 +1877,335 @@ def test_e2e_real_session_smoke():
     assert isinstance(report.data.get("log_parsed"), dict)
 
 
+# ── v1.4.5: multi-attempt-per-runId handling ─────────────────────────────
+
+
+def _build_attempt_cycle(
+    *, sid: str, run_id: str, started_ms: int, ended_ms: int,
+    artifacts_overrides: Dict[str, Any], final_status: str = "success",
+) -> List[Dict[str, Any]]:
+    """One full attempt cycle (session.started → ... → session.ended) with
+    a configurable trace.artifacts payload. seq counters reset to 1 per
+    cycle, mirroring the real trajectory shape."""
+    base = {
+        "schemaVersion": 1, "traceSchema": "openclaw-trajectory",
+        "runId": run_id, "sessionId": sid, "sessionKey": SESSION_KEY,
+        "provider": "test", "modelId": "test-model",
+    }
+    artifacts_data = {
+        "finalStatus": final_status,
+        "aborted": False, "externalAbort": False,
+        "timedOut": False, "idleTimedOut": False,
+        "timedOutDuringCompaction": False,
+        "timedOutDuringToolExecution": False,
+        "promptErrorSource": None,
+        "usage": {"input": 0, "output": 0,
+                  "cacheRead": 0, "cacheWrite": 0, "total": 0},
+    }
+    artifacts_data.update(artifacts_overrides)
+    return [
+        {**base, "type": "session.started", "ts": _ms_to_iso(started_ms),
+         "seq": 1,
+         "data": {"trigger": "user", "agentId": "main",
+                  "messageChannel": "feishu"}},
+        {**base, "type": "trace.metadata",
+         "ts": _ms_to_iso(started_ms + 1), "seq": 2, "data": {}},
+        {**base, "type": "context.compiled",
+         "ts": _ms_to_iso(started_ms + 2), "seq": 3,
+         "data": {"messages": [], "tools": []}},
+        {**base, "type": "prompt.submitted",
+         "ts": _ms_to_iso(started_ms + 3), "seq": 4, "data": {}},
+        {**base, "type": "model.completed",
+         "ts": _ms_to_iso(ended_ms - 200), "seq": 5, "data": {}},
+        {**base, "type": "trace.artifacts",
+         "ts": _ms_to_iso(ended_ms - 100), "seq": 6,
+         "data": artifacts_data},
+        {**base, "type": "session.ended",
+         "ts": _ms_to_iso(ended_ms), "seq": 7,
+         "data": {"status": final_status}},
+    ]
+
+
+def test_multi_attempt_failed_then_success_surfaces_hidden_failure(
+        tmp_path: Path):
+    """v1.4.5: mirror the real e37602da pattern. One runId, two cycles:
+    attempt #1 idle-times out, attempt #2 succeeds. The pre-1.4.5 grouper
+    overwrote attempt #1 with #2 → the failure was invisible. We now
+    surface a retried_after_failure WARN signal carrying the classified
+    reason for #1.
+    """
+    sid = "abcdef00-1111-2222-3333-444444444aaa"
+    rid = "abcdef00-aaaa-bbbb-cccc-dddddddddddd"
+    home = tmp_path / "home"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_minimal_session_jsonl(main_sd, sid)
+
+    # Attempt #1: 5 minutes, idle-timed-out + aborted + promptErrorSource.
+    cycle1 = _build_attempt_cycle(
+        sid=sid, run_id=rid, started_ms=T0, ended_ms=T0 + 5 * 60 * 1000,
+        final_status="error",
+        artifacts_overrides={
+            "aborted": True, "timedOut": True, "idleTimedOut": True,
+            "promptErrorSource": "prompt", "finalStatus": "error",
+        },
+    )
+    # Attempt #2: 52 seconds, success.
+    cycle2_start = T0 + 5 * 60 * 1000 + 100
+    cycle2 = _build_attempt_cycle(
+        sid=sid, run_id=rid, started_ms=cycle2_start,
+        ended_ms=cycle2_start + 52 * 1000,
+        artifacts_overrides={"finalStatus": "success"},
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", cycle1 + cycle2)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+
+    # The runId still groups into ONE run; attempt_count reveals the truth.
+    selected_runs = report.data["selected_runs"]
+    assert selected_runs == [rid]
+    run_attempts = report.data["run_attempts"]
+    assert len(run_attempts) == 1
+    rd = run_attempts[0]
+    assert rd["attempt_count"] == 2
+    assert rd["had_failed_attempt"] is True
+    a1, a2 = rd["attempts"]
+    # Per-attempt accuracy
+    assert a1["index"] == 1 and a2["index"] == 2
+    assert a1["failed"] is True and a2["failed"] is False
+    assert a1["final_status"] == "error"
+    assert a2["final_status"] == "success"
+    assert a1["prompt_error_source"] == "prompt"
+    assert "idleTimedOut" in (a1["failure_flags"] or [])
+    assert "promptErrorSource" in (a1["failure_flags"] or [])
+    # Per-attempt durations match what we wrote
+    assert a1["duration_ms"] == 5 * 60 * 1000
+    assert a2["duration_ms"] == 52 * 1000
+
+    # Health Signals: a retried_after_failure entry must list cycle 1 as
+    # idle and final as success.
+    sigs = report.data["health_signals"]
+    retry_sigs = [s for s in sigs if s.get("kind") == "retried_after_failure"]
+    assert len(retry_sigs) == 1
+    rs = retry_sigs[0]
+    assert rs["attempt_count"] == 2
+    assert rs["failed_count"] == 1
+    assert rs["final_status"] == "success"
+    assert rs["final_failed"] is False
+    chain = " | ".join(rs["per_attempt"])
+    assert "went idle" in chain
+    assert "success" in chain
+
+    # Verdict: WARN (recovered), not FAIL.
+    assert report.verdict == Verdict.WARN
+
+    # Session Overview must show the attempts line.
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    assert any(
+        "attempts: 2" in c.message and "1 failed" in c.message
+        and "final=success" in c.message
+        for c in overview.checks
+    )
+
+
+def test_multi_attempt_both_failed_keeps_fail_verdict(tmp_path: Path):
+    """v1.4.5: when the FINAL attempt also fails, verdict stays FAIL —
+    the recovery WARN should not weaken what was already a hard failure.
+    The retried_after_failure signal still fires and carries final_failed=True.
+    """
+    sid = "abcdef00-1111-2222-3333-444444444bbb"
+    rid = "abcdef00-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    home = tmp_path / "home"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_minimal_session_jsonl(main_sd, sid)
+
+    cycle1 = _build_attempt_cycle(
+        sid=sid, run_id=rid, started_ms=T0, ended_ms=T0 + 30_000,
+        final_status="error",
+        artifacts_overrides={
+            "aborted": True, "timedOut": True, "idleTimedOut": True,
+            "finalStatus": "error",
+        },
+    )
+    c2_start = T0 + 30_100
+    cycle2 = _build_attempt_cycle(
+        sid=sid, run_id=rid, started_ms=c2_start, ended_ms=c2_start + 5_000,
+        final_status="error",
+        artifacts_overrides={
+            "aborted": True, "timedOut": True,
+            "timedOutDuringToolExecution": True, "finalStatus": "error",
+        },
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", cycle1 + cycle2)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+
+    sigs = report.data["health_signals"]
+    retry_sigs = [s for s in sigs if s.get("kind") == "retried_after_failure"]
+    assert len(retry_sigs) == 1
+    assert retry_sigs[0]["final_failed"] is True
+    assert retry_sigs[0]["failed_count"] == 2
+    # Final attempt also failed → verdict FAIL.
+    assert report.verdict == Verdict.FAIL
+
+
+def test_single_cycle_no_regression(tmp_path: Path):
+    """v1.4.5 control: a single-cycle run must yield attempt_count=1 and
+    NO retried_after_failure signal. Existing tests already cover the
+    rest of the output; this guards the structural fields specifically.
+    """
+    sid = "abcdef00-1111-2222-3333-444444444ccc"
+    rid = "abcdef00-cccc-cccc-cccc-cccccccccccc"
+    home = tmp_path / "home"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _make_minimal_session_jsonl(main_sd, sid)
+    cycle = _build_attempt_cycle(
+        sid=sid, run_id=rid, started_ms=T0, ended_ms=T0 + 10_000,
+        artifacts_overrides={"finalStatus": "success"},
+    )
+    _write_jsonl(main_sd / f"{sid}.trajectory.jsonl", cycle)
+    ctx = _ctx_for_session(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+
+    rd = report.data["run_attempts"][0]
+    assert rd["attempt_count"] == 1
+    assert rd["had_failed_attempt"] is False
+    assert len(rd["attempts"]) == 1
+    assert rd["attempts"][0]["failed"] is False
+    sigs = report.data["health_signals"]
+    assert not any(
+        s.get("kind") == "retried_after_failure" for s in sigs
+    )
+    # Overview must NOT show an attempts line for single-cycle runs.
+    overview = next(
+        s for s in report.sections if s.title == "Panorama · Session Overview"
+    )
+    assert not any(
+        c.name.startswith("runs.attempts.") for c in overview.checks
+    )
+
+
+# ── v1.4.5 e2e: real session smokes ──────────────────────────────────────
+
+
+REAL_SESSION_E37 = "e37602da-ce25-45c6-97d9-2cffa237d1ba"
+REAL_HIDDEN_RID_PREFIX = "7b06f3d9"  # the runId whose attempt-1 was hidden
+
+
+def _real_session_present(sid: str) -> bool:
+    """The session.jsonl can have a normal name OR a .reset.* sibling
+    (after a /reset). Either is enough for sessions.resolve to find it.
+    """
+    base = REAL_SESSIONS_DIR
+    if not base.is_dir():
+        return False
+    if (base / f"{sid}.jsonl").is_file():
+        return True
+    # Check for any .reset.* variant
+    return any(
+        p.name.startswith(f"{sid}.jsonl")
+        for p in base.glob(f"{sid}.jsonl*")
+    )
+
+
+@pytest.mark.skipif(
+    not _real_session_present(REAL_SESSION_E37),
+    reason="real session e37602da fixture not present on this host",
+)
+def test_e2e_real_session_e37_hidden_failure_surfaces():
+    """v1.4.5 e2e: against the real e37602da session (run 7b06f3d9 had
+    attempt-1 idle-time-out + attempt-2 success), --all-runs must surface
+    the previously-hidden retry as a retried_after_failure signal.
+    """
+    cfg = REAL_HOME / "config.json"
+    ctx = DiagContext(
+        openclaw_home=REAL_HOME,
+        config_path=cfg if cfg.is_file() else REAL_HOME / "openclaw.json",
+        log_dir=REAL_LOG_DIR,
+        sessions_base=REAL_HOME / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(REAL_HOME)
+    paths_mod.CRON_RUNS_DIR = str(REAL_HOME / "cron" / "runs")
+    report = _run_panorama(
+        ctx, session_id=REAL_SESSION_E37, all_runs=True,
+    )
+    assert report.error is None, f"unexpected error: {report.error}"
+
+    # The targeted runId must show up in run_attempts with attempt_count==2.
+    matches = [
+        rd for rd in report.data["run_attempts"]
+        if (rd.get("runId") or "").startswith(REAL_HIDDEN_RID_PREFIX)
+    ]
+    assert matches, (
+        "runId 7b06f3d9 not found in run_attempts; got "
+        + str([rd.get("runId") for rd in report.data["run_attempts"]])
+    )
+    rd = matches[0]
+    assert rd["attempt_count"] >= 2, (
+        f"expected at least 2 attempts on 7b06f3d9; got {rd}"
+    )
+    assert rd["had_failed_attempt"] is True
+
+    # A retried_after_failure signal for that runId must be present.
+    sigs = report.data["health_signals"]
+    retry_sigs = [
+        s for s in sigs
+        if s.get("kind") == "retried_after_failure"
+        and (s.get("runId") or "").startswith(REAL_HIDDEN_RID_PREFIX)
+    ]
+    assert retry_sigs, (
+        "retried_after_failure signal for 7b06f3d9 missing; "
+        f"signals seen: {[s.get('kind') for s in sigs]}"
+    )
+    rs = retry_sigs[0]
+    # The first attempt was idle-timed-out, so the rendered chain must
+    # include that classification.
+    chain = " | ".join(rs["per_attempt"])
+    assert "went idle" in chain, (
+        f"idle-timeout classification missing from chain: {chain}"
+    )
+
+
+@pytest.mark.skipif(
+    not _real_session_present(REAL_SESSION_ID),
+    reason="real single-cycle session 63d70b29 not present on this host",
+)
+def test_e2e_real_session_63d_no_regression():
+    """v1.4.5 e2e: 63d70b29 is single-cycle. Ensure no
+    retried_after_failure signals fire and run_attempts shows count==1
+    for every run."""
+    cfg = REAL_HOME / "config.json"
+    ctx = DiagContext(
+        openclaw_home=REAL_HOME,
+        config_path=cfg if cfg.is_file() else REAL_HOME / "openclaw.json",
+        log_dir=REAL_LOG_DIR,
+        sessions_base=REAL_HOME / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(REAL_HOME)
+    paths_mod.CRON_RUNS_DIR = str(REAL_HOME / "cron" / "runs")
+    report = _run_panorama(
+        ctx, session_id=REAL_SESSION_ID, all_runs=True,
+    )
+    assert report.error is None, f"unexpected error: {report.error}"
+    for rd in report.data["run_attempts"]:
+        assert rd["attempt_count"] == 1, (
+            f"unexpected multi-attempt on 63d70b29 run "
+            f"{rd.get('runId')}: {rd}"
+        )
+    sigs = report.data["health_signals"]
+    assert not any(s.get("kind") == "retried_after_failure" for s in sigs), (
+        "retried_after_failure unexpectedly fired on single-cycle session"
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -214,13 +214,21 @@ and `delivery` data keys were removed (their content lives under
   - `state_transition_abnormal` — `session state` line whose `new` is
     `aborted`/`error`/`errored`/`failed`
   - `config_reload_failed` — `config reload skipped (invalid config): ...`
+- **v1.4.5 retried_after_failure** — a single `runId` carried multiple
+  attempt-cycles AND at least one earlier attempt failed. WARN when the
+  final attempt succeeded (the run recovered), FAIL when the final
+  attempt also failed. Carries `attempt_count`, `failed_count`,
+  `final_status`, `final_failed`, and a `per_attempt[]` list of human
+  reasons (e.g. `"#1 went idle (no progress within idle timeout) (5.1m)"`,
+  `"#2 success (52s)"`). The per-attempt classification reuses the same
+  vocabulary as `_classify_timeout_flags`.
 
 ## Verdict Logic
 
 | Condition | Verdict |
 |---|---|
 | trace.artifacts shows abort/timeout OR child task failed OR ERROR-level correlated log OR cron delivery failure OR model-call error | **fail** |
-| WARN-level correlated log OR log-marker decision (fallback/overflow/compaction) OR stall detected OR E2E > 5min OR plugin load error OR bootstrap truncation OR (v1.4.4) prompt cache broke / items incomplete / queue wait > 2s / context precheck overflow / abnormal state transition / config reload failed | **warn** |
+| WARN-level correlated log OR log-marker decision (fallback/overflow/compaction) OR stall detected OR E2E > 5min OR plugin load error OR bootstrap truncation OR (v1.4.4) prompt cache broke / items incomplete / queue wait > 2s / context precheck overflow / abnormal state transition / config reload failed OR (v1.4.5) retried_after_failure with the FINAL attempt succeeding | **warn** |
 | All clean | **ok** |
 
 ## v1.4.4 JSON envelope additions
@@ -243,6 +251,43 @@ and `delivery` data keys were removed (their content lives under
 - `--run-index 0`: first run
 - `--all-runs`: all runs in the session
 - Run boundaries detected from trajectory `session.started` events or log `embedded run start` timestamps
+
+## Multi-attempt-per-runId handling (v1.4.5)
+
+A single `runId` can carry MULTIPLE attempt-cycles when the run retries
+internally. Each cycle is a full event sequence (`session.started` →
+`trace.metadata` → `context.compiled` → `prompt.submitted` →
+`model.completed` → `trace.artifacts` → `session.ended`) with `seq`
+resetting to 1 each cycle, all sharing the same `runId`. The pre-1.4.5
+grouper kept only the LAST `trace.artifacts`/`session.started`/
+`trace.metadata` for a runId, so a failed attempt-1 was overwritten by a
+successful attempt-2 and never surfaced.
+
+The grouper now collects every cycle into `run["attempts"]`. The
+top-level `run["artifacts"]` / `session_started` / `trace_metadata` keys
+still point at the LAST cycle (preserves behavior for everything that
+read those keys), and the per-attempt detail enables multi-attempt
+health reporting:
+
+- `report.data["run_attempts"][i]`: one entry per selected run,
+  `{runId, attempt_count, had_failed_attempt, attempts[]}`. Each
+  `attempts[j]` is `{index, started_ms, ended_ms, duration_ms,
+  final_status, failure_flags[], prompt_error_source, failed}`.
+- Session Overview adds a one-line `attempts: N (M failed,
+  final=<status>) [run <rid8>]` for each multi-attempt run (WARN when
+  any attempt failed, OK otherwise).
+- Health Signals adds a `retried_after_failure` entry per multi-attempt
+  run with at least one failed attempt — see entry above. WARN when the
+  final attempt recovered, FAIL when it also failed.
+
+A new attempt is signaled by either a repeated `session.started` for the
+same runId, OR (defensive fallback) by a `seq` value resetting on any
+event when no attempt is currently open. An attempt that produces no
+`trace.artifacts` (run died mid-flight) is recorded with
+`failure_flags=["noArtifacts"]` and `failed=true`.
+
+Single-cycle runs (the common case) are unchanged: `attempt_count == 1`,
+no `attempts` line in Overview, no `retried_after_failure` signal.
 
 ## Masking
 

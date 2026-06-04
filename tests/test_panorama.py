@@ -2696,13 +2696,13 @@ def test_timeline_sample_more_than_old_cap_and_spans_run():
 # ── v1.4.11: representative INFO removed from Correlated Logs ─────────────
 
 
-def test_correlated_logs_renders_no_info_lines_when_no_err_warn(
+def test_correlated_logs_renders_representative_info_when_no_err_warn(
         tmp_path: Path):
-    """v1.4.11: when correlated logs have no ERROR/WARN, the section must
-    NOT cherry-pick "representative" INFO lines anymore. Only the summary
-    line shows. (The clean fixture has only INFO + one unrelated WARN; we
-    overwrite that WARN to assert the strictly-clean path.)
+    """v1.4.12: when correlated logs have no ERROR/WARN, the merged section
+    SHOWS up to REPRESENTATIVE_INFO_LINES (=20) representative INFO lines so a
+    quiet window still shows concrete evidence (restored + raised from 5).
     """
+    from ocdiag.inspectors.panorama import REPRESENTATIVE_INFO_LINES
     ctx = _build_fixture_home(tmp_path)
     # Rewrite today's log so every line is INFO-only and includes the
     # sessionId so we get a non-zero correlated-log count.
@@ -2726,23 +2726,31 @@ def test_correlated_logs_renders_no_info_lines_when_no_err_warn(
     )
     # Summary still present
     assert any(c.name == "logs.summary" for c in section.checks)
-    # The pre-1.4.11 render emitted up to 5 logs.info.* lines here.
+    # v1.4.12: representative INFO lines ARE shown for a clean window.
     info_lines = [c for c in section.checks
                   if c.name.startswith("logs.info.")]
-    assert info_lines == [], (
-        "v1.4.11 regression: 'logs.info.*' representative lines reappeared. "
-        f"Got: {[c.name for c in info_lines]}"
+    assert info_lines, (
+        "v1.4.12: representative INFO lines must show when no ERROR/WARN"
     )
+    # 8 INFO entries < cap → all shown; never exceed the cap.
+    assert len(info_lines) == 8
+    assert len(info_lines) <= REPRESENTATIVE_INFO_LINES
 
 
-def test_representative_logs_helper_removed():
-    """v1.4.11: the helper that produced cherry-picked INFO lines was
-    removed entirely. Importing it must fail.
+def test_representative_logs_present_and_capped():
+    """v1.4.12: the representative-INFO helper is restored and the cap is 20
+    (raised from the old 5). The helper never returns more than the cap.
     """
     import ocdiag.inspectors.panorama as panorama
-    assert not hasattr(panorama, "_representative_logs"), (
-        "_representative_logs should have been deleted in v1.4.11"
-    )
+    assert hasattr(panorama, "_representative_logs")
+    assert panorama.REPRESENTATIVE_INFO_LINES == 20
+    pool = [
+        {"level": "INFO", "time": i, "message": f"tool start step {i}"}
+        for i in range(100)
+    ]
+    reps = panorama._representative_logs(
+        pool, limit=panorama.REPRESENTATIVE_INFO_LINES)
+    assert 0 < len(reps) <= 20
 
 
 # ── v1.4.11: merged "Correlated Logs & Signals" section ───────────────────

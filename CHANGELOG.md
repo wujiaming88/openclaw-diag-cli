@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.4.12 — restore representative INFO, raise cap 5 → 20 (2026-06-04)
+
+### Changed
+- **Restored the representative-INFO block** in the merged Correlated Logs &
+  Signals section, and raised the cap from 5 to `REPRESENTATIVE_INFO_LINES`
+  (=20). v1.4.11 had removed it; that was wrong — on a window with no
+  ERROR/WARN, a few representative INFO lines (lifecycle/tool/model
+  boundaries, spanning head→middle→tail) are exactly what shows "what
+  happened" on an otherwise-quiet run. Renders only when there are no
+  ERROR/WARN entries; OK-level (✓), no verdict effect.
+- Fixed an indentation bug in the restored block (it was nested under
+  `if warn_entries:`, so it never fired when there were zero WARN entries
+  — the common clean case). It now sits at else-body scope, firing exactly
+  when both ERROR and WARN are empty. Verified on a real session: a window
+  with 277 INFO / 0 ERROR / 0 WARN now renders 20 INFO lines.
+
+### Tests
+- Replaced the v1.4.11 "INFO removed"/"helper removed" tests with
+  `test_correlated_logs_renders_representative_info_when_no_err_warn` and
+  `test_representative_logs_present_and_capped` (asserts cap 20, non-empty,
+  never exceeds cap).
+
 ## v1.4.11 — bigger timeline middle, drop representative INFO, merge Health Signals into Correlated Logs (2026-06-04)
 
 ### Changed

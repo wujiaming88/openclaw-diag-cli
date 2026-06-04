@@ -90,6 +90,11 @@ LOG_WINDOW_GRACE_MS = 5_000
 MAX_RENDERED_ERROR_LINES = 200
 MAX_RENDERED_WARN_LINES = 10
 
+# When a window has NO ERROR/WARN correlated entries, show this many
+# representative INFO log lines (lifecycle/tool/model boundaries, spanning
+# head→middle→tail) so a quiet window still shows what actually happened.
+REPRESENTATIVE_INFO_LINES = 20
+
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -2079,6 +2084,43 @@ def _timeline_sample(
     return chosen[:cap]
 
 
+def _representative_logs(
+    correlated_logs: List[Dict[str, Any]],
+    *,
+    limit: int = REPRESENTATIVE_INFO_LINES,
+) -> List[Dict[str, Any]]:
+    """Pick telling INFO entries: lifecycle starts/ends and tool/model
+    boundaries, spanning head→middle→tail so the selection reflects the whole
+    run. Used only when a window has no ERROR/WARN entries, so a quiet window
+    still shows concrete evidence of what happened instead of going silent.
+    """
+    if not correlated_logs:
+        return []
+    interesting: List[Dict[str, Any]] = []
+    fallback: List[Dict[str, Any]] = []
+    keywords = (
+        "start", "end", "complete", "spawn", "deliver", "cron",
+        "tool", "model", "compaction", "session",
+    )
+    for rec in correlated_logs:
+        text = (parse_log_msg(rec) or "").lower()
+        if any(k in text for k in keywords):
+            interesting.append(rec)
+        else:
+            fallback.append(rec)
+    pool = interesting or fallback
+    if len(pool) <= limit:
+        return pool
+    # Span the pool: first, last, plus evenly spaced mids via fractional
+    # spacing so the picks spread across the whole run, not cluster at head.
+    inner = limit - 2
+    indices = {0, len(pool) - 1}
+    if inner > 0:
+        for i in range(1, inner + 1):
+            indices.add((i * (len(pool) - 1)) // (inner + 1))
+    return [pool[i] for i in sorted(indices)][:limit]
+
+
 # ── main inspector ─────────────────────────────────────────────────────────
 
 
@@ -3295,6 +3337,29 @@ class PanoramaInspector:
                     "logs.warn.more",
                     f"+{more} more WARN entries not shown",
                     data={"more": more, "cap": MAX_RENDERED_WARN_LINES},
+                )
+        # 6. Representative INFO lines — only when the window had NO
+        # ERROR/WARN entries, so a quiet/clean window still shows concrete
+        # lifecycle/tool/model evidence instead of just a count. Cap is
+        # REPRESENTATIVE_INFO_LINES (=20); OK-level (✓), no verdict effect.
+        # Sits at else-body indent (sibling of the `if error_entries:` /
+        # `if warn_entries:` blocks) so it fires precisely when both are empty.
+        if correlated_logs and not error_entries and not warn_entries:
+            info_only = [
+                rec for rec in correlated_logs
+                if (_log_level(rec) or "").upper() not in ("ERROR", "WARN")
+            ]
+            reps = _representative_logs(
+                info_only, limit=REPRESENTATIVE_INFO_LINES)
+            for idx, rec in enumerate(reps, 1):
+                msg_s = parse_log_msg(rec) or "?"
+                sub = get_log_subsystem(rec) or "?"
+                ts = _log_ts_ms(rec)
+                tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
+                s_logs.ok(
+                    f"logs.info.{idx:02d}",
+                    f"{tsfx}[INFO] [{sub}] {msg_s[:160]}",
+                    data={"correlation": rec.get("correlation")},
                 )
 
         # (Standalone "Model Decisions" section removed in v1.4.3 — log-marker

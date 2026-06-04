@@ -224,12 +224,14 @@ Other behavior:
   `discover_recent_logs`. The downstream window-bound filter still does
   the precise ±5s slice — broadening file selection does not leak
   unrelated entries.
-- INFO log lines: **NOT rendered.** v1.4.11 removed the cherry-picked
-  "representative INFO" block that ran when no ERROR/WARN existed.
-  It was arbitrary — keyword-driven, ignored content the user might
-  actually care about, and gave a false sense of completeness. On a
-  clean run only the summary line and the positive ✓ confirmations
-  show; that's the honest answer.
+- INFO log lines: shown **only when the window has no ERROR/WARN** — up to
+  `REPRESENTATIVE_INFO_LINES` (=20) representative entries (lifecycle/tool/
+  model boundaries, spanning head→middle→tail) as OK-level (✓) lines, so a
+  quiet window still shows concrete evidence of what happened instead of
+  just a count. (History: v1.4.11 removed this block; v1.4.12 restored it and
+  raised the cap from 5 to 20 — 5 was too few to show the run's shape.) When
+  ERROR/WARN exist, raw INFO lines are suppressed (the errors/warns + signals
+  carry the diagnosis).
 - `logs.summary.data` still carries `out_of_window_dropped`,
   `ts_less_kept`.
 

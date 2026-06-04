@@ -142,6 +142,13 @@ and `delivery` data keys were removed (their content lives under
   `truncated:true` are reported on the JSON envelope and surfaced as a WARN
   line in the section
 - Records with no parseable timestamp are counted under `skipped_no_ts`
+- **v1.4.10 middle-event sample** — the rendered Timeline section now
+  includes a `timeline.sample.*` block (up to `TIMELINE_RENDER_SAMPLE = 20`
+  entries, chronological, deduped against first/last/key-moment anchors).
+  Selection prioritizes interesting events (log:ERROR, log:WARN, state
+  transitions, delivery, model.completed, tool calls), then pads with
+  evenly-spaced filler so the run's overall shape is visible. Linear
+  time, bounded memory.
 
 ### 3. model_calls
 - Per-call data: `ts_ms`, `duration_ms` (round-trip wall-clock proxy — kept
@@ -172,6 +179,16 @@ and `delivery` data keys were removed (their content lives under
 - App log entries passing the correlation filter, **bounded to the session
   window** (`[window_start − 5s, window_end + 5s]`) so reused
   sessionKey/toolCallId noise is dropped
+- **v1.4.10 window-aware log discovery.** Log files are selected by
+  filename date (`openclaw-YYYY-MM-DD.log`) intersecting the session
+  window (with a ±1 day margin for midnight / tz boundaries), unioned
+  with today's mtime ≥ today-00:00 set. This lets a session that ran on
+  a previous day still pull in the right log file (the pre-1.4.10
+  mtime-only discovery dropped older files, leaving Correlated Logs
+  empty). When the window is unknown (0/0), discovery falls back to
+  `discover_recent_logs`. The downstream window-bound filter still does
+  the precise ±5s slice — broadening file selection does not leak
+  unrelated entries.
 - ERROR entries: ALL in-window errors are rendered (safety cap 200 with
   `+N more` line)
 - WARN entries: head-10 plus `+N more`
@@ -198,7 +215,13 @@ and `delivery` data keys were removed (their content lives under
 - `last_tool_error`
 - `log_stall` (long-running / stalled session log markers)
 - `gateway_pid_change` (multiple gateway PIDs in the correlated logs)
-- `long_tool_call` (any tool > 60s)
+- `long_tool_call` (any tool > 60s). **v1.4.10:** the signal now carries
+  `args_summary` (compact `{k=v, ...}` rendering of the tool call's
+  arguments — sanitized when `--mask` is set), `snippet` (a 120-char
+  excerpt of the error or result text), and `callId`. The rendered line
+  reads e.g. `long tool call: cron(action=update,
+  jobId=0cdb2836-...) 2.4m → error: patch required` instead of the
+  previous `long tool call: cron 2.4m (error)`.
 - `child_task_failed`
 - **cron_delivery_failed (folded in v1.4.3):** failed cron deliveries
   (`deliveryStatus` ∈ failed/error/errored/undelivered) influence verdict
@@ -222,6 +245,16 @@ and `delivery` data keys were removed (their content lives under
   reasons (e.g. `"#1 went idle (no progress within idle timeout) (5.1m)"`,
   `"#2 success (52s)"`). The per-attempt classification reuses the same
   vocabulary as `_classify_timeout_flags`.
+- **v1.4.10 positive (OK) signals** — a parallel list emitted on
+  `report.data["positive_health_signals"]` so a healthy run shows
+  per-aspect confirmations instead of a single "no signals" line.
+  Kinds: `ok_tools` ("N tool calls, 0 errors" / "M/N tool calls ok"),
+  `ok_lifecycle` ("no leaks (active=0), all N items completed"),
+  `ok_cache` ("cache healthy (no breaks)" — only when an observation is
+  present), `ok_outcome` ("no aborts/timeouts/stalls"), `ok_delivery`
+  ("delivered ok ..." or cron-records confirmed). They render as `✓`
+  lines at the top of Health Signals and are **additive only** —
+  problem ⚠/✗ lines still drive the verdict.
 
 ## Verdict Logic
 

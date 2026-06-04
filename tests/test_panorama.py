@@ -2259,5 +2259,376 @@ def test_e2e_real_session_63d_no_regression():
     )
 
 
+# ── v1.4.10 task T1: window-aware log discovery ──────────────────────────
+
+
+def test_discover_logs_for_window_includes_yesterday(tmp_path: Path):
+    """A log file dated within the session window must be included even when
+    its mtime is older than today (the v1.4.9 ``discover_recent_logs``
+    excluded such files, leaving Correlated Logs empty for older sessions).
+    """
+    from datetime import datetime, timedelta
+
+    from ocdiag.recent_logs import discover_logs_for_window
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    yesterday = (datetime.now() - timedelta(days=2)).date()
+    yfile = log_dir / f"openclaw-{yesterday.isoformat()}.log"
+    yfile.write_text("dummy\n")
+    # Backdate mtime so a today-mtime filter would reject it.
+    old_mtime = time.time() - 3 * 86400
+    os.utime(yfile, (old_mtime, old_mtime))
+
+    # Window straddling that day.
+    win_start = int(time.mktime(yesterday.timetuple()) * 1000)
+    win_end = win_start + 60_000
+    out = discover_logs_for_window(str(log_dir), win_start, win_end)
+    assert str(yfile) in out, (
+        "yesterday's log not in window-aware discovery; got: " + str(out)
+    )
+
+
+def test_discover_logs_for_window_zero_falls_back(tmp_path: Path):
+    """When window=0, fall back to ``discover_recent_logs`` semantics."""
+    from datetime import datetime
+
+    from ocdiag.recent_logs import (
+        discover_logs_for_window,
+        discover_recent_logs,
+    )
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    today = datetime.now().date().isoformat()
+    tfile = log_dir / f"openclaw-{today}.log"
+    tfile.write_text("today\n")
+    out = discover_logs_for_window(str(log_dir), 0, 0)
+    assert out == discover_recent_logs(str(log_dir))
+
+
+def test_discover_logs_for_window_excludes_far_dates(tmp_path: Path):
+    """Files whose filename date is far outside the window AND whose mtime
+    is also old must be excluded, so we don't drag in unrelated logs.
+    """
+    from datetime import datetime, timedelta
+
+    from ocdiag.recent_logs import discover_logs_for_window
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    far_date = (datetime.now() - timedelta(days=30)).date()
+    far = log_dir / f"openclaw-{far_date.isoformat()}.log"
+    far.write_text("old\n")
+    old_mtime = time.time() - 30 * 86400
+    os.utime(far, (old_mtime, old_mtime))
+
+    near_date = (datetime.now() - timedelta(days=2)).date()
+    win_start = int(time.mktime(near_date.timetuple()) * 1000)
+    win_end = win_start + 60_000
+    out = discover_logs_for_window(str(log_dir), win_start, win_end)
+    assert str(far) not in out
+
+
+def test_panorama_correlates_yesterday_log(tmp_path: Path):
+    """Integration: a synthetic session whose window is "yesterday" plus a
+    yesterday-named log mentioning the sessionId must produce
+    correlated_logs > 0.
+    """
+    from datetime import datetime, timedelta
+
+    home = tmp_path / "yhome"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "ylogs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "10101010-aaaa-bbbb-cccc-101010101010"
+    yesterday = (datetime.now() - timedelta(days=2))
+    y_ms = int(yesterday.timestamp() * 1000)
+    y_iso = _ms_to_iso(y_ms)
+
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid, "timestamp": y_iso},
+        {"type": "message", "id": "u-1", "timestamp": y_iso,
+         "message": {"role": "user", "timestamp": y_ms, "content": "ping"}},
+        {"type": "message", "id": "u-2", "timestamp": _ms_to_iso(y_ms + 5000),
+         "message": {"role": "user", "timestamp": y_ms + 5000,
+                     "content": "more"}},
+    ])
+
+    # Yesterday-dated log file with backdated mtime + a sessionId mention
+    # within the window.
+    yfile = log_dir / (
+        f"openclaw-{yesterday.date().isoformat()}.log"
+    )
+    rec = {
+        "level": "INFO", "time": y_ms + 100, "pid": 1,
+        "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+        "msg": f"sessionId={sid} starting",
+    }
+    yfile.write_text(json.dumps(rec) + "\n")
+    old_mtime = time.time() - 2 * 86400
+    os.utime(yfile, (old_mtime, old_mtime))
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=home / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None
+    assert len(report.data["correlated_logs"]) >= 1, (
+        "yesterday-dated log not correlated; sources_present="
+        + str(report.data["sources_present"])
+    )
+
+
+# ── v1.4.10 task T2a: enriched long_tool_call signal ──────────────────────
+
+
+def test_long_tool_call_renders_args_and_error(tmp_path: Path):
+    """A long (>60s) erroring tool call must surface its args + error
+    snippet on the rendered Health Signals line and on the JSON signal.
+    """
+    from ocdiag.render.human import render
+
+    home = tmp_path / "long-tool"
+    main_sd = home / "agents" / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "70707070-1111-2222-3333-707070707070"
+    call_id = "tooluse_LongCron1"
+    start_ms = T0
+    end_ms = T0 + 120_000  # 2 minutes
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(T0),
+         "message": {"role": "user", "timestamp": T0, "content": "go"}},
+        {"type": "message", "id": "a-1",
+         "timestamp": _ms_to_iso(start_ms),
+         "message": {
+             "role": "assistant", "timestamp": start_ms,
+             "content": [
+                 {"type": "toolCall", "id": call_id, "name": "cron",
+                  "input": {"action": "update",
+                            "jobId": "0cdb2836-3791-468e-a756-d6b8af97d894"}},
+             ],
+         }},
+        {"type": "message", "id": "r-1",
+         "timestamp": _ms_to_iso(end_ms),
+         "message": {
+             "role": "toolResult", "timestamp": end_ms,
+             "toolCallId": call_id, "toolName": "cron",
+             "isError": True, "content": "patch required",
+         }},
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=home / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+
+    report = _run_panorama(ctx, session_id=sid)
+    sigs = report.data["health_signals"]
+    long_sigs = [s for s in sigs if s.get("kind") == "long_tool_call"]
+    assert len(long_sigs) == 1
+    sig = long_sigs[0]
+    # New v1.4.10 fields.
+    assert "args_summary" in sig
+    assert "snippet" in sig
+    assert "action=update" in sig["args_summary"]
+    assert "jobId=0cdb2836" in sig["args_summary"]
+    assert "patch required" in sig["snippet"]
+
+    text = render(report, no_color=True)
+    assert "long tool call: cron(action=update" in text
+    assert "→ error: patch required" in text
+
+
+# ── v1.4.10 task T2b: positive (OK) health signals ────────────────────────
+
+
+def test_positive_health_signals_clean_run(tmp_path: Path):
+    """A clean fixture must emit at least one OK positive health signal."""
+    ctx = _build_fixture_home(tmp_path)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    positives = report.data.get("positive_health_signals") or []
+    kinds = {p.get("kind") for p in positives}
+    # Tools — fixture has 2 calls + 1 error, so partial-ok wording.
+    assert "ok_tools" in kinds
+    # Lifecycle clean (started==completed==2, active==0)
+    assert "ok_lifecycle" in kinds
+    # The Health Signals section must render the positive lines.
+    health = next(
+        s for s in report.sections
+        if s.title == "Panorama · Health Signals"
+    )
+    ok_msgs = [c.message for c in health.checks
+               if c.name.startswith("health.ok_")]
+    assert ok_msgs, "expected at least one ok_* line in Health Signals"
+
+
+def test_positive_signals_do_not_change_verdict(tmp_path: Path):
+    """A failing run must keep its FAIL verdict even though positive
+    signals are emitted alongside the problems.
+    """
+    ctx = _build_fixture_home(tmp_path, artifact_failure=True)
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    assert report.verdict == Verdict.FAIL
+    # Problems still rendered.
+    sigs = report.data["health_signals"]
+    assert any(s.get("kind") == "trajectory_artifact" for s in sigs)
+
+
+# ── v1.4.10 task T3: timeline middle-event sample ─────────────────────────
+
+
+def test_timeline_sample_renders_middle_events(tmp_path: Path):
+    """The Timeline section must include sample lines covering events
+    between first and last, bounded by TIMELINE_RENDER_SAMPLE.
+    """
+    from ocdiag.inspectors.panorama import TIMELINE_RENDER_SAMPLE
+
+    ctx = _build_fixture_home(tmp_path, run_b=True)
+    report = _run_panorama(ctx, session_id=SESSION_ID, all_runs=True)
+    timeline_section = next(
+        s for s in report.sections if s.title == "Panorama · Timeline"
+    )
+    sample_checks = [
+        c for c in timeline_section.checks
+        if c.name.startswith("timeline.sample.")
+    ]
+    assert sample_checks, "expected timeline.sample.* checks"
+    assert len(sample_checks) <= TIMELINE_RENDER_SAMPLE
+    # Chronological order
+    sample_ts = [
+        (c.data.get("ts_ms") if isinstance(c.data, dict) else 0)
+        for c in sample_checks
+    ]
+    assert sample_ts == sorted(sample_ts)
+    # De-dup vs the actual first/last entries on the merged timeline.
+    timeline_data = report.data["timeline"]
+    skip_ts = {timeline_data[0]["ts_ms"], timeline_data[-1]["ts_ms"]}
+    for ts in sample_ts:
+        assert ts not in skip_ts, (
+            "sample must not duplicate the first/last timeline ts"
+        )
+
+
+def test_timeline_sample_helper_dedup_and_bounds():
+    """Direct test of _timeline_sample: cap, chronological, dedup, prefer
+    interesting events.
+    """
+    from ocdiag.inspectors.panorama import _timeline_sample
+    timeline = []
+    for i in range(50):
+        timeline.append({
+            "ts_ms": T0 + i * 1000,
+            "source": "session.jsonl",
+            "event_type": "message",
+            "summary": f"message:user [{i}]",
+        })
+    # Inject a few "interesting" events — log:ERROR, state, delivery.
+    timeline.append({
+        "ts_ms": T0 + 10_500, "source": "app_log",
+        "event_type": "log:ERROR", "summary": "[gw] kaboom",
+    })
+    timeline.append({
+        "ts_ms": T0 + 20_500, "source": "state",
+        "event_type": "state", "summary": "state idle → processing",
+    })
+    timeline.sort(key=lambda e: e["ts_ms"])
+    # Skip the first event the renderer would already show.
+    skip = {timeline[0]["ts_ms"], timeline[-1]["ts_ms"]}
+    sample = _timeline_sample(timeline, skip_ts_ms=skip, cap=10)
+    assert len(sample) <= 10
+    assert all(s["ts_ms"] not in skip for s in sample)
+    # Chronological
+    assert sample == sorted(sample, key=lambda e: e["ts_ms"])
+    # Interesting events must be present in the sample.
+    summaries = " | ".join(s["summary"] for s in sample)
+    assert "kaboom" in summaries
+    assert "idle → processing" in summaries
+
+
+def test_timeline_sample_small_timeline_returns_all():
+    """When the timeline is smaller than the sample cap, return all of
+    them (still dedup'd vs skip set).
+    """
+    from ocdiag.inspectors.panorama import _timeline_sample
+    timeline = [
+        {"ts_ms": T0 + 1000, "source": "session.jsonl",
+         "event_type": "message", "summary": "user"},
+        {"ts_ms": T0 + 2000, "source": "session.jsonl",
+         "event_type": "message", "summary": "asst"},
+        {"ts_ms": T0 + 3000, "source": "session.jsonl",
+         "event_type": "message", "summary": "tool"},
+    ]
+    out = _timeline_sample(
+        timeline, skip_ts_ms={T0 + 1000}, cap=20,
+    )
+    # Skipped first; remaining 2 returned in order.
+    assert len(out) == 2
+    assert out[0]["ts_ms"] == T0 + 2000
+    assert out[1]["ts_ms"] == T0 + 3000
+
+
+# ── v1.4.10 e2e: real session e37602da ────────────────────────────────────
+
+
+@pytest.mark.skipif(
+    not _real_session_present("e37602da-ce25-45c6-97d9-2cffa237d1ba"),
+    reason="real session e37602da fixture not present on this host",
+)
+def test_e2e_real_session_e37_v1_4_10_improvements():
+    """v1.4.10 e2e: the real e37602da session must now show
+    correlated logs > 0 (T1), enriched long-tool-call signals (T2a),
+    and timeline middle-sample lines (T3).
+    """
+    cfg = REAL_HOME / "config.json"
+    ctx = DiagContext(
+        openclaw_home=REAL_HOME,
+        config_path=cfg if cfg.is_file() else REAL_HOME / "openclaw.json",
+        log_dir=REAL_LOG_DIR,
+        sessions_base=REAL_HOME / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(REAL_HOME)
+    paths_mod.CRON_RUNS_DIR = str(REAL_HOME / "cron" / "runs")
+    report = _run_panorama(
+        ctx, session_id="e37602da-ce25-45c6-97d9-2cffa237d1ba",
+        all_runs=True,
+    )
+    assert report.error is None, f"unexpected error: {report.error}"
+    # T1: correlated logs > 0
+    assert len(report.data["correlated_logs"]) > 0, (
+        "T1 regression: correlated_logs empty for older session"
+    )
+    # T2a: at least one long_tool_call signal carrying args + snippet
+    sigs = report.data["health_signals"]
+    longs = [s for s in sigs if s.get("kind") == "long_tool_call"]
+    if longs:  # only if the session actually had long tool calls
+        assert any("args_summary" in s for s in longs)
+    # T3: timeline middle-sample renders
+    timeline_section = next(
+        s for s in report.sections if s.title == "Panorama · Timeline"
+    )
+    assert any(
+        c.name.startswith("timeline.sample.")
+        for c in timeline_section.checks
+    ), "T3 regression: timeline.sample.* missing"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

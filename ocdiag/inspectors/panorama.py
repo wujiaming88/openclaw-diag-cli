@@ -50,7 +50,7 @@ from ..correlation import (
     filter_log_files_with_otel,
 )
 from ..jsonlog import get_log_subsystem, parse_log_msg
-from ..recent_logs import discover_recent_logs
+from ..recent_logs import discover_logs_for_window, discover_recent_logs
 from ..sensitive import sanitize_text
 from ..timeutil import fmt_duration, fmt_epoch_local
 from ..tracing import (
@@ -64,6 +64,10 @@ from ..tracing import (
 SLOW_E2E_MS = 5 * 60 * 1000
 DEFAULT_LOG_RECORD_CAP = 5000
 DEFAULT_TIMELINE_CAP = 2000
+# v1.4.10: cap on the number of representative middle-of-the-run timeline
+# events rendered under "timeline.sample". Tunable in one place so the
+# render heuristic can be retuned without hunting for magic numbers.
+TIMELINE_RENDER_SAMPLE = 20
 # Slack added to the session window when bounding correlated log entries,
 # so a clock-skewed log line written just before/after the run still counts.
 LOG_WINDOW_GRACE_MS = 5_000
@@ -1464,7 +1468,11 @@ def _health_signals(
             "kind": "gateway_pid_change",
             "pids": sorted(p for p in seen_pids if isinstance(p, (int, str))),
         })
-    # Long-running tool calls
+    # Long-running tool calls. v1.4.10 enriches each signal with the call's
+    # arguments + a result/error snippet so the rendered line tells the user
+    # WHICH tool invocation hung (not just "cron 2.4m"). The waterfall has
+    # already applied masking when --mask was set, so we just forward the
+    # already-sanitized values; downstream renderers don't need to know.
     if waterfall:
         long_calls = sorted(
             [
@@ -1474,12 +1482,31 @@ def _health_signals(
             key=lambda w: w.get("duration_ms") or 0, reverse=True,
         )
         for lc in long_calls[:5]:
+            args_summary = _format_args_inline(lc.get("args"), max_total=80)
+            error_text = lc.get("error_text") or ""
+            result_text = lc.get("result_text") or ""
+            # Pick the snippet that explains the most: error first, then a
+            # tail of the result. Truncated to keep the rendered line short.
+            snippet = ""
+            if lc.get("is_error"):
+                snippet = (error_text or result_text or "").replace(
+                    "\n", " ").strip()
+            elif result_text:
+                snippet = result_text.replace("\n", " ").strip()
+            if len(snippet) > 120:
+                snippet = snippet[:119] + "…"
             signals.append({
                 "kind": "long_tool_call",
                 "name": lc.get("name"),
                 "duration_ms": lc.get("duration_ms"),
                 "is_error": bool(lc.get("is_error")),
                 "ts_ms": lc.get("end_ms") or lc.get("start_ms") or 0,
+                # New v1.4.10 fields. Compact, inline-renderable strings;
+                # raw args/result_text/error_text already on the waterfall
+                # entry for JSON consumers needing the full payload.
+                "args_summary": args_summary,
+                "snippet": snippet,
+                "callId": lc.get("callId"),
             })
     # Failed child tasks
     if children:
@@ -1611,6 +1638,164 @@ def _health_signals(
                     "reason": rl.get("reason"),
                 })
     return signals
+
+
+# ── positive health signals (v1.4.10) ──────────────────────────────────────
+#
+# `_health_signals` only surfaces problems (warn/fail). For a healthy run that
+# leaves the section empty, the user has no positive confirmation that the
+# tools, lifecycle, cache, outcome, or delivery are actually fine — they just
+# see a single "no abort/timeout/..." line. The positives below provide a
+# concise per-aspect "✓" so a clean run is visible, not just an empty section.
+#
+# These signals are ADDITIVE — they never change the verdict. They are also
+# concise summary lines (counts, not per-call detail) so the section stays
+# scannable.
+
+
+def _positive_health_signals(
+    runs: List[Dict[str, Any]],
+    *,
+    waterfall: Optional[List[Dict[str, Any]]],
+    problem_signals: List[Dict[str, Any]],
+    delivery_run_summary: Optional[Dict[str, Any]],
+    cron_runs: Optional[List[Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    """Return a list of OK-level health entries for aspects that look fine.
+
+    Each entry is ``{kind: "ok_<aspect>", summary: <text>}``. The renderer
+    routes them to ``s_health.ok``. Aspects covered:
+
+      ``ok_tools``      no tool errors across the waterfall
+      ``ok_lifecycle``  itemLifecycle started==completed and active==0
+      ``ok_cache``      no ``prompt_cache_broke`` problem signal
+      ``ok_outcome``    no abort/timeout/stall problem signal
+      ``ok_delivery``   messaging-tool sent OR no cron failures
+    """
+    out: List[Dict[str, Any]] = []
+
+    # Tools: count calls + errors. We emit even when there are zero calls,
+    # so the user sees "no tool calls" affirmatively rather than nothing.
+    if waterfall is not None:
+        total = len(waterfall)
+        errs = sum(1 for w in waterfall if w.get("is_error"))
+        if total == 0:
+            out.append({
+                "kind": "ok_tools",
+                "summary": "no tool calls in this run",
+            })
+        elif errs == 0:
+            out.append({
+                "kind": "ok_tools",
+                "summary": f"{total} tool calls, 0 errors",
+            })
+        else:
+            ok_count = total - errs
+            out.append({
+                "kind": "ok_tools",
+                "summary": f"{ok_count}/{total} tool calls ok",
+            })
+
+    # Lifecycle: aggregate across selected runs. Only emit a positive when
+    # every run has started == completed and active == 0; if any run shows
+    # a leak/incomplete, the existing problem signal already speaks.
+    if runs:
+        all_clean = True
+        agg_started = 0
+        agg_completed = 0
+        any_data = False
+        for run in runs:
+            ad = (run.get("artifacts") or {}).get("data") or {}
+            il = ad.get("itemLifecycle") or {}
+            if not isinstance(il, dict):
+                continue
+            started = il.get("startedCount") or 0
+            completed = il.get("completedCount") or 0
+            active = il.get("activeCount") or 0
+            if not (started or completed or active):
+                continue
+            any_data = True
+            agg_started += started
+            agg_completed += completed
+            if active or completed != started:
+                all_clean = False
+        if any_data and all_clean:
+            out.append({
+                "kind": "ok_lifecycle",
+                "summary": (
+                    f"no leaks (active=0), all {agg_completed} items "
+                    f"completed"
+                ),
+            })
+
+    # Cache: positive when no broke signal AND at least one run reported a
+    # promptCache observation. We don't want to crow "cache healthy" when
+    # we have no observation at all (older runs, missing data) — that
+    # would be misleading.
+    has_cache_break = any(
+        s.get("kind") == "prompt_cache_broke" for s in problem_signals
+    )
+    has_observation = False
+    for run in runs or []:
+        pc = ((run.get("artifacts") or {}).get("data") or {}).get(
+            "promptCache") or {}
+        if isinstance(pc, dict) and isinstance(
+                pc.get("observation"), dict):
+            has_observation = True
+            break
+    if has_observation and not has_cache_break:
+        out.append({
+            "kind": "ok_cache",
+            "summary": "cache healthy (no breaks)",
+        })
+
+    # Outcome: emit when none of the trajectory-level problem flags fired.
+    bad_outcome_kinds = {
+        "trajectory_artifact",
+        "log_stall",
+        "tool_call_leak",
+        "items_incomplete",
+        "retried_after_failure",
+        "state_transition_abnormal",
+    }
+    has_bad_outcome = any(
+        s.get("kind") in bad_outcome_kinds for s in problem_signals
+    )
+    if runs and not has_bad_outcome:
+        out.append({
+            "kind": "ok_outcome",
+            "summary": "no aborts/timeouts/stalls",
+        })
+
+    # Delivery: prefer to confirm a successful messaging-tool send when the
+    # run actually delivered. Otherwise (cron run with no failures) we
+    # confirm the absence of failures. If we have neither signal nor data,
+    # we say nothing — silence is correct here.
+    has_delivery_failure = any(
+        s.get("kind") == "cron_delivery_failed" for s in problem_signals
+    )
+    if delivery_run_summary and delivery_run_summary.get("did_send") \
+            and not has_delivery_failure:
+        targets = delivery_run_summary.get("targets") or []
+        text_count = delivery_run_summary.get("text_count") or 0
+        out.append({
+            "kind": "ok_delivery",
+            "summary": (
+                f"delivered ok ({len(targets)} targets, "
+                f"{text_count} texts)"
+            ),
+        })
+    elif cron_runs and not has_delivery_failure:
+        # When we have cron records but no failure signal, confirm.
+        out.append({
+            "kind": "ok_delivery",
+            "summary": (
+                f"delivered ok ({len(cron_runs)} cron records, "
+                "no failures)"
+            ),
+        })
+
+    return out
 
 
 # ── model-call extraction (with per-call duration) ────────────────────────
@@ -1749,6 +1934,116 @@ def _timeline_key_moments(timeline: List[Dict[str, Any]]) -> Dict[str, Any]:
     return out
 
 
+# ── timeline middle-event sampling (v1.4.10) ───────────────────────────────
+
+
+def _is_interesting_timeline_event(entry: Dict[str, Any]) -> bool:
+    """Whether a timeline entry is interesting enough to prioritize over an
+    evenly-spaced filler sample. Any log error/warn, state transition,
+    delivery event, model.completed, or tool-call boundary qualifies.
+    """
+    et = entry.get("event_type") or ""
+    src = entry.get("source") or ""
+    if et.startswith("log:ERROR") or et.startswith("log:WARN"):
+        return True
+    if src == "state":
+        return True
+    if src == "delivery":
+        return True
+    if et == "model.completed":
+        return True
+    summary = entry.get("summary") or ""
+    if "toolCall" in summary or "toolResult" in summary:
+        return True
+    return False
+
+
+def _timeline_sample(
+    timeline: List[Dict[str, Any]],
+    *,
+    skip_ts_ms: Optional[set] = None,
+    cap: int = TIMELINE_RENDER_SAMPLE,
+) -> List[Dict[str, Any]]:
+    """Build a bounded, chronological list of representative middle-of-the-
+    run timeline events.
+
+    Strategy:
+      1. Drop entries whose ``ts_ms`` is in ``skip_ts_ms`` (typically the
+         first/last/key-moment entries the renderer already shows).
+      2. Take every "interesting" entry (errors, warns, state transitions,
+         delivery, model.completed, tool-call boundaries) up to ``cap``.
+      3. Pad with evenly-spaced filler from the remaining entries so the
+         user can see the SHAPE of the run, not just its anomalies.
+      4. De-dup by (ts_ms, source, summary) and return chronological.
+
+    Linear time and bounded memory. ``skip_ts_ms`` may be ``None``.
+    """
+    if not timeline:
+        return []
+    skip = set(skip_ts_ms or ())
+
+    # Pre-filter once.
+    candidates = [e for e in timeline if e.get("ts_ms") not in skip]
+    if not candidates:
+        return []
+
+    # Small timelines: just return everything (chronological, deduped).
+    if len(candidates) <= cap:
+        seen: set = set()
+        out: List[Dict[str, Any]] = []
+        for e in candidates:
+            key = (e.get("ts_ms"), e.get("source"), e.get("summary"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(e)
+        return out
+
+    # Phase 1: prioritize interesting events, in order.
+    seen_keys: set = set()
+    chosen: List[Dict[str, Any]] = []
+    for e in candidates:
+        if not _is_interesting_timeline_event(e):
+            continue
+        key = (e.get("ts_ms"), e.get("source"), e.get("summary"))
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        chosen.append(e)
+        if len(chosen) >= cap:
+            break
+
+    # Phase 2: pad with evenly-spaced filler from the remaining pool, only
+    # if we have room. We sample by index so the picks span the run's
+    # full duration (helpful when interesting events all cluster near one
+    # end).
+    if len(chosen) < cap:
+        room = cap - len(chosen)
+        # Build the filler pool: candidates not yet chosen.
+        pool = [
+            e for e in candidates
+            if (e.get("ts_ms"), e.get("source"), e.get("summary"))
+            not in seen_keys
+        ]
+        n = len(pool)
+        if n and room:
+            # Even spacing across the pool's index range. step = max(1, n/room).
+            # We add room+1 anchors and take indices 0..room−1 to avoid
+            # always picking the same head/tail twice.
+            step = max(1, n // room)
+            for i in range(room):
+                idx = min(n - 1, i * step)
+                e = pool[idx]
+                key = (e.get("ts_ms"), e.get("source"), e.get("summary"))
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                chosen.append(e)
+
+    chosen.sort(key=lambda e: e.get("ts_ms") or 0)
+    return chosen[:cap]
+
+
 # ── representative log entries when only INFO is present ───────────────────
 
 
@@ -1866,39 +2161,20 @@ class PanoramaInspector:
             os.path.dirname(os.path.dirname(session_file))
         )
 
-        # Discover sibling files / data sources
+        # Discover sibling files / data sources. Note: app log discovery is
+        # deferred until after we have computed the session window — see
+        # below — because the older "today's mtime" heuristic excluded log
+        # files for sessions that ran on previous days, leaving Correlated
+        # Logs empty. v1.4.10 widens the candidate set to cover the window's
+        # filename-date range.
         traj_path = _trajectory_path_for(session_file)
         sessions_json_path = _sessions_json_for(session_file)
-        log_files = discover_recent_logs(str(ctx.log_dir))
         runs_sqlite_path = _runs_sqlite_path()
         if not os.path.isfile(runs_sqlite_path):
             runs_sqlite_path = None
 
-        sources_present: Dict[str, bool] = {
-            "session.jsonl": True,
-            "trajectory.jsonl": bool(traj_path),
-            "sessions.json": bool(sessions_json_path),
-            "app_log": bool(log_files),
-            "runs.sqlite": bool(runs_sqlite_path),
-        }
-
-        # Build correlation graph from every available source.
-        graph, child_rows = build_graph(
-            full_session_id,
-            session_file=session_file,
-            sessions_json_path=sessions_json_path,
-            trajectory_path=traj_path,
-            app_log_files=log_files,
-            runs_sqlite_path=runs_sqlite_path,
-        )
-
-        cron_run_path: Optional[str] = None
-        if graph.cron_job_id:
-            cron_run_path = _cron_run_path(graph.cron_job_id)
-            if cron_run_path:
-                sources_present["cron/runs"] = True
-
-        # Resolve run selection.
+        # Resolve run selection (used to compute the window before we go
+        # discover the right log files for it).
         traj_runs = _group_trajectory_runs(traj_path) if traj_path else []
         run_index = kwargs.get("run_index")
         all_runs = bool(kwargs.get("all_runs"))
@@ -1927,6 +2203,38 @@ class PanoramaInspector:
             window_start = min(record_ts) if record_ts else 0
             window_end = max(record_ts) if record_ts else 0
         duration_ms = max(0, window_end - window_start) if window_end else 0
+
+        # v1.4.10: pick log files whose filename date intersects the window
+        # (with a ±1 day margin) so a session whose run finished on a
+        # previous day still pulls in that day's log. When the window is 0
+        # the helper falls back to ``discover_recent_logs``.
+        log_files = discover_logs_for_window(
+            str(ctx.log_dir), window_start, window_end,
+        )
+
+        sources_present: Dict[str, bool] = {
+            "session.jsonl": True,
+            "trajectory.jsonl": bool(traj_path),
+            "sessions.json": bool(sessions_json_path),
+            "app_log": bool(log_files),
+            "runs.sqlite": bool(runs_sqlite_path),
+        }
+
+        # Build correlation graph from every available source.
+        graph, child_rows = build_graph(
+            full_session_id,
+            session_file=session_file,
+            sessions_json_path=sessions_json_path,
+            trajectory_path=traj_path,
+            app_log_files=log_files,
+            runs_sqlite_path=runs_sqlite_path,
+        )
+
+        cron_run_path: Optional[str] = None
+        if graph.cron_job_id:
+            cron_run_path = _cron_run_path(graph.cron_job_id)
+            if cron_run_path:
+                sources_present["cron/runs"] = True
 
         # Filter app logs through correlation graph, then bound to the
         # session window so we don't drag in unrelated traffic that just
@@ -2021,6 +2329,16 @@ class PanoramaInspector:
             waterfall=waterfall, children=children,
             cron_runs=cron_runs, log_decisions=log_decisions,
             log_parsed=log_parsed,
+        )
+        # v1.4.10: positive (OK) signals so a healthy run shows confirmation
+        # lines, not just an empty Health Signals section. Additive only —
+        # they never affect the verdict.
+        positive_signals = _positive_health_signals(
+            selected_runs or traj_runs,
+            waterfall=waterfall,
+            problem_signals=signals,
+            delivery_run_summary=delivery_run_summary,
+            cron_runs=cron_runs,
         )
 
         # v1.4.4 task F: the gateway log carries an authoritative end-to-
@@ -2119,6 +2437,9 @@ class PanoramaInspector:
         report.data["model_calls"] = model_calls
         report.data["model_aggregate"] = model_aggregate
         report.data["health_signals"] = signals
+        # v1.4.10: positive signals on the JSON envelope so consumers can
+        # render their own "what looks fine" summary alongside problems.
+        report.data["positive_health_signals"] = positive_signals
         report.data["child_tasks"] = children
         report.data["session_stats"] = session_stats
         # v1.4.4: surface the parsed log buckets and the OTel traceIds we
@@ -2502,6 +2823,32 @@ class PanoramaInspector:
                     f"{fs.get('summary', '')[:140]}",
                     data=fs,
                 )
+            # v1.4.10: representative middle-of-the-run sample. Earlier
+            # versions only rendered first/last/key moments, hiding the
+            # shape of the run itself. The sample is deduped against the
+            # already-rendered anchors and capped at TIMELINE_RENDER_SAMPLE.
+            already_rendered_ts = {timeline[0]["ts_ms"], timeline[-1]["ts_ms"]}
+            for keymom in (
+                timeline_keys.get("first_error"),
+                timeline_keys.get("first_warn"),
+                timeline_keys.get("first_stall"),
+            ):
+                if keymom and keymom.get("ts_ms"):
+                    already_rendered_ts.add(keymom["ts_ms"])
+            sample = _timeline_sample(
+                timeline,
+                skip_ts_ms=already_rendered_ts,
+                cap=TIMELINE_RENDER_SAMPLE,
+            )
+            for idx, entry in enumerate(sample, 1):
+                summary = (entry.get("summary") or "")[:100]
+                ts = entry.get("ts_ms") or 0
+                src = entry.get("source") or "?"
+                s_timeline.ok(
+                    f"timeline.sample.{idx:02d}",
+                    f"[{fmt_epoch_local(ts)}] {src} · {summary}",
+                    data=entry,
+                )
 
         # (Standalone "Runtime Context" section removed in v1.4.3 — its
         # fields were folded into Session Overview above. The per-run
@@ -2785,14 +3132,25 @@ class PanoramaInspector:
         #  deliveries surface as a kind=cron_delivery_failed health signal so
         #  the verdict still degrades correctly.)
 
-        # 7. Health Signals — with timestamps + richer data
+        # 7. Health Signals — with timestamps + richer data. v1.4.10 also
+        # renders positive (OK) signals so a healthy run is visible, not
+        # just an empty section.
         s_health = report.section("Panorama · Health Signals")
         if not signals:
             s_health.ok(
                 "health.clean",
                 "no abort/timeout/leak/stall signals",
             )
-        else:
+        # Positive signals come first when present, regardless of whether
+        # there are also problems — they answer "what IS fine?" up front.
+        for psig in positive_signals:
+            kind = psig.get("kind") or "ok"
+            s_health.ok(
+                f"health.{kind}",
+                psig.get("summary") or "",
+                data=psig,
+            )
+        if signals:
             for sig in signals:
                 kind = sig.get("kind", "?")
                 ts_ms = sig.get("ts_ms") or 0
@@ -2832,12 +3190,36 @@ class PanoramaInspector:
                         data=sig,
                     )
                 elif kind == "long_tool_call":
-                    err_s = " (error)" if sig.get("is_error") else ""
+                    # v1.4.10: render the call's args + (when present) an
+                    # error or result snippet, so the line names WHICH
+                    # invocation hung — e.g. "cron(action=update,
+                    # jobId=0cdb2836) 2.4m → error: patch required"
+                    # — instead of just "cron 2.4m (error)".
+                    name = sig.get("name") or "?"
+                    args_s = sig.get("args_summary") or ""
+                    # Convert the waterfall's {k=v, k=v} curly format to
+                    # paren-wrapped (k=v, k=v) so the rendering reads like
+                    # a function call. The signal itself preserves the
+                    # original {} string for any consumer that already
+                    # depends on _format_args_inline output shape.
+                    if (args_s.startswith("{") and args_s.endswith("}")):
+                        paren_args = "(" + args_s[1:-1] + ")"
+                    else:
+                        paren_args = f"({args_s})" if args_s else ""
+                    name_call = f"{name}{paren_args}" if paren_args else name
+                    dur_s = fmt_duration(
+                        (sig.get("duration_ms") or 0) / 1000
+                    )
+                    snippet = sig.get("snippet") or ""
+                    if sig.get("is_error"):
+                        tail = (
+                            f" → error: {snippet}" if snippet else " (error)"
+                        )
+                    else:
+                        tail = f" → {snippet}" if snippet else ""
                     s_health.warn(
                         f"health.{kind}.{ts_ms}",
-                        f"{tsfx}long tool call: {sig.get('name')} "
-                        f"{fmt_duration((sig.get('duration_ms') or 0) / 1000)}"
-                        f"{err_s}",
+                        f"{tsfx}long tool call: {name_call} {dur_s}{tail}",
                         data=sig,
                     )
                 elif kind == "last_tool_error":

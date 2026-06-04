@@ -1,5 +1,67 @@
 # Changelog
 
+## v1.4.10 — three user-reported panorama fixes (2026-06-04)
+
+### Fixed
+- **T1: Correlated Logs no longer empty for older sessions.** The previous
+  log discovery (`discover_recent_logs`) selected files by mtime ≥ today
+  00:00, so for a session that ran yesterday (or earlier) the relevant
+  log file's mtime was already stale and got skipped — leaving Correlated
+  Logs at zero entries. Added `discover_logs_for_window(log_dir,
+  window_start_ms, window_end_ms)` in `recent_logs.py` that selects log
+  files by **filename date** intersecting the session window (with a ±1
+  day margin for midnight / timezone boundaries), unioned with the
+  existing recent-mtime set so today's live log keeps flowing. The
+  inspector now computes the session window FIRST, then discovers logs
+  for that window. Window-bound (±5s) filtering still does the precise
+  slice. Verified on session e37602da: 0 → 277 correlated entries.
+
+### Added
+- **T2a: Enriched `long_tool_call` health signal.** The signal now carries
+  `args_summary` and `snippet` (error/result text), and the rendered line
+  reads e.g. `long tool call: cron(action=update,
+  jobId=0cdb2836-3791-468e-a756-d6b8af97d894) 2.4m → error: patch
+  required` instead of the previous `long tool call: cron 2.4m (error)`.
+  Args summary respects the existing waterfall masking (already sanitized
+  upstream when `--mask` is set). Raw `args` / `result_text` /
+  `error_text` remain on the waterfall entry for JSON consumers needing
+  the full payload.
+- **T2b: Positive (OK) health signals.** A healthy run no longer leaves
+  Health Signals as a single "no signals" line. Concise per-aspect
+  positive signals are emitted: `ok_tools` ("N tool calls, 0 errors" or
+  "M/N tool calls ok"), `ok_lifecycle` ("no leaks (active=0), all N
+  items completed"), `ok_cache` ("cache healthy (no breaks)" — only when
+  an observation is present), `ok_outcome` ("no aborts/timeouts/stalls"),
+  `ok_delivery` ("delivered ok ..." or cron records confirmed). They are
+  **additive only** — they never affect the verdict, and problem
+  ⚠/✗ lines still render alongside. Surfaced on `report.data
+  ["positive_health_signals"]`.
+- **T3: Timeline middle-event sample.** The Timeline section previously
+  showed only first / last / first error / first warn / first stall,
+  hiding the shape of long sessions. Added a `timeline.sample.*` block
+  with up to `TIMELINE_RENDER_SAMPLE` (=20) chronological,
+  de-duplicated entries between the anchors. Selection prioritizes
+  interesting events (log:ERROR/WARN, state transitions, delivery,
+  model.completed, tool calls), then pads with evenly-spaced filler so
+  the run's overall structure is visible. Linear-time, bounded.
+
+### Tests
+- T1: `test_discover_logs_for_window_includes_yesterday`,
+  `test_discover_logs_for_window_zero_falls_back`,
+  `test_discover_logs_for_window_excludes_far_dates`,
+  `test_panorama_correlates_yesterday_log` (integration with synthetic
+  yesterday-dated log + backdated mtime).
+- T2a: `test_long_tool_call_renders_args_and_error` — asserts new fields
+  on the signal and the args+error rendering on the human output.
+- T2b: `test_positive_health_signals_clean_run`,
+  `test_positive_signals_do_not_change_verdict`.
+- T3: `test_timeline_sample_renders_middle_events`,
+  `test_timeline_sample_helper_dedup_and_bounds`,
+  `test_timeline_sample_small_timeline_returns_all`.
+- e2e: `test_e2e_real_session_e37_v1_4_10_improvements` against real
+  session e37602da.
+- 87 tests total, all green; both 100k-line perf tests still pass.
+
 ## v1.4.9 — remove misleading "longest gap" timeline metric (2026-06-04)
 
 ### Changed

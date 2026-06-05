@@ -1,5 +1,57 @@
 # Changelog
 
+## v1.4.19 — SKILL.md upgraded to AI-agent diagnostic playbook (2026-06-05)
+
+### Changed
+- **`skill/openclaw-diag/SKILL.md`** rewritten from a command-reference + panorama
+  description into an operating procedure for AI agents diagnosing OpenClaw.
+  Frontmatter (`name`, `description` triggers, `metadata.requires`) is unchanged
+  so existing skill-discovery hits keep working.
+  - **Preflight** section added — tells the agent to confirm execution context
+    (`--version`, `npx` fallback, ask for SSH/container access or explicit
+    `--openclaw-home`/`--log-dir`/`--sessions-base`/`--config` when running
+    off-host, run `doctor --format json` when uncertain) before diagnosing.
+  - **Decision Ladder** added as the primary routing rule (no UUID + symptom →
+    `all`; UUID + open-ended → `panorama`; UUID + specific message → `trace`;
+    raw records → `extract`). The existing **Routing** table is kept as a
+    quick lookup, with `Session stuck` reworded to `Specific message
+    stuck/slow → trace` plus a new `Session health / why / 全貌 → panorama`
+    row so the table no longer conflicts with the ladder.
+  - **Panorama · empty correlated logs** — four-state interpretation guide
+    aligned to the real check names emitted by `_render_section` in
+    `panorama.py` (`logs.not_retained`, `logs.uncorrelated`, `logs.missing`,
+    `logs.none`). Crucially `logs.none` is now described as the
+    unknown-window degenerate fallback, not a generic "no correlated entries"
+    catch-all.
+  - **Masking policy** consolidated into a single global rule under Safety
+    Rules (`trace`/`panorama` unmasked by default → pass `--mask` when
+    sharing; `extract` masked by default → `--unmask` only for trusted local
+    use; config/log collectors redact secrets). The per-command sections now
+    reference the global rule instead of repeating it.
+  - **Final answer contract** strengthened — added "do not present a root
+    cause unless directly supported by checks/logs", "Evidence observed →
+    Interpretation → Confidence / limits → Safe next checks" structure, and
+    "do not recommend restart/config changes unless the user asks".
+  - **De-versioned section descriptions** — Panorama section heading is now
+    `Panorama sections currently include:` instead of pinning a specific
+    version, and changelog-style historical notes ("Per-call duration was
+    removed in v1.4.5", "v1.4.13 — 7 sections") are removed. Behavioral
+    information the agent needs (Findings-first ordering, merged Correlated
+    Logs & Signals, `--mask`, `--all-runs`, four empty-log states) is
+    preserved.
+  - **Common Pitfalls** section added at the end — exit code `1` is not a
+    CLI failure; `ok=true` with `verdict=fail` is a real finding;
+    `logs.not_retained` is a retention artefact, not absence of errors;
+    `panorama` defaults to latest run only.
+- Version bumped to **1.4.19** across `package.json`, `pyproject.toml`, and
+  `ocdiag/__init__.py`. SKILL.md is shipped in the npm package, so the bump
+  is required for the new playbook to reach installed Agent harnesses.
+
+### Validation
+- `python3 -m pytest tests/test_panorama.py -q` — 109 passed, 1 skipped, 0
+  failed. SKILL.md is documentation only; the bump exercises
+  `doctor.ocdiag` reading `__version__` cleanly.
+
 ## v1.4.18 — honest empty-correlation states (2026-06-05)
 
 ### Changed

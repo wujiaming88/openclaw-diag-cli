@@ -16,9 +16,44 @@ Use `openclaw-diag` to diagnose OpenClaw systems. Diagnostic commands are observ
 - Treat exit code `1` as "diagnostic found warn/fail", not command failure.
 - Treat top-level `{ok:false}` as command/input/runtime failure.
 - Do not paste large raw JSON back to the user; summarize module verdicts, evidence, and next checks.
-- Trajectory-sourced fields may contain plaintext message/tool content. Use `trace --mask` when output may be shared.
-- `extract` is masked by default. Use `--unmask` only for trusted local analysis.
 - Some collectors perform read-only DNS/TCP/HTTP probes. Do not run fix/restart/write commands unless the user separately asks.
+
+Masking policy (global):
+- `trace` and `panorama` are UNMASKED by default; pass `--mask` unless output stays local AND the user explicitly needs raw content.
+- `extract` is MASKED by default; use `--unmask` only for trusted local analysis.
+- Config/log collectors redact secrets by default.
+
+## Preflight
+
+Before diagnosing, confirm the target execution context.
+
+1. Run `openclaw-diag --version`.
+2. If the command is missing, try `npx openclaw-diag-cli --version` or ask the user where to run it.
+3. If running outside the OpenClaw host/container, do not infer from local files; ask for SSH/container access or explicit `--openclaw-home`, `--log-dir`, `--sessions-base`, `--config`.
+4. Run `openclaw-diag doctor --format json` when environment access is uncertain.
+
+## Decision Ladder
+
+- No session UUID + broad symptom → `all --format json`.
+- Session UUID + open-ended question / health / slow / stuck / "why" → `panorama <uuid> --format json --mask`.
+- Session UUID + one specific user message/turn → `trace <uuid> --format json --mask`.
+- Need raw transcript / count / filter records → `extract <uuid> --summary --format json` first.
+- A collector verdict is warn/fail → run that collector alone only if more detail is needed.
+
+## Routing
+
+| Symptom | Start with |
+|---|---|
+| General health / unknown issue | `openclaw-diag all --format json` |
+| Slow response / high latency | `openclaw-diag performance --format json` |
+| Gateway down / cannot connect | `openclaw-diag gateway --format json` |
+| Recent failures / errors | `openclaw-diag recent_errors --format json` |
+| Cron not firing / no delivery | `openclaw-diag cron_jobs --format json` |
+| Task/subagent 失败 | `openclaw-diag task_health --format json` |
+| Plugin issue | `openclaw-diag plugin_diag --format json` |
+| Session health / why / 全貌 | `openclaw-diag panorama <uuid> --format json --mask` |
+| Specific message stuck/slow → trace | `openclaw-diag trace <uuid> --format json --mask` |
+| Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
 
 ## Workflow
 
@@ -48,25 +83,13 @@ openclaw-diag all --format json
    - Evidence from check messages, not full dumps
    - Recommended next commands or manual checks
    - Any limits: missing logs, missing trajectory, ambiguous session, unavailable tools
-
-## Routing
-
-| Symptom | Start with |
-|---|---|
-| General health / unknown issue | `openclaw-diag all --format json` |
-| Slow response / high latency | `openclaw-diag performance --format json` |
-| Gateway down / cannot connect | `openclaw-diag gateway --format json` |
-| Recent failures / errors | `openclaw-diag recent_errors --format json` |
-| Cron not firing / no delivery | `openclaw-diag cron_jobs --format json` |
-| Task/subagent 失败 | `openclaw-diag task_health --format json` |
-| Plugin issue | `openclaw-diag plugin_diag --format json` |
-| Session stuck | `openclaw-diag trace <uuid> --format json --mask` |
-| Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
-| Full session diagnosis (everything correlated to one UUID) | `openclaw-diag panorama <uuid> --format json` |
+   - Do not present a root cause unless directly supported by checks/logs.
+   - Structure the answer as: Evidence observed → Interpretation → Confidence / limits → Safe next checks.
+   - Do not recommend restart/config changes unless the user asks for remediation.
 
 ## Trace
 
-Use trace when the user provides a session UUID or asks why one message got stuck/slow.
+Use trace when the user provides a session UUID or asks why one specific message got stuck/slow.
 
 ```bash
 openclaw-diag trace <uuid> --format json --mask
@@ -74,7 +97,7 @@ openclaw-diag trace <uuid> --msg-index 0 --format json --mask
 openclaw-diag trace <uuid> --msg-match "text" --format json --mask
 ```
 
-If `SESSION_NOT_FOUND`, ask for a longer UUID prefix or use the recent-session hint.
+If `SESSION_NOT_FOUND`, ask for a longer UUID prefix or use the recent-session hint. Apply the global masking policy.
 
 ## Extract
 
@@ -86,27 +109,27 @@ openclaw-diag extract <uuid> --format json
 openclaw-diag extract <uuid> --all --format json
 ```
 
-Avoid `--unmask` unless the user explicitly needs raw local content.
+Apply the global masking policy (extract is masked by default).
 
 ## Panorama
 
 Use panorama when given a session UUID and asked an open-ended health
 question ("是否健康?", "为什么这条 session 卡住?", "把所有相关信息拉出来",
 "执行慢不慢", "工具有没有异常", "模型性能好不好"). It walks every standard
-data source and produces a complete execution picture:
+data source and produces a complete execution picture.
 
-**Sections (v1.4.13 — 7 sections, Findings-first ordering):**
-- **Findings** — objective triage summary, rendered first. Re-surfaces the worst already-computed problem signals using a deterministic severity ordering. No inferred causes, no recommendations.
-- **Session Overview** — IDs, trigger, model, time window, activity stats (model calls / tool calls / errors / tokens / cost), sources, verdict. Runtime context (prompt chars, tools/skills/plugins, workspace files, bootstrap truncation, stream strategy) is folded in here — there is no longer a standalone "Runtime Context" section.
-- **Timeline** — first/last events, first error/stall timestamp, plus a sampled middle slice for long runs. (Per-call duration / tok/s / "longest gap" metrics were removed in v1.4.5.)
-- **Model Calls** — per-model performance breakdown + every model call with output tokens, stopReason, triggered tools, cache stats. (Per-call duration was removed; route model-selection/fallback events through Correlated Logs & Signals as `log_decision` health entries.)
-- **Tool Execution** — per-call detail with args + result/error message, timing stats (avg/p50/p95/max).
-- **Correlated Logs & Signals** — merged section (was two: "Correlated Logs" + "Health Signals"). Includes the Findings-aligned signal list (sorted by severity), positive signals ("what looks fine"), ERROR/WARN raw entries with full text, and representative INFO entries when the window is quiet. There is no standalone "Model Decisions" section anymore — those decisions surface here as `log_decision` signals.
+**Panorama sections currently include:**
+- **Findings** — objective triage summary, rendered first. Re-surfaces the worst already-computed problem signals using deterministic severity ordering. No inferred causes, no recommendations.
+- **Session Overview** — IDs, trigger, model, time window, activity stats (model calls / tool calls / errors / tokens / cost), sources, verdict, plus runtime context (prompt chars, tools/skills/plugins, workspace files, bootstrap truncation, stream strategy).
+- **Timeline** — first/last events, first error/stall timestamp, plus a sampled middle slice for long runs.
+- **Model Calls** — per-model breakdown and every model call with output tokens, stopReason, triggered tools, cache stats. Model-selection/fallback events surface in Correlated Logs & Signals as `log_decision` entries.
+- **Tool Execution** — per-call args + result/error, with timing stats (avg/p50/p95/max).
+- **Correlated Logs & Signals** — Findings-aligned signals (sorted by severity), positive signals, ERROR/WARN raw entries, representative INFO when the window is quiet.
 - **Child Tasks** — failed tasks with error message, succeeded count.
 
 ```bash
-openclaw-diag panorama <uuid> --format json
-openclaw-diag panorama <uuid> --all-runs --format json
+openclaw-diag panorama <uuid> --format json --mask
+openclaw-diag panorama <uuid> --all-runs --format json --mask
 openclaw-diag panorama <uuid> --strict-correlation --format json --mask
 ```
 
@@ -115,16 +138,18 @@ correlation graph expanded from `sessionId` (sessionKey, runIds,
 toolCallIds, childSessionIds, cronJobId). Each correlated log entry is
 annotated with `correlation.path`.
 
-- Default: latest run only. Use `--run-index N` or `--all-runs` for
-  persistent multi-run sessions.
+- Default: latest run only. Use `--run-index N` or `--all-runs` for persistent multi-run sessions.
 - `--strict-correlation` only matches sessionId/runId (drops sessionKey/toolCallId matches).
-- `--mask` (opt-in) sanitizes tool arguments, result text, message bodies, and correlated log entries (raw ERROR/WARN/INFO render + JSON envelope). Default is unmasked — pass `--mask` when sharing output externally.
+
+Interpret empty correlated logs carefully (the section surfaces one of these check names):
+- `logs.not_retained`: the session-window log file is missing/rotated from log_dir. Do NOT claim the session produced no log evidence — the evidence existed but was rotated away (retention issue, not a session bug).
+- `logs.uncorrelated`: the session-date log file exists but no line carries this sessionId/runId. Mention a possible logging/correlation gap (e.g. older harness not stamping ids) worth investigating.
+- `logs.missing`: no app log files were found in log_dir at all.
+- `logs.none`: the session window is unknown/unclassifiable, so correlation can't be scoped — report it as a limitation.
 
 Verdict mapping:
-- `fail`: trajectory `aborted/timedOut`, child task failed, or any
-  ERROR-level correlated log.
-- `warn`: WARN-level correlated log, model fallback / context overflow
-  decision, stall log, plugin activation error, or E2E > 5min.
+- `fail`: trajectory `aborted/timedOut`, child task failed, or any ERROR-level correlated log.
+- `warn`: WARN-level correlated log, model fallback / context overflow decision, stall log, plugin activation error, or E2E > 5min.
 - `ok`: everything clean.
 
 ## JSON Notes
@@ -136,3 +161,11 @@ Verdict mapping:
 - Exit code `1`: command succeeded and found warn/fail diagnostics.
 - Exit code `2`: bad input or missing/ambiguous session.
 - Exit code `3`: runtime failure.
+
+## Common Pitfalls
+
+- Exit code `1` means diagnostics found warn/fail signals — it is NOT a CLI failure.
+- `ok=true` with `verdict=fail` means the command succeeded AND found a real diagnostic failure. Report the failure, not a tool error.
+- Missing trajectory/logs limits confidence — always report the missing source.
+- `logs.not_retained` is a log-retention artifact, NOT proof that no error happened.
+- `panorama` defaults to the latest run only; earlier failed attempts may be hidden — use `--all-runs` for persistent multi-run sessions.

@@ -2600,9 +2600,14 @@ def test_timeline_sample_small_timeline_returns_all():
     reason="real session e37602da fixture not present on this host",
 )
 def test_e2e_real_session_e37_v1_4_10_improvements():
-    """v1.4.10 e2e: the real e37602da session must now show
-    correlated logs > 0 (T1), enriched long-tool-call signals (T2a),
-    and timeline middle-sample lines (T3).
+    """v1.4.10 e2e: the real e37602da session exercises three improvements
+    end-to-end: correlation against app logs (T1), enriched long-tool-call
+    signals (T2a), and timeline middle-sample lines (T3).
+
+    T1 semantics (data-aware since v1.4.18): if the session-window log is
+    still on disk we expect correlated_logs > 0; if /tmp log retention
+    rotated it away, the tool now honestly emits `logs.not_retained` and
+    we verify that instead of fabricating a correlation count.
     """
     cfg = REAL_HOME / "config.json"
     ctx = DiagContext(
@@ -2619,10 +2624,24 @@ def test_e2e_real_session_e37_v1_4_10_improvements():
         all_runs=True,
     )
     assert report.error is None, f"unexpected error: {report.error}"
-    # T1: correlated logs > 0
-    assert len(report.data["correlated_logs"]) > 0, (
-        "T1 regression: correlated_logs empty for older session"
-    )
+    # T1: correlation pulls in app logs — but only verifiable when the
+    # session-window log is still on disk. On hosts with short /tmp log
+    # retention the session-date log is rotated away; v1.4.18 then
+    # honestly reports `logs.not_retained` instead of fabricating
+    # correlation. Make the assertion data-aware so it tracks real
+    # behavior either way.
+    all_checks = [c for s in report.sections for c in s.checks]
+    not_retained = [c for c in all_checks if c.name == "logs.not_retained"]
+    if not_retained:
+        assert "not retained" in not_retained[0].message.lower(), (
+            "expected honest not_retained message when session-window "
+            "log is rotated away"
+        )
+    else:
+        assert len(report.data["correlated_logs"]) > 0, (
+            "T1 regression: correlated_logs empty though session-window "
+            "log is present"
+        )
     # T2a: at least one long_tool_call signal carrying args + snippet
     sigs = report.data["health_signals"]
     longs = [s for s in sigs if s.get("kind") == "long_tool_call"]

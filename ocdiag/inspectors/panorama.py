@@ -570,16 +570,39 @@ def _build_tool_waterfall(
     return [calls[cid] for cid in order]
 
 
+def _fmt_tool_dur(ms: Optional[int]) -> str:
+    """Humanize a tool-call duration. Sub-second keeps ms precision so the
+    waterfall column can show the difference between a 12ms call and a
+    900ms one. ``fmt_duration`` rounds anything <0.5s to "0s", which loses
+    that signal.
+    """
+    if ms is None:
+        return "?"
+    if ms < 1000:
+        return f"{ms}ms"
+    if ms < 60000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms / 60000:.1f}m"
+
+
+def _collapse_ws(text: str) -> str:
+    """Fold runs of whitespace (including newlines and the multi-space
+    artifacts left by JSON pretty-printing) into a single space.
+    """
+    return re.sub(r"\s+", " ", text).strip()
+
+
 def _format_args_inline(args: Any, *, max_total: int = 80) -> str:
     """Render ``args`` as a compact inline string for the tool waterfall.
 
     Each value is truncated to 50 chars; the whole rendering is capped at
-    ``max_total`` chars.
+    ``max_total`` chars. Whitespace runs (e.g. the indentation spaces left
+    after ``json.dumps`` of a nested object) are collapsed to single spaces.
     """
     if args is None:
         return ""
     if not isinstance(args, dict):
-        s = str(args)
+        s = _collapse_ws(str(args))
         return s if len(s) <= max_total else s[:max_total - 1] + "…"
     parts: List[str] = []
     for k, v in args.items():
@@ -590,6 +613,7 @@ def _format_args_inline(args: Any, *, max_total: int = 80) -> str:
                 vs = str(v)
         else:
             vs = str(v)
+        vs = _collapse_ws(vs)
         if len(vs) > 50:
             vs = vs[:49] + "…"
         parts.append(f"{k}={vs}")
@@ -603,9 +627,9 @@ def _format_result_inline(entry: Dict[str, Any], *, max_chars: int = 80) -> str:
     """Compact one-line summary of a tool result for the waterfall."""
     if entry.get("is_error"):
         err = entry.get("error_text") or entry.get("result_text") or "error"
-        text = err.replace("\n", " ").strip()
+        text = _collapse_ws(err)
     else:
-        text = (entry.get("result_text") or "").replace("\n", " ").strip()
+        text = _collapse_ws(entry.get("result_text") or "")
     if not text:
         return ""
     if len(text) > max_chars:
@@ -3299,31 +3323,63 @@ class PanoramaInspector:
             s_tools.ok("tools.none", "no tool calls in this run")
         else:
             if wf_stats["completed"]:
+                summary_parts = [
+                    f"{wf_stats['total']} calls",
+                    f"{wf_stats['errors']} err",
+                    f"avg {_fmt_tool_dur(int(round(wf_stats['avg_ms'])))}",
+                    f"p50 {_fmt_tool_dur(wf_stats['p50_ms'])}",
+                    f"p95 {_fmt_tool_dur(wf_stats['p95_ms'])}",
+                    f"max {_fmt_tool_dur(wf_stats['max_ms'])}",
+                ]
+                slow = wf_stats.get("slowest")
+                if slow and slow.get("name"):
+                    summary_parts.append(
+                        f"slowest {slow['name']}"
+                        f"({_fmt_tool_dur(slow.get('duration_ms'))})"
+                    )
                 s_tools.ok(
                     "tools.timing",
-                    f"{wf_stats['total']} calls "
-                    f"({wf_stats['errors']} errors) | "
-                    f"avg={wf_stats['avg_ms']}ms p50={wf_stats['p50_ms']}ms "
-                    f"p95={wf_stats['p95_ms']}ms max={wf_stats['max_ms']}ms",
+                    " · ".join(summary_parts),
                     data=wf_stats,
                 )
+            # Column widths: keep #idx and name padded so the eye can
+            # stripe down the duration column. Names longer than the pad
+            # render flush — better than wrapping a column we don't own.
+            IDX_W = 4
+            NAME_W = 16
+            DUR_W = 6
+            INLINE_RESULT_MAX = 48
             for idx, t in enumerate(waterfall, 1):
                 name = t.get("name", "?")
                 dur = t.get("duration_ms")
-                dur_s = f"{dur}ms" if dur is not None else "?"
+                dur_s = _fmt_tool_dur(dur)
                 is_err = t.get("is_error")
                 v = Verdict.WARN if is_err else Verdict.OK
-                status = "✗" if is_err else "✓"
                 args_s = _format_args_inline(t.get("args"))
                 result_s = _format_result_inline(t)
-                line = f"#{idx} {name} {dur_s} {status}"
+                idx_f = f"#{idx}".ljust(IDX_W)
+                name_f = name if len(name) > NAME_W else name.ljust(NAME_W)
+                dur_f = dur_s.rjust(DUR_W)
+                header = f"{idx_f} {name_f} {dur_f}"
                 if args_s:
-                    line += f" args={args_s}"
+                    header += f"  {args_s}"
+                detail: Optional[str] = None
                 if result_s:
-                    arrow = " ⇒ ERR " if is_err else " → "
-                    line += arrow + result_s
+                    arrow = "⇒ ERR " if is_err else "→ "
+                    snippet = arrow + result_s
+                    # Short snippets ride along on the header; long ones
+                    # drop to a continuation line so each call stays
+                    # vertically scannable.
+                    if (
+                        len(result_s) <= INLINE_RESULT_MAX
+                        and len(header) + 2 + len(snippet) <= 110
+                    ):
+                        header += f"  {snippet}"
+                    else:
+                        detail = snippet
                 s_tools.add(
-                    f"tools.call.{idx}", v, line, data=t,
+                    f"tools.call.{idx}", v, header,
+                    detail=detail, data=t,
                 )
 
         # 5. Correlated Logs & Signals — v1.4.11 merges the standalone

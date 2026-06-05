@@ -3670,6 +3670,279 @@ def test_model_calls_exclude_openclaw_transcript_only_injections(tmp_path: Path)
     assert "delivery-mirror: 2 calls" not in text
 
 
+# ── v1.4.17 Tool Execution rendering ──────────────────────────────────────
+
+
+def test_fmt_tool_dur_helper():
+    """Sub-second keeps ms precision; second/minute scales humanize."""
+    from ocdiag.inspectors.panorama import _fmt_tool_dur
+    assert _fmt_tool_dur(None) == "?"
+    assert _fmt_tool_dur(0) == "0ms"
+    assert _fmt_tool_dur(234) == "234ms"
+    assert _fmt_tool_dur(999) == "999ms"
+    assert _fmt_tool_dur(1000) == "1.0s"
+    assert _fmt_tool_dur(4797) == "4.8s"
+    assert _fmt_tool_dur(59999) == "60.0s"
+    assert _fmt_tool_dur(60000) == "1.0m"
+    assert _fmt_tool_dur(141665) == "2.4m"
+
+
+def test_collapse_ws_helper():
+    """JSON pretty-print artefacts collapse to single spaces."""
+    from ocdiag.inspectors.panorama import _collapse_ws
+    assert _collapse_ws("a    b") == "a b"
+    assert _collapse_ws("{\n  \"a\":  1,\n  \"b\":  2\n}") == "{ \"a\": 1, \"b\": 2 }"
+    assert _collapse_ws("  leading   trailing  ") == "leading trailing"
+
+
+def _build_tool_render_fixture(tmp: Path) -> tuple:
+    """Synthetic session covering the full render matrix:
+    short-success / long-JSON-success / short-error / long-error / pending.
+    Returns (ctx, session_id) — caller runs panorama and renders.
+    """
+    home = tmp / "tool-render-home"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp / "tool-render-logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "12345678-aaaa-bbbb-cccc-1234567890ab"
+    long_json_result = json.dumps(
+        {"results": [], "disabled": True, "unavailable": True,
+         "error": "No API key configured for memory_search"},
+        indent=2,
+    )
+    long_error_text = (
+        'Validation failed for tool "edit":   - edits.0: must not have '
+        "additional properties (this is a long error that needs to drop "
+        "to a continuation line)"
+    )
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        {"type": "message", "id": "u1", "timestamp": _ms_to_iso(T0),
+         "message": {"role": "user", "timestamp": T0, "content": "go"}},
+        # #1 short success
+        {"type": "message", "id": "a1", "timestamp": _ms_to_iso(T0 + 1),
+         "message": {"role": "assistant", "timestamp": T0 + 1,
+                     "content": [{"type": "toolCall", "id": "tc1",
+                                  "name": "Bash", "input": {"cmd": "ls"}}]}},
+        {"type": "message", "id": "r1", "timestamp": _ms_to_iso(T0 + 200),
+         "message": {"role": "toolResult", "timestamp": T0 + 200,
+                     "toolCallId": "tc1", "toolName": "Bash",
+                     "isError": False, "content": "ok\n"}},
+        # #2 long JSON success
+        {"type": "message", "id": "a2", "timestamp": _ms_to_iso(T0 + 1000),
+         "message": {"role": "assistant", "timestamp": T0 + 1000,
+                     "content": [{"type": "toolCall", "id": "tc2",
+                                  "name": "memory_search",
+                                  "input": {"query": "lookup"}}]}},
+        {"type": "message", "id": "r2", "timestamp": _ms_to_iso(T0 + 5797),
+         "message": {"role": "toolResult", "timestamp": T0 + 5797,
+                     "toolCallId": "tc2", "toolName": "memory_search",
+                     "isError": False, "content": long_json_result}},
+        # #3 short error
+        {"type": "message", "id": "a3", "timestamp": _ms_to_iso(T0 + 6000),
+         "message": {"role": "assistant", "timestamp": T0 + 6000,
+                     "content": [{"type": "toolCall", "id": "tc3",
+                                  "name": "cron",
+                                  "input": {"action": "update", "jobId": "abc"}}]}},
+        {"type": "message", "id": "r3", "timestamp": _ms_to_iso(T0 + 147665),
+         "message": {"role": "toolResult", "timestamp": T0 + 147665,
+                     "toolCallId": "tc3", "toolName": "cron",
+                     "isError": True, "content": "patch required"}},
+        # #4 long error
+        {"type": "message", "id": "a4", "timestamp": _ms_to_iso(T0 + 148000),
+         "message": {"role": "assistant", "timestamp": T0 + 148000,
+                     "content": [{"type": "toolCall", "id": "tc4",
+                                  "name": "edit",
+                                  "input": {"path": "/x"}}]}},
+        {"type": "message", "id": "r4", "timestamp": _ms_to_iso(T0 + 180889),
+         "message": {"role": "toolResult", "timestamp": T0 + 180889,
+                     "toolCallId": "tc4", "toolName": "edit",
+                     "isError": True, "content": long_error_text}},
+        # #5 pending (no result)
+        {"type": "message", "id": "a5", "timestamp": _ms_to_iso(T0 + 181000),
+         "message": {"role": "assistant", "timestamp": T0 + 181000,
+                     "content": [{"type": "toolCall", "id": "tc5",
+                                  "name": "sessions_history",
+                                  "input": {"limit": 10}}]}},
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    return ctx, sid
+
+
+def _tool_section_checks(report) -> list:
+    for sec in report.sections:
+        if sec.title == "Panorama · Tool Execution":
+            return sec.checks
+    raise AssertionError("Tool Execution section not found")
+
+
+def test_tool_execution_renders_humanized_durations(tmp_path: Path):
+    """v1.4.17: per-call duration must use _fmt_tool_dur, not raw 'NNNNms'."""
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    checks = _tool_section_checks(report)
+    # Skip the timing summary; per-call checks follow.
+    per_call = [c for c in checks if c.name.startswith("tools.call.")]
+    assert len(per_call) == 5
+    # No raw multi-digit ms (e.g. "147665ms") — that's the v1.4.16 wart.
+    for c in per_call:
+        whole = c.message + (c.detail or "")
+        assert "147665ms" not in whole
+        assert "180889ms" not in whole
+        assert "5797ms" not in whole
+    # Specific humanized renderings are present.
+    msgs = [c.message for c in per_call]
+    joined = "\n".join(msgs)
+    assert "199ms" in joined  # short call keeps ms
+    assert "4.8s" in joined   # 5797ms → 4.8s (gap-derived 4797ms, depending)
+    assert "2.4m" in joined   # cron 141665ms → 2.4m
+    assert "32.9s" in joined  # edit ≈ 32889ms
+
+
+def test_tool_execution_no_double_status_glyph(tmp_path: Path):
+    """The render layer prepends the verdict glyph; the message itself
+    must not carry a redundant ✓/✗ (the v1.4.16 bug).
+    """
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    per_call = [c for c in _tool_section_checks(report)
+                if c.name.startswith("tools.call.")]
+    for c in per_call:
+        # No bare-glyph "args" pattern from the old `f"... {status} args=..."`
+        assert " ✗ args=" not in c.message
+        assert " ✓ args=" not in c.message
+        # And no leading status char.
+        assert not c.message.lstrip().startswith("✓ ")
+        assert not c.message.lstrip().startswith("✗ ")
+
+
+def test_tool_execution_short_error_inline_long_in_detail(tmp_path: Path):
+    """Short error rides the header; long error/result drops to detail."""
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    by_idx = {c.name: c for c in _tool_section_checks(report)
+              if c.name.startswith("tools.call.")}
+    # #3 cron — short "patch required" — inline on header.
+    assert "patch required" in by_idx["tools.call.3"].message
+    assert "⇒ ERR patch required" in by_idx["tools.call.3"].message
+    assert by_idx["tools.call.3"].detail in (None, "")
+    # #4 edit — long error — message has no ERR text, detail does.
+    assert "Validation failed" not in by_idx["tools.call.4"].message
+    assert by_idx["tools.call.4"].detail is not None
+    assert by_idx["tools.call.4"].detail.startswith("⇒ ERR ")
+    assert "Validation failed" in by_idx["tools.call.4"].detail
+    # #2 memory_search — long JSON result — detail starts with "→ ".
+    assert by_idx["tools.call.2"].detail is not None
+    assert by_idx["tools.call.2"].detail.startswith("→ ")
+
+
+def test_tool_execution_pending_call_renders_question_mark(tmp_path: Path):
+    """Pending call (duration_ms is None) renders dur as "?" without crashing
+    and without a result arrow.
+    """
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    by_idx = {c.name: c for c in _tool_section_checks(report)
+              if c.name.startswith("tools.call.")}
+    msg = by_idx["tools.call.5"].message
+    assert "sessions_history" in msg
+    assert "?" in msg
+    assert "→" not in msg
+    assert "⇒" not in msg
+
+
+def test_tool_execution_summary_includes_slowest(tmp_path: Path):
+    """v1.4.17: timing summary uses '·' separators, humanized ms, slowest."""
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    timing = next(c for c in _tool_section_checks(report)
+                  if c.name == "tools.timing")
+    assert "5 calls" in timing.message
+    assert "2 err" in timing.message
+    assert "·" in timing.message
+    assert "avg " in timing.message
+    assert "p50 " in timing.message
+    assert "p95 " in timing.message
+    assert "max " in timing.message
+    assert "slowest cron(2.4m)" in timing.message
+    # No legacy "avg=NNNNms" form.
+    assert "avg=" not in timing.message
+    assert "ms p50=" not in timing.message
+
+
+def test_tool_execution_compresses_json_whitespace(tmp_path: Path):
+    """Indented JSON results must collapse to single-space separators —
+    the old renderer left runs of 3+ spaces from the original indent.
+    """
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    by_idx = {c.name: c for c in _tool_section_checks(report)
+              if c.name.startswith("tools.call.")}
+    detail = by_idx["tools.call.2"].detail or ""
+    # No 3+ space runs anywhere in the rendered detail.
+    assert "   " not in detail
+
+
+def test_tool_execution_json_envelope_unchanged(tmp_path: Path):
+    """Render-layer changes must NOT touch report.data["tool_waterfall"] /
+    "tool_stats". Consumers depend on the existing field shape.
+    """
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    waterfall = report.data["tool_waterfall"]
+    assert isinstance(waterfall, list) and len(waterfall) == 5
+    sample = waterfall[0]
+    for fld in ("name", "callId", "duration_ms", "is_error",
+                "result_text", "args"):
+        assert fld in sample, f"missing field {fld} in tool_waterfall row"
+    stats = report.data["tool_stats"]
+    for fld in ("total", "completed", "errors",
+                "avg_ms", "p50_ms", "p95_ms", "max_ms", "slowest"):
+        assert fld in stats, f"missing field {fld} in tool_stats"
+    # Slowest is still the {name, duration_ms} dict.
+    slow = stats["slowest"]
+    assert slow is not None
+    assert "name" in slow and "duration_ms" in slow
+
+
+def test_tool_execution_columns_align_in_human_render(tmp_path: Path):
+    """Human render places #idx/name/dur in fixed columns so the eye can
+    scan vertically. Locking exact widths catches accidental drift.
+    """
+    from ocdiag.render.human import render
+    ctx, sid = _build_tool_render_fixture(tmp_path)
+    report = _run_panorama(ctx, session_id=sid)
+    text = render(report, no_color=True)
+    # Find Tool Execution section, collect per-call lines.
+    lines = []
+    in_sec = False
+    for ln in text.split("\n"):
+        if "Tool Execution" in ln:
+            in_sec = True
+            continue
+        if in_sec and ln.strip().startswith(("Panorama ·", "━")):
+            in_sec = False
+        if in_sec and ln.strip().startswith(("✓ #", "⚠ #", "✗ #")):
+            lines.append(ln)
+    # 5 per-call rows, each beginning at the same #idx column offset.
+    assert len(lines) == 5
+    # IDX col starts after "  ✓ " / "  ⚠ " etc; "#" is at offset 4.
+    for ln in lines:
+        assert ln[4] == "#", f"#idx col misaligned: {ln!r}"
+
+
 # ── --version flag (parity with Node entry) ───────────────────────────────
 
 

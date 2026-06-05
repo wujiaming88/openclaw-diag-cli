@@ -1,5 +1,74 @@
 # Changelog
 
+## v1.4.17 — readable Tool Execution layout (2026-06-05)
+
+### Changed
+- **Panorama · Tool Execution** is now scannable instead of dense. The
+  v1.4.16 line `⚠ #4 edit 32889ms ✗ args={…} ⇒ ERR Validation failed for
+  tool "edit":   - edits.0: must not have additional proper…` had four
+  readability problems: (1) **double status glyph** — the human renderer
+  already prepends ✓/⚠/✗ from `Check.verdict`, but the inspector also
+  baked one into the message string, so each line shouted twice; (2) raw
+  `NNNNNms` durations while every other section humanized; (3) result
+  bodies were JSON pretty-printed indentation collapsed by `\n→space` and
+  ended up as runs of three+ spaces; (4) `#idx`/name/dur jittered between
+  rows, so the eye couldn't stripe down the duration column. The new
+  rendering:
+  ```
+  ✓ 5 calls · 2 err · avg 44.9s · p50 32.9s · p95 32.9s · max 2.4m · slowest cron(2.4m)
+  ✓ #1   Bash              199ms  {cmd=ls}  → ok
+  ✓ #2   memory_search      4.8s  {query=lookup}
+      → { "results": [], "disabled": true, "unavailable": true, "error": "No API key co…
+  ⚠ #3   cron               2.4m  {action=update, jobId=abc}  ⇒ ERR patch required
+  ⚠ #4   edit              32.9s  {path=/x}
+      ⇒ ERR Validation failed for tool "edit": - edits.0: must not have additional pr…
+  ✓ #5   sessions_history      ?  {limit=10}
+  ```
+  Specifically:
+  - Per-call message no longer carries a status char — the section's
+    glyph alone signals success/failure.
+  - New `_fmt_tool_dur(ms)` renders <1s as `NNNms` (signal preserved),
+    <60s as `X.Xs`, ≥1m as `X.Xm`. Used by both the per-call duration
+    column and the timing summary's avg/p50/p95/max.
+  - `#idx` (4-wide), tool name (16-wide ljust), duration (6-wide rjust).
+    Names longer than the pad render flush rather than truncate.
+  - Result/error <=48 chars and a header that still fits in 110 chars
+    rides inline as `→ snippet` / `⇒ ERR snippet`. Anything longer drops
+    to `Check.detail`, which the human renderer indents one continuation
+    line — short calls stay on one row, long ones don't run off the right
+    edge.
+  - `_format_args_inline` and `_format_result_inline` now collapse
+    runs of whitespace (the indent leftovers from `json.dumps(indent=2)`
+    after newline→space substitution) to single spaces.
+  - Timing summary uses `·` separators and tacks on `slowest NAME(DUR)`
+    (pulled from `tool_stats.slowest`, which already existed in the
+    JSON envelope).
+  - Pending calls (no `toolResult` paired) render `?` as the duration
+    and omit the result arrow entirely.
+
+### Unchanged
+- `report.data["tool_waterfall"]` and `report.data["tool_stats"]` JSON
+  fields are byte-identical to v1.4.16 — only the human-readable
+  `Check.message`/`Check.detail` strings changed. Consumers depending on
+  the JSON envelope (e.g. masking tests, panorama-spec validators) keep
+  working.
+- Masking is unaffected: secret scrubbing happens upstream in
+  `_build_tool_waterfall`; the renderer only re-formats whitespace.
+
+### Tests
+- Eight new regressions in `tests/test_panorama.py`:
+  `test_fmt_tool_dur_helper`, `test_collapse_ws_helper`,
+  `test_tool_execution_renders_humanized_durations`,
+  `test_tool_execution_no_double_status_glyph`,
+  `test_tool_execution_short_error_inline_long_in_detail`,
+  `test_tool_execution_pending_call_renders_question_mark`,
+  `test_tool_execution_summary_includes_slowest`,
+  `test_tool_execution_compresses_json_whitespace`,
+  `test_tool_execution_json_envelope_unchanged`,
+  `test_tool_execution_columns_align_in_human_render`.
+  Shared fixture `_build_tool_render_fixture` covers the full matrix
+  (short success, long-JSON success, short error, long error, pending).
+
 ## v1.4.16 — exclude OpenClaw transcript-only injected turns from Model Calls (2026-06-05)
 
 ### Fixed

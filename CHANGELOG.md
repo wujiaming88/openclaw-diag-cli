@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.4.21 — README: surface npm downloads, OpenClaw relationship, scope & masking at top (2026-06-05)
+
+### Changed
+- **`README.md`** — Front-of-readme upgrade so npm visitors see the four
+  things that matter in the first screen:
+  - Added a dynamic **npm downloads** badge (`img.shields.io/npm/dm/...`) next
+    to the existing version badge — auto-updates from npm, no hardcoded
+    numbers.
+  - New **About & Scope** section, three compact bullets, placed between the
+    nav links and `## Why openclaw-diag?`:
+    - **Relationship to OpenClaw** — explicit "independent, community-maintained,
+      NOT an official OpenClaw product, not affiliated" wording. Lists the
+      on-disk artifacts read (`openclaw.json`, `/tmp/openclaw/*.log`,
+      `agents/*/sessions/*.jsonl`, `cron/`, `tasks/runs.sqlite`) so the
+      reader-only contract is concrete, not vague.
+    - **Maintenance scope** — 13 modules + 3 inspectors, tracking current
+      OpenClaw releases, zero runtime deps, plus an explicit out-of-scope
+      list (no remediation, no config writes, no service restarts, no
+      telemetry).
+    - **Security & masking** — observer-only summary that mirrors (does not
+      duplicate) the existing `## Security` section's masking policy:
+      `extract` masked by default; `trace` / `panorama` unmasked by default,
+      use `--mask` before sharing externally; config/log collectors always
+      redact secrets. Links down to `## Security` for the full statement.
+  No other README sections changed — `## Why`, `## Features`, `## Security`,
+  flag tables, and architecture all stay intact.
+
 ## v1.4.20 — performance: decouple latency from availability verdict + 7-day mtime window for daily trend (2026-06-05)
 
 ### Fixed

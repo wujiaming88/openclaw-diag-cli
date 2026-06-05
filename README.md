@@ -2,12 +2,19 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![npm version](https://img.shields.io/npm/v/openclaw-diag-cli.svg)](https://www.npmjs.com/package/openclaw-diag-cli)
+[![npm downloads](https://img.shields.io/npm/dm/openclaw-diag-cli.svg)](https://www.npmjs.com/package/openclaw-diag-cli)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue.svg)](https://www.python.org/)
 
 Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 13 diagnostic modules, 3 inspectors, structured output, zero dependencies.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [AI Agent Skill](#ai-agent-skill) · [Output Formats](#output-formats) · [Examples](#examples) · [Contributing](#contributing)
+
+## About & Scope
+
+- **Relationship to OpenClaw** — Independent, community-maintained companion tool for [OpenClaw](https://github.com/openclaw/openclaw). NOT an official OpenClaw product and not affiliated with the OpenClaw maintainers. It reads OpenClaw's on-disk artifacts (`openclaw.json`, `/tmp/openclaw/*.log`, `agents/*/sessions/*.jsonl`, `cron/`, `tasks/runs.sqlite`) — it does not embed or modify OpenClaw itself.
+- **Maintenance scope** — Covers 13 diagnostic modules + 3 session inspectors (trace / extract / panorama), tracking current OpenClaw releases. Zero runtime dependencies (Python stdlib + Node thin-shell). Out of scope by design: no remediation, no config writes, no service restarts, no telemetry — diagnosis only.
+- **Security & masking** — Observer-only: read-only file reads plus read-only DNS/TCP/HTTP probes (no POST/PUT/DELETE, no state mutation). Masking is per-command: `extract` is masked by default; `trace` and `panorama` are unmasked by default (pass `--mask` before sharing externally); config/log collectors always redact API keys / tokens / secrets. No data leaves the host. See [Security](#security) for details.
 
 ## Why openclaw-diag?
 

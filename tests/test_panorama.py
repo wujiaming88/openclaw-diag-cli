@@ -3513,5 +3513,30 @@ def test_openclaw_cron_runs_env_still_wins(tmp_path: Path, monkeypatch):
     assert any(r.get("jobId") == cron_job_id for r in cron_runs)
 
 
+# ── --version flag (parity with Node entry) ───────────────────────────────
+
+
+def test_main_version_flag(capsys):
+    from ocdiag import __version__ as pkg_version
+    from ocdiag.main import main
+
+    rc = main(["--version"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert captured.out.strip() == pkg_version
+    assert captured.err == ""
+
+
+def test_main_version_aliases(capsys):
+    from ocdiag import __version__ as pkg_version
+    from ocdiag.main import main
+
+    for alias in ("-V", "-v", "version"):
+        rc = main([alias])
+        captured = capsys.readouterr()
+        assert rc == 0, f"alias {alias!r} returned {rc}"
+        assert captured.out.strip() == pkg_version, f"alias {alias!r} printed {captured.out!r}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

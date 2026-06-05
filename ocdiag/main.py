@@ -524,7 +524,7 @@ def _print_help() -> None:
     print("  openclaw-diag panorama <uuid>     360° session 全景诊断")
     print("  openclaw-diag examples            打印常用示例")
     print()
-    print("通用 flag：--format pretty|json|ndjson  --json (alias)  --no-color  --unmask")
+    print("通用 flag：--format pretty|json|ndjson  --json (alias)  --no-color  --unmask  --version")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -533,6 +533,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not argv or argv[0] in ("-h", "--help"):
         _print_help()
+        return 0
+
+    if argv[0] in ("--version", "-V", "-v", "version"):
+        print(__version__)
         return 0
 
     head, rest = argv[0], argv[1:]

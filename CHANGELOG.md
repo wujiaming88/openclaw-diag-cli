@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.4.15 — clarify per-command masking in README + --version on python entry (2026-06-05)
+
+### Fixed
+- **[P2] README Global Flags table no longer claims `default: sanitized` as a
+  global rule.** That phrasing was misleading because masking defaults are
+  per-command: `extract` is masked by default, `trace` and `panorama` are
+  unmasked by default, and config/log state collectors always redact
+  secrets. The table now lists both `--mask` and `--unmask` as opt-in flags
+  whose default varies per command, with a one-line clarifier directly
+  under the table — matching the existing language in the Security section,
+  PANORAMA_SPEC.md, and SKILL.md.
+- **[P3] `python3 bin/ocdiag --version` and the `ocdiag` console script now
+  print the version.** Previously only the Node entry (`openclaw-diag
+  --version`) handled the flag; the Python entry returned
+  `Error: 未知命令 '--version'`. `main()` now intercepts `--version` /
+  `-V` / `-v` / `version` before dispatch and prints the bare version
+  number (byte-for-byte parity with the Node entry).
+
+### Tests
+- Regression tests in `tests/test_panorama.py` cover `main(["--version"])`
+  and the `-V` / `-v` / `version` aliases via `capsys`, asserting `rc=0`
+  and stdout equal to `__version__`.
+
 ## v1.4.14 — mask correlated logs + honor --openclaw-home for runs.sqlite/cron (2026-06-05)
 
 ### Fixed

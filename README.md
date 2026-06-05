@@ -279,11 +279,14 @@ Adding a new collector: create one file in `ocdiag/collectors/`, add `@register`
 | `--format pretty\|json\|ndjson` | Output format |
 | `--json` | Alias for `--format json` |
 | `--no-color` | Disable ANSI colors |
-| `--unmask` | Show secrets (default: sanitized) |
+| `--mask` | Redact secrets/args/log bodies (opt-in; default varies by command) |
+| `--unmask` | Show full plaintext (opt-in; default varies by command) |
 | `--config PATH` | Custom openclaw.json path |
 | `--log-dir PATH` | Custom log directory |
 | `--sessions-base PATH` | Custom sessions base directory |
 | `--openclaw-home PATH` | Custom OpenClaw home directory |
+
+Masking default is per-command: `extract` is masked by default (`--unmask` for trusted local analysis); `trace` and `panorama` are unmasked by default (pass `--mask` before sharing output externally). Config/log state collectors always redact API keys/tokens/secrets regardless of flag.
 
 ## Security
 

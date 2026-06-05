@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.4.14 — mask correlated logs + honor --openclaw-home for runs.sqlite/cron (2026-06-05)
+
+### Fixed
+- **[P1] `panorama --mask` now scrubs correlated log entries.** The previous
+  release sanitized tool args/result text but left raw ERROR/WARN/INFO log
+  bodies — and the `correlated_logs` JSON envelope copy — completely
+  unmodified, so a `Bearer <secret>` or `sk-<live-key>` in a correlated
+  application log line leaked verbatim under `--mask`. Both the rendered
+  Section text (Raw ERROR / Raw WARN / representative INFO blocks) and the
+  envelope list now go through `_maybe_sanitize` when `--mask` is active.
+- **[P2] `--openclaw-home` is now honoured by `runs.sqlite` and
+  `cron/runs/<job>.jsonl` lookup.** `_runs_sqlite_path()` and
+  `_cron_run_path()` previously read the import-time `paths_mod.OPENCLAW_HOME`
+  / `paths_mod.CRON_RUNS_DIR` constants, which only reflect the
+  `OPENCLAW_HOME` env var, so a CLI-only `--openclaw-home <dir>` invocation
+  silently missed both sources. They now derive the path from
+  `ctx.openclaw_home` (env + CLI). The standalone `OPENCLAW_CRON_RUNS` env
+  override still wins when set, preserving existing behaviour.
+
+### Tooling / Docs
+- **[P2] `pytest` declared as `[project.optional-dependencies].dev`.** The
+  runtime `ocdiag` package remains zero-dep; contributors who run the
+  pytest suites (`tests/test_panorama.py`, `tests/test_v2_*.py`) install
+  with `pip install -e ".[dev]"`. README documents the test entry points.
+- **[P3]** README architecture tree now lists `panorama` under
+  `inspectors/`. SKILL.md Panorama section synced with v1.4.13 reality
+  (Findings-first ordering, merged Correlated Logs & Signals, removed
+  standalone Runtime Context / Model Decisions, removed per-call duration
+  / longest gap). PANORAMA_SPEC.md masking section now correctly states
+  `--mask` is opt-in (default is unmasked).
+
+### Tests
+- New regression tests covering the four mask render paths
+  (envelope `correlated_logs`, raw ERROR, raw WARN, unmask sanity check)
+  plus `--openclaw-home` routing for `runs.sqlite` and `cron/runs/<job>.jsonl`,
+  including a guard that `OPENCLAW_CRON_RUNS` still wins when explicitly set.
+
 ## v1.4.13 — objective Findings summary + deterministic severity ranking (2026-06-04)
 
 ### Added

@@ -261,7 +261,7 @@ ocdiag/
   main.py              CLI dispatch + argument parsing
   core/                Types (Check/Section/Report/Verdict), registry, context
   collectors/          13 state collectors (one file each, @register decorator)
-  inspectors/          trace + extract
+  inspectors/          trace + extract + panorama
   render/              human / json / ndjson renderers
   (shared utilities)   sessions, trajectory, sensitive, paths, ...
 skill/
@@ -301,6 +301,26 @@ Issues and PRs welcome. For new collectors:
 3. Return `Report` with explicit `Verdict` on every `Check`
 4. Run `python3 -m ocdiag.main your_module` to test
 5. Add tests in `tests/`
+
+### Running tests
+
+The runtime `ocdiag` package is zero-dep. Tests fall into two groups:
+
+- **Stdlib-only** (no install needed) —
+  ```bash
+  python3 tests/run_collector_tests.py
+  python3 tests/run_sessions_tests.py
+  python3 tests/run_trajectory_tests.py
+  ```
+- **pytest** (`tests/test_panorama.py`, `tests/test_v2_*.py`) — install the
+  optional `dev` extras first, then run pytest:
+  ```bash
+  pip install -e ".[dev]"
+  pytest tests/
+  ```
+
+`pytest` is declared under `[project.optional-dependencies].dev` in
+`pyproject.toml`; it is **not** a runtime dependency.
 
 ## License
 

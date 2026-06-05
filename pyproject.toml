@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-diag-cli"
-version = "1.4.13"
+version = "1.4.14"
 description = "OpenClaw observer-only diagnostic CLI — built for humans and AI Agents"
 readme = "README.md"
 license = {text = "MIT"}
@@ -17,6 +17,15 @@ classifiers = [
     "Programming Language :: Python :: 3 :: Only",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+]
+
+[project.optional-dependencies]
+# Test-only dependencies. The runtime ocdiag package is zero-dep on purpose;
+# pytest is opt-in for contributors who want to run tests/test_panorama.py
+# and tests/test_v2_*.py. Stdlib-only test runners under tests/run_*.py keep
+# working without it. Install with: ``pip install -e ".[dev]"``.
+dev = [
+    "pytest>=7",
 ]
 
 [project.scripts]

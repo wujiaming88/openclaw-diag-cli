@@ -120,12 +120,31 @@ def _sessions_json_for(session_file: str) -> Optional[str]:
     return p if os.path.isfile(p) else None
 
 
-def _runs_sqlite_path() -> str:
-    return os.path.join(paths_mod.OPENCLAW_HOME, "tasks", "runs.sqlite")
+def _runs_sqlite_path(openclaw_home: str) -> str:
+    """Resolve runs.sqlite under the caller-provided OPENCLAW_HOME.
+
+    The path is computed from ``ctx.openclaw_home`` (which already reflects
+    the ``--openclaw-home`` CLI flag and ``OPENCLAW_HOME`` env var) rather
+    than the import-time ``paths_mod.OPENCLAW_HOME`` constant, which only
+    sees the env at module-load time.
+    """
+    return os.path.join(openclaw_home, "tasks", "runs.sqlite")
 
 
-def _cron_run_path(job_id: str) -> Optional[str]:
-    p = os.path.join(paths_mod.CRON_RUNS_DIR, f"{job_id}.jsonl")
+def _cron_run_path(job_id: str, openclaw_home: str) -> Optional[str]:
+    """Resolve cron/runs/<job>.jsonl under the caller-provided OPENCLAW_HOME.
+
+    A user who explicitly set ``OPENCLAW_CRON_RUNS`` (env-only knob, not on
+    the CLI) should still win — we only fall back to the env-derived
+    constant when the env var is set; otherwise we honour
+    ``--openclaw-home`` by deriving the dir from it.
+    """
+    cron_runs_env = os.environ.get("OPENCLAW_CRON_RUNS")
+    if cron_runs_env:
+        base = cron_runs_env
+    else:
+        base = os.path.join(openclaw_home, "cron", "runs")
+    p = os.path.join(base, f"{job_id}.jsonl")
     return p if os.path.isfile(p) else None
 
 
@@ -2430,7 +2449,7 @@ class PanoramaInspector:
         # filename-date range.
         traj_path = _trajectory_path_for(session_file)
         sessions_json_path = _sessions_json_for(session_file)
-        runs_sqlite_path = _runs_sqlite_path()
+        runs_sqlite_path = _runs_sqlite_path(str(ctx.openclaw_home))
         if not os.path.isfile(runs_sqlite_path):
             runs_sqlite_path = None
 
@@ -2493,7 +2512,9 @@ class PanoramaInspector:
 
         cron_run_path: Optional[str] = None
         if graph.cron_job_id:
-            cron_run_path = _cron_run_path(graph.cron_job_id)
+            cron_run_path = _cron_run_path(
+                graph.cron_job_id, str(ctx.openclaw_home),
+            )
             if cron_run_path:
                 sources_present["cron/runs"] = True
 
@@ -2695,7 +2716,17 @@ class PanoramaInspector:
         # runtime_context kept on the JSON envelope for backward-compat —
         # the standalone pretty section is gone (folded into Session Overview).
         report.data["runtime_context"] = runtime_blocks
-        report.data["correlated_logs"] = correlated_logs
+        # When --mask is active, deep-sanitize a copy of each correlated log
+        # record before placing it on the JSON envelope. The sanitizer walks
+        # strings only and preserves dict/list structure, so level/timestamp
+        # fields used by downstream consumers remain intact. The in-memory
+        # `correlated_logs` list is left as-is so the rendering blocks above
+        # (which sanitize `msg_s` individually) and any other in-process
+        # consumers still see the unmodified records.
+        report.data["correlated_logs"] = (
+            [_maybe_sanitize(rec, mask=mask) for rec in correlated_logs]
+            if mask else correlated_logs
+        )
         report.data["model_calls"] = model_calls
         report.data["model_aggregate"] = model_aggregate
         # v1.4.13 Findings: deterministic ordering of problem signals so the
@@ -3539,6 +3570,7 @@ class PanoramaInspector:
             shown_errors = error_entries[:MAX_RENDERED_ERROR_LINES]
             for idx, rec in enumerate(shown_errors, 1):
                 msg_s = parse_log_msg(rec) or "?"
+                msg_s = _maybe_sanitize(msg_s, mask=mask)
                 sub = get_log_subsystem(rec) or "?"
                 ts = _log_ts_ms(rec)
                 tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
@@ -3561,6 +3593,7 @@ class PanoramaInspector:
             shown_warns = warn_entries[:MAX_RENDERED_WARN_LINES]
             for idx, rec in enumerate(shown_warns, 1):
                 msg_s = parse_log_msg(rec) or "?"
+                msg_s = _maybe_sanitize(msg_s, mask=mask)
                 sub = get_log_subsystem(rec) or "?"
                 ts = _log_ts_ms(rec)
                 tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""
@@ -3591,6 +3624,7 @@ class PanoramaInspector:
                 info_only, limit=REPRESENTATIVE_INFO_LINES)
             for idx, rec in enumerate(reps, 1):
                 msg_s = parse_log_msg(rec) or "?"
+                msg_s = _maybe_sanitize(msg_s, mask=mask)
                 sub = get_log_subsystem(rec) or "?"
                 ts = _log_ts_ms(rec)
                 tsfx = f"[{fmt_epoch_local(ts)}] " if ts else ""

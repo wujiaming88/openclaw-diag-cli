@@ -3213,5 +3213,305 @@ def test_signal_severity_table_documented():
     assert not missing, f"SIGNAL_SEVERITY missing entries for: {missing}"
 
 
+# ── v1.4.14 regression: --mask scrubs correlated log bodies ──────────────
+
+
+def _build_app_log_with_secret(
+    path: Path, *, level: str, secret: str,
+    session_id: str, run_id: str,
+) -> None:
+    """Single correlated log line carrying an obvious secret in the message.
+
+    Crafted so that the correlation graph admits it (carries sessionId +
+    runId) and the secret survives ``parse_log_msg`` (which strips
+    subsystem-marker JSON but keeps plain ``msg`` strings).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        rec = {
+            "level": level,
+            "time": T0 + 500,
+            "pid": 12345,
+            "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+            "msg": (
+                f"sessionId={session_id} runId={run_id} "
+                f"failed: Authorization: Bearer {secret}"
+            ),
+        }
+        f.write(json.dumps(rec) + "\n")
+
+
+def _has_text(report, needle: str) -> bool:
+    """True if ``needle`` appears anywhere in rendered section messages.
+
+    Walks every Check.message + Check.data on every Section so the test
+    catches leaks via either the human render path or the section-level
+    JSON payload.
+    """
+    if needle in json.dumps(report.data):
+        return True
+    for s in report.sections:
+        for c in s.checks:
+            if needle in (c.message or ""):
+                return True
+            if c.data and needle in json.dumps(c.data, default=str):
+                return True
+    return False
+
+
+def test_mask_scrubs_correlated_logs_envelope(tmp_path: Path):
+    """v1.4.14 P1: --mask must scrub the JSON envelope's correlated_logs.
+
+    Pre-fix: ``report.data["correlated_logs"]`` was the raw record list,
+    so a Bearer token in a log line leaked verbatim under --mask.
+    """
+    secret = "LIVEKEY1234567890abcDEFghi"
+    ctx = _build_fixture_home(tmp_path)
+    # Replace the synthetic log with one that carries a correlated secret.
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _build_app_log_with_secret(
+        log_path, level="ERROR", secret=secret,
+        session_id=SESSION_ID, run_id=RUN_ID_A,
+    )
+
+    report = _run_panorama(ctx, session_id=SESSION_ID, mask=True)
+    envelope_logs = report.data["correlated_logs"]
+    # The line itself must still be present (correlation matched), but the
+    # secret token must be scrubbed.
+    assert envelope_logs, "expected correlated_logs to include the secret line"
+    blob = json.dumps(envelope_logs)
+    assert secret not in blob, (
+        f"--mask leaked secret into correlated_logs envelope: {blob[:300]}"
+    )
+
+
+def test_mask_scrubs_raw_error_render(tmp_path: Path):
+    """v1.4.14 P1: --mask must scrub the pretty-rendered ERROR log lines.
+
+    Pre-fix: the Raw ERROR render block called ``parse_log_msg(rec)`` and
+    sliced it directly into ``s_logs.fail(...)`` without sanitization.
+    """
+    secret = "sk-LIVEKEY1234567890"
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _build_app_log_with_secret(
+        log_path, level="ERROR", secret=secret,
+        session_id=SESSION_ID, run_id=RUN_ID_A,
+    )
+
+    report = _run_panorama(ctx, session_id=SESSION_ID, mask=True)
+    # Find the Correlated Logs & Signals section and check no rendered
+    # message contains the secret.
+    logs_sec = next(
+        (s for s in report.sections
+         if "Correlated Logs" in s.title or "Logs" in s.title),
+        None,
+    )
+    assert logs_sec is not None, "expected a Correlated Logs section"
+    rendered = " | ".join(c.message for c in logs_sec.checks)
+    assert secret not in rendered, (
+        f"--mask leaked secret into rendered ERROR line: {rendered[:300]}"
+    )
+
+
+def test_mask_scrubs_raw_warn_render(tmp_path: Path):
+    """v1.4.14 P1: --mask must scrub WARN lines the same way as ERROR."""
+    secret = "sk-WARNKEY9876543210"
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _build_app_log_with_secret(
+        log_path, level="WARN", secret=secret,
+        session_id=SESSION_ID, run_id=RUN_ID_A,
+    )
+
+    report = _run_panorama(ctx, session_id=SESSION_ID, mask=True)
+    assert not _has_text(report, secret), "--mask leaked WARN body"
+
+
+def test_unmask_keeps_correlated_log_secret(tmp_path: Path):
+    """Sanity check: --unmask (default) must NOT redact log bodies.
+
+    Guards against accidentally over-scrubbing in the new code path.
+    """
+    secret = "sk-UNMASKED1234567890"
+    ctx = _build_fixture_home(tmp_path)
+    from datetime import datetime
+    today = datetime.now().strftime("%Y-%m-%d")
+    log_path = ctx.log_dir / f"openclaw-{today}.log"
+    _build_app_log_with_secret(
+        log_path, level="ERROR", secret=secret,
+        session_id=SESSION_ID, run_id=RUN_ID_A,
+    )
+
+    report = _run_panorama(ctx, session_id=SESSION_ID, mask=False)
+    assert _has_text(report, secret), "--unmask should preserve the raw log body"
+
+
+# ── v1.4.14 regression: --openclaw-home is honoured by runs.sqlite/cron ──
+
+
+def test_openclaw_home_routes_runs_sqlite(tmp_path: Path, monkeypatch):
+    """v1.4.14 P2: passing only --openclaw-home (no env override) should
+    make panorama find runs.sqlite under that home.
+
+    Pre-fix: ``_runs_sqlite_path()`` consulted the import-time
+    ``paths_mod.OPENCLAW_HOME`` constant, so a CLI-only override was
+    silently ignored.
+    """
+    # Critically: do NOT set OPENCLAW_HOME in env, and do NOT touch
+    # paths_mod.OPENCLAW_HOME — we want to prove ctx.openclaw_home is
+    # the source of truth.
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_CRON_RUNS", raising=False)
+
+    ctx = _build_fixture_home(tmp_path)
+
+    # Reset paths_mod to a sentinel that does NOT match the temp home so
+    # that any code still consulting it would fail to find runs.sqlite.
+    import ocdiag.paths as paths_mod
+    bogus = tmp_path / "definitely-not-the-real-home"
+    bogus.mkdir(parents=True, exist_ok=True)
+    paths_mod.OPENCLAW_HOME = str(bogus)
+    paths_mod.CRON_RUNS_DIR = str(bogus / "cron" / "runs")
+
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sp = report.data["sources_present"]
+    assert sp["runs.sqlite"] is True, (
+        "panorama must find runs.sqlite via ctx.openclaw_home, "
+        "not via paths_mod.OPENCLAW_HOME"
+    )
+    # Child task surfaces from runs.sqlite — proves we actually opened it.
+    children = report.data["child_tasks"]
+    assert any(c["task_id"] == CHILD_TASK_ID for c in children)
+
+
+def _stamp_cron_session_key(home: Path, cron_job_id: str) -> None:
+    """Rewrite the fixture's sessions.json + trajectory so the sessionKey
+    carries ``:cron:<jobId>``.
+
+    The correlation graph's ``cron_job_id`` is derived from the sessionKey
+    string (regex ``:cron:<id>``); ``graph.session_key`` itself is loaded
+    from the per-agent ``sessions.json`` store (see
+    ``expand_from_sessions_json``), so a fixture must stamp the marker
+    there. We rewrite the trajectory too for consistency.
+    """
+    cron_key = f"agent:main:cron:{cron_job_id}"
+    main_sd = home / "agents" / "main" / "sessions"
+
+    # Replace sessions.json with a cron-style sessionKey.
+    store_path = main_sd / "sessions.json"
+    store = {
+        cron_key: {
+            "sessionId": SESSION_ID,
+            "systemPromptReport": {
+                "systemPrompt": {"chars": 12345},
+                "tools": {"entries": []},
+                "skills": {"entries": []},
+                "source": "test",
+            },
+        }
+    }
+    with open(store_path, "w") as f:
+        json.dump(store, f)
+
+    # Mirror it into the trajectory for consistency.
+    traj_file = main_sd / f"{SESSION_ID}.trajectory.jsonl"
+    rewritten: List[Dict[str, Any]] = []
+    with open(traj_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            rec["sessionKey"] = cron_key
+            rewritten.append(rec)
+    _write_jsonl(traj_file, rewritten)
+
+
+def test_openclaw_home_routes_cron_runs(tmp_path: Path, monkeypatch):
+    """v1.4.14 P2: same as above but for cron/runs/<job>.jsonl.
+
+    Pre-fix: ``_cron_run_path`` derived the dir from
+    ``paths_mod.CRON_RUNS_DIR`` only.
+    """
+    monkeypatch.delenv("OPENCLAW_HOME", raising=False)
+    monkeypatch.delenv("OPENCLAW_CRON_RUNS", raising=False)
+
+    ctx = _build_fixture_home(tmp_path)
+
+    # Mirror the test above: scramble paths_mod.
+    import ocdiag.paths as paths_mod
+    bogus = tmp_path / "definitely-not-the-real-home"
+    bogus.mkdir(parents=True, exist_ok=True)
+    paths_mod.OPENCLAW_HOME = str(bogus)
+    paths_mod.CRON_RUNS_DIR = str(bogus / "cron" / "runs")
+
+    # Wire a cron-triggered run into the synthetic fixture: trajectory
+    # sessionKey carries `:cron:<jobId>` (which is how the correlation
+    # graph picks up ``cron_job_id``). The jobId must match the
+    # correlation regex `:cron:([0-9a-fA-F-]{8,})`, so we use a hex/uuid-
+    # shaped value rather than free-form text. A matching delivery file
+    # is dropped under the temp openclaw_home.
+    cron_job_id = "abcdef01-1111-2222-3333-444444444444"
+    home = Path(ctx.openclaw_home)
+    cron_runs_dir = home / "cron" / "runs"
+    cron_runs_dir.mkdir(parents=True, exist_ok=True)
+    cron_run_file = cron_runs_dir / f"{cron_job_id}.jsonl"
+    cron_run_file.write_text(json.dumps({
+        "schemaVersion": 1,
+        "jobId": cron_job_id,
+        "sessionId": SESSION_ID,
+        "runId": RUN_ID_A,
+        "deliveredAt": _ms_to_iso(T6),
+        "deliveryStatus": "delivered",
+    }) + "\n")
+
+    _stamp_cron_session_key(home, cron_job_id)
+
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sp = report.data["sources_present"]
+    assert sp.get("cron/runs") is True, (
+        "panorama must locate cron/runs/<job>.jsonl via ctx.openclaw_home"
+    )
+    cron_runs = report.data.get("cron_runs") or []
+    assert any(r.get("jobId") == cron_job_id for r in cron_runs), (
+        "expected the cron delivery record to be loaded"
+    )
+
+
+def test_openclaw_cron_runs_env_still_wins(tmp_path: Path, monkeypatch):
+    """When the user explicitly sets OPENCLAW_CRON_RUNS, that env var
+    must continue to override the openclaw-home-derived cron dir, since
+    it is documented as a standalone knob in ocdiag.paths.
+    """
+    cron_job_id = "deadbeef-1111-2222-3333-444444444444"
+    # Custom dir outside both the temp home and paths_mod default.
+    custom_cron_dir = tmp_path / "elsewhere" / "cron-runs"
+    custom_cron_dir.mkdir(parents=True, exist_ok=True)
+    (custom_cron_dir / f"{cron_job_id}.jsonl").write_text(json.dumps({
+        "schemaVersion": 1, "jobId": cron_job_id,
+        "sessionId": SESSION_ID, "runId": RUN_ID_A,
+        "deliveredAt": _ms_to_iso(T6), "deliveryStatus": "delivered",
+    }) + "\n")
+
+    monkeypatch.setenv("OPENCLAW_CRON_RUNS", str(custom_cron_dir))
+
+    ctx = _build_fixture_home(tmp_path)
+    home = Path(ctx.openclaw_home)
+    _stamp_cron_session_key(home, cron_job_id)
+
+    report = _run_panorama(ctx, session_id=SESSION_ID)
+    sp = report.data["sources_present"]
+    assert sp.get("cron/runs") is True
+    cron_runs = report.data.get("cron_runs") or []
+    assert any(r.get("jobId") == cron_job_id for r in cron_runs)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

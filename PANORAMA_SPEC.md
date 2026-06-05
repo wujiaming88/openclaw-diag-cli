@@ -461,8 +461,17 @@ no `attempts` line in Overview, no `retried_after_failure` signal.
 
 ## Masking
 
-- `--mask` (default): redact tool arguments, message content, API keys
-- `--unmask`: show everything (local analysis only)
+`panorama` defaults to **unmasked** output. The two flags are opt-in:
+
+- `--mask` (opt-in, must be explicitly passed): redact tool arguments,
+  tool results / message content, API keys / bearer tokens / sensitive
+  KEY=VALUE patterns, AND the body of correlated log entries (raw
+  ERROR/WARN/INFO render plus the `correlated_logs` JSON envelope copy).
+  Use this when sharing output externally.
+- `--unmask` (opt-in, also default behavior when `--mask` is not passed):
+  show full plaintext. Intended for local analysis only.
+
+When both `--mask` and `--unmask` are passed, `--unmask` wins.
 
 ## Exit codes
 

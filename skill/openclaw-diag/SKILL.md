@@ -95,16 +95,14 @@ question ("是否健康?", "为什么这条 session 卡住?", "把所有相关�
 "执行慢不慢", "工具有没有异常", "模型性能好不好"). It walks every standard
 data source and produces a complete execution picture:
 
-**Sections:**
-- **Session Overview** — IDs, trigger, model, time window, activity stats (model calls / tool calls / errors / tokens / cost), sources, verdict
-- **Timeline** — first/last events, first error/stall timestamp, longest gap
-- **Runtime Context** — model, prompt chars, tools/skills/plugins, workspace files, bootstrap truncation, stream strategy
-- **Model Calls** — per-model performance breakdown + every model call with duration, output tokens, stopReason, triggered tools, cache stats
-- **Tool Execution** — per-call detail with args + result/error message, timing stats (avg/p50/p95/max)
-- **Correlated Logs** — ERROR/WARN entries with full text; representative INFO entries; level/subsystem breakdown
-- **Model Decisions** — model selection, fallback events
-- **Child Tasks** — failed tasks with error message, succeeded count
-- **Health Signals** — stall/long-running logs with timestamps, long tool calls, trajectory abort/timeout, child failures
+**Sections (v1.4.13 — 7 sections, Findings-first ordering):**
+- **Findings** — objective triage summary, rendered first. Re-surfaces the worst already-computed problem signals using a deterministic severity ordering. No inferred causes, no recommendations.
+- **Session Overview** — IDs, trigger, model, time window, activity stats (model calls / tool calls / errors / tokens / cost), sources, verdict. Runtime context (prompt chars, tools/skills/plugins, workspace files, bootstrap truncation, stream strategy) is folded in here — there is no longer a standalone "Runtime Context" section.
+- **Timeline** — first/last events, first error/stall timestamp, plus a sampled middle slice for long runs. (Per-call duration / tok/s / "longest gap" metrics were removed in v1.4.5.)
+- **Model Calls** — per-model performance breakdown + every model call with output tokens, stopReason, triggered tools, cache stats. (Per-call duration was removed; route model-selection/fallback events through Correlated Logs & Signals as `log_decision` health entries.)
+- **Tool Execution** — per-call detail with args + result/error message, timing stats (avg/p50/p95/max).
+- **Correlated Logs & Signals** — merged section (was two: "Correlated Logs" + "Health Signals"). Includes the Findings-aligned signal list (sorted by severity), positive signals ("what looks fine"), ERROR/WARN raw entries with full text, and representative INFO entries when the window is quiet. There is no standalone "Model Decisions" section anymore — those decisions surface here as `log_decision` signals.
+- **Child Tasks** — failed tasks with error message, succeeded count.
 
 ```bash
 openclaw-diag panorama <uuid> --format json
@@ -120,7 +118,7 @@ annotated with `correlation.path`.
 - Default: latest run only. Use `--run-index N` or `--all-runs` for
   persistent multi-run sessions.
 - `--strict-correlation` only matches sessionId/runId (drops sessionKey/toolCallId matches).
-- `--mask` sanitizes tool arguments and result text. Default is unmasked.
+- `--mask` (opt-in) sanitizes tool arguments, result text, message bodies, and correlated log entries (raw ERROR/WARN/INFO render + JSON envelope). Default is unmasked — pass `--mask` when sharing output externally.
 
 Verdict mapping:
 - `fail`: trajectory `aborted/timedOut`, child task failed, or any

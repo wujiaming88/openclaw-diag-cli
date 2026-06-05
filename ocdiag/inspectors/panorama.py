@@ -2063,6 +2063,20 @@ def _positive_health_signals(
 # ── model-call extraction (with per-call duration) ────────────────────────
 
 
+# OpenClaw injects two kinds of assistant turns into the transcript that are
+# NOT real LLM inferences — they're transcript-only synthetic messages used
+# for delivery mirroring and gateway-side message injection. Excluding them
+# from Model Calls keeps the section honest about real inference activity.
+# Naming aligned with OpenClaw's own constant
+# (TRANSCRIPT_ONLY_OPENCLAW_MODELS in dist/compaction-successor-transcript-*.js
+# and TRANSCRIPT_ONLY_OPENCLAW_ASSISTANT_MODELS in dist/selection-*.js); see
+# also docs/reference/transcript-hygiene.md ("Replay filters OpenClaw
+# delivery-mirror and gateway-injected assistant turns.").
+_TRANSCRIPT_ONLY_OPENCLAW_MODELS = frozenset({
+    "delivery-mirror", "gateway-injected",
+})
+
+
 def _extract_model_calls(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Walk records in order; for each assistant message capture usage stats
     plus the wall-clock duration since the previous user/toolResult/assistant
@@ -2084,6 +2098,15 @@ def _extract_model_calls(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if role != "assistant":
             if ts:
                 last_ts = ts
+            continue
+        # Skip OpenClaw transcript-only injected turns BEFORE updating
+        # last_ts: these are not real model calls (per OpenClaw's own
+        # judgement) and they are not real user/toolResult/assistant
+        # boundary events for duration purposes — letting them update
+        # last_ts would skew the next real call's duration_ms downward.
+        # Treat them as if they were not in the stream at all.
+        if (msg.get("provider") == "openclaw"
+                and msg.get("model") in _TRANSCRIPT_ONLY_OPENCLAW_MODELS):
             continue
         usage = msg.get("usage")
         if not isinstance(usage, dict):

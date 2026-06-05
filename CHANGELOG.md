@@ -1,5 +1,45 @@
 # Changelog
 
+## v1.4.16 — exclude OpenClaw transcript-only injected turns from Model Calls (2026-06-05)
+
+### Fixed
+- **[P1] Panorama · Model Calls no longer counts OpenClaw transcript-only
+  injected assistant turns as real model calls.** The previous release
+  surfaced bogus rows like `delivery-mirror: 2 calls | avg_out=0.0 tok |
+  stop[stop=2]` and `gateway-injected: …` because `_extract_model_calls`
+  did not filter the two synthetic assistant kinds OpenClaw injects into
+  the transcript: `delivery-mirror` (delivery mirror) and
+  `gateway-injected` (gateway-side injection). Both are not LLM
+  inferences and OpenClaw itself filters them at replay time. The
+  inspector now drops any assistant turn where
+  `provider == "openclaw"` and `model ∈ {delivery-mirror,
+  gateway-injected}` before counting, so by-model breakdown, total
+  tokens, `session_stats.model_calls`, and the rendered Model Calls
+  section all stop double-counting injected transcript turns. The
+  filter is applied early in extraction without updating
+  `last_ts`, so the next real call's `duration_ms` is measured against
+  the previous *real* boundary instead of being skewed by the
+  intervening synthetic turn.
+- Reference (OpenClaw 2026.6.1 dist):
+  `dist/selection-DrXxngyT.js` (`TRANSCRIPT_ONLY_OPENCLAW_ASSISTANT_MODELS`),
+  `dist/compaction-successor-transcript-CUmEvaGX.js`
+  (`TRANSCRIPT_ONLY_OPENCLAW_MODELS`), and
+  `docs/reference/transcript-hygiene.md` ("Replay filters OpenClaw
+  delivery-mirror and gateway-injected assistant turns.").
+
+### Tests
+- New regression test
+  `test_model_calls_exclude_openclaw_transcript_only_injections` in
+  `tests/test_panorama.py`. The fixture mixes two real
+  `amazon-bedrock` calls, one `provider=openclaw,model=delivery-mirror`
+  injection, one `provider=openclaw,model=gateway-injected` injection,
+  and a negative-case `provider=anthropic,model=delivery-mirror` row
+  (must NOT be filtered, since the filter requires both fields).
+  Asserts `model_calls`, `model_aggregate.models`,
+  `session_stats.model_calls`, total token sums, the second real
+  call's `duration_ms` (measured past the skipped injections), and
+  the rendered text are all transcript-only-free.
+
 ## v1.4.15 — clarify per-command masking in README + --version on python entry (2026-06-05)
 
 ### Fixed

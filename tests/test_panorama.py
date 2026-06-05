@@ -3513,6 +3513,163 @@ def test_openclaw_cron_runs_env_still_wins(tmp_path: Path, monkeypatch):
     assert any(r.get("jobId") == cron_job_id for r in cron_runs)
 
 
+# ── transcript-only OpenClaw injected turns are excluded from Model Calls ─
+
+
+def test_model_calls_exclude_openclaw_transcript_only_injections(tmp_path: Path):
+    """v1.4.16: assistant messages whose provider is "openclaw" and whose
+    model is "delivery-mirror" or "gateway-injected" are transcript-only
+    synthetic turns (delivery mirror / gateway injection), NOT real LLM
+    inferences. They must not appear in Model Calls and must not feed any
+    downstream aggregate (by-model breakdown, total tokens, session_stats).
+
+    Reference (OpenClaw 2026.6.1 dist):
+      * dist/selection-DrXxngyT.js: TRANSCRIPT_ONLY_OPENCLAW_ASSISTANT_MODELS
+      * dist/compaction-successor-transcript-CUmEvaGX.js:
+        TRANSCRIPT_ONLY_OPENCLAW_MODELS
+      * docs/reference/transcript-hygiene.md: "Replay filters OpenClaw
+        delivery-mirror and gateway-injected assistant turns."
+    """
+    home = tmp_path / "with-injected"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    sid = "cccccccc-3333-4444-5555-cccccccccccc"
+    base = T0
+    records = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(base)},
+        {"type": "message", "id": "u-1", "timestamp": _ms_to_iso(base),
+         "message": {"role": "user", "timestamp": base, "content": "go"}},
+        # Real model call #1.
+        {"type": "message", "id": "a-1",
+         "timestamp": _ms_to_iso(base + 1000),
+         "message": {"role": "assistant", "timestamp": base + 1000,
+                     "model": "claude-opus-4-7",
+                     "provider": "amazon-bedrock",
+                     "stopReason": "toolUse",
+                     "usage": {"input": 100, "output": 200,
+                               "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "text", "text": "ok"}]}},
+        # OpenClaw transcript-only delivery-mirror — must be filtered.
+        {"type": "message", "id": "a-mirror",
+         "timestamp": _ms_to_iso(base + 1500),
+         "message": {"role": "assistant", "timestamp": base + 1500,
+                     "model": "delivery-mirror",
+                     "provider": "openclaw",
+                     "stopReason": "stop",
+                     "usage": {"input": 0, "output": 0,
+                               "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "text", "text": "(mirror)"}]}},
+        # OpenClaw transcript-only gateway-injected — must be filtered.
+        {"type": "message", "id": "a-gw",
+         "timestamp": _ms_to_iso(base + 1800),
+         "message": {"role": "assistant", "timestamp": base + 1800,
+                     "model": "gateway-injected",
+                     "provider": "openclaw",
+                     "stopReason": "stop",
+                     "usage": {"input": 0, "output": 0,
+                               "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "text", "text": "(injected)"}]}},
+        # Real model call #2 — counted, and its duration must be measured
+        # from the previous *real* boundary (the user message at `base`
+        # + the assistant turn at base+1000), NOT from the skipped
+        # transcript-only turns. last_ts at this point is base+1000, so
+        # duration_ms = 1000.
+        {"type": "message", "id": "a-2",
+         "timestamp": _ms_to_iso(base + 2000),
+         "message": {"role": "assistant", "timestamp": base + 2000,
+                     "model": "claude-opus-4-7",
+                     "provider": "amazon-bedrock",
+                     "stopReason": "endTurn",
+                     "usage": {"input": 110, "output": 250,
+                               "cacheRead": 5, "cacheWrite": 3},
+                     "content": [{"type": "text", "text": "done"}]}},
+        # Negative case: provider is NOT "openclaw" but model name is
+        # "delivery-mirror". Must NOT be filtered (filter requires both).
+        {"type": "message", "id": "a-other",
+         "timestamp": _ms_to_iso(base + 3000),
+         "message": {"role": "assistant", "timestamp": base + 3000,
+                     "model": "delivery-mirror",
+                     "provider": "anthropic",
+                     "stopReason": "endTurn",
+                     "usage": {"input": 1, "output": 2,
+                               "cacheRead": 0, "cacheWrite": 0},
+                     "content": [{"type": "text", "text": "x"}]}},
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None, f"unexpected error: {report.error}"
+
+    calls = report.data["model_calls"]
+    # Three real calls survived: bedrock x2 + anthropic/delivery-mirror.
+    assert len(calls) == 3, calls
+    for c in calls:
+        assert not (c.get("provider") == "openclaw"
+                    and c.get("model") in {"delivery-mirror",
+                                           "gateway-injected"}), c
+
+    # Negative case survived (provider != "openclaw").
+    assert any(c.get("provider") == "anthropic"
+               and c.get("model") == "delivery-mirror" for c in calls)
+
+    # Both real bedrock calls survived with their original token counts.
+    bedrock_calls = [c for c in calls
+                     if c.get("provider") == "amazon-bedrock"]
+    assert len(bedrock_calls) == 2
+    assert {c["output"] for c in bedrock_calls} == {200, 250}
+
+    # The 2nd real bedrock call's duration_ms is measured from the 1st
+    # bedrock call (last_ts wasn't bumped by the skipped injected turns).
+    second_bedrock = next(
+        c for c in bedrock_calls if c["output"] == 250
+    )
+    assert second_bedrock["duration_ms"] == 1000, second_bedrock
+
+    # By-model aggregate: no transcript-only keys present.
+    by_model = {m["model"]: m for m
+                in report.data["model_aggregate"]["models"]}
+    assert "delivery-mirror" in by_model  # the anthropic one only
+    assert by_model["delivery-mirror"]["calls"] == 1
+    # All "delivery-mirror" calls in aggregate must come from non-openclaw.
+    # (We can't see provider in by-model directly, but call count == 1
+    # already proves the openclaw mirror was filtered upstream.)
+    assert "gateway-injected" not in by_model
+    assert by_model["claude-opus-4-7"]["calls"] == 2
+    assert by_model["claude-opus-4-7"]["input"] == 210
+    assert by_model["claude-opus-4-7"]["output"] == 450
+
+    # session_stats counts only real calls (3 = 2 bedrock + 1 anthropic).
+    assert report.data["session_stats"]["model_calls"] == 3
+    # Total token sums must not include the zero-output injected turns
+    # (they would not change totals here since output=0, but verify the
+    # exclusion is real by checking input totals — bedrock 100+110=210
+    # + anthropic 1 = 211, no openclaw zeros mixed in).
+    assert report.data["session_stats"]["tokens"]["input"] == 211
+    assert report.data["session_stats"]["tokens"]["output"] == 452
+
+    # Render must not show any "delivery-mirror: 2 calls" (the buggy
+    # symptom) or "gateway-injected" as a model row.
+    from ocdiag.render.human import render
+    text = render(report, no_color=True)
+    assert "gateway-injected" not in text
+    # delivery-mirror appears only via the surviving anthropic call,
+    # so its row should say "1 calls" not "2 calls".
+    assert "delivery-mirror: 2 calls" not in text
+
+
 # ── --version flag (parity with Node entry) ───────────────────────────────
 
 

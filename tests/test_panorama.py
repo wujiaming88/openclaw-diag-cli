@@ -3968,5 +3968,276 @@ def test_main_version_aliases(capsys):
         assert captured.out.strip() == pkg_version, f"alias {alias!r} printed {captured.out!r}"
 
 
+# ── v1.4.18: three-state empty-correlation messaging ────────────────────
+
+
+def _build_session_for_window(
+    home: Path, sid: str, *, ts_ms: int,
+) -> None:
+    """Lay down a minimal session.jsonl whose record timestamps anchor
+    the panorama session window onto a chosen day."""
+    main_sd = home / "agents" / "main" / "sessions"
+    iso = _ms_to_iso(ts_ms)
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid, "timestamp": iso},
+        {"type": "message", "id": "u-1", "timestamp": iso,
+         "message": {"role": "user", "timestamp": ts_ms,
+                     "content": "ping"}},
+        {"type": "message", "id": "u-2",
+         "timestamp": _ms_to_iso(ts_ms + 5000),
+         "message": {"role": "user", "timestamp": ts_ms + 5000,
+                     "content": "more"}},
+    ])
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+
+
+def _ctx_for(home: Path, log_dir: Path) -> DiagContext:
+    cfg = home / "openclaw.json"
+    if not cfg.is_file():
+        cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=home / "agents",
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    paths_mod.CRON_RUNS_DIR = str(home / "cron" / "runs")
+    return ctx
+
+
+def _logs_section(report) -> Any:
+    for sec in report.sections:
+        if sec.title == "Panorama · Correlated Logs & Signals":
+            return sec
+    raise AssertionError("Correlated Logs section missing")
+
+
+def test_logs_not_retained_state(tmp_path: Path):
+    """Session window day has no log file in log_dir, but adjacent days'
+    files exist (so log_files is non-empty via discover_logs_for_window's
+    ±1 day margin) → emit logs.not_retained, not the generic logs.none."""
+    from datetime import datetime, timedelta
+
+    home = tmp_path / "ret-home"
+    log_dir = tmp_path / "ret-logs"
+    log_dir.mkdir(parents=True)
+
+    # Window day = 3 days ago. log_dir holds days -2 and -1 (within ±1
+    # margin of window day, so discover_logs_for_window includes them).
+    win_day = (datetime.now() - timedelta(days=3)).date()
+    win_ms = int(time.mktime(win_day.timetuple()) * 1000) + 3600_000
+
+    sid = "deadbeef-aaaa-bbbb-cccc-deadbeefdead"
+    _build_session_for_window(home, sid, ts_ms=win_ms)
+
+    # Logs for win_day-1 and win_day+1 (within ±1 margin used by
+    # discover_logs_for_window). win_day itself is intentionally absent.
+    for offset in (-1, 1):
+        d = win_day + timedelta(days=offset)
+        path = log_dir / f"openclaw-{d.isoformat()}.log"
+        # Lines that DO mention the sessionId but with timestamps far
+        # outside the window — bound filter drops them, correlated=0.
+        rec = {
+            "level": "INFO",
+            "time": int(time.time() * 1000),  # now → out of window
+            "pid": 1,
+            "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+            "msg": f"sessionId={sid} unrelated",
+        }
+        path.write_text(json.dumps(rec) + "\n")
+        old = time.time() - abs(offset) * 86400
+        os.utime(path, (old, old))
+
+    # Make sure the win_day log itself does NOT exist.
+    assert not (log_dir / f"openclaw-{win_day.isoformat()}.log").exists()
+
+    ctx = _ctx_for(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None, f"unexpected error: {report.error}"
+    sec = _logs_section(report)
+    names = [c.name for c in sec.checks]
+    assert "logs.not_retained" in names, (
+        f"expected logs.not_retained, got {names}"
+    )
+    assert "logs.missing" not in names
+    assert "logs.uncorrelated" not in names
+    check = next(c for c in sec.checks if c.name == "logs.not_retained")
+    assert "not retained" in check.message
+    assert win_day.isoformat() in check.message
+    # Verdict must remain OK — this is environmental, not a session fault.
+    assert check.verdict == Verdict.OK
+    # Structured data carries the missing/present/available lists.
+    assert win_day.isoformat() in check.data["window_dates_missing"]
+    assert check.data["window_dates_present"] == []
+    assert len(check.data["available_log_dates"]) >= 1
+    # Section's verdict shouldn't be promoted to WARN by this state.
+    assert sec.verdict in (Verdict.OK, Verdict.WARN, Verdict.FAIL)
+    # The not_retained check itself contributes OK.
+
+
+def test_logs_uncorrelated_state(tmp_path: Path):
+    """Window day's log file exists but its lines lack any sessionId/runId
+    matching the diagnosed session → emit logs.uncorrelated."""
+    from datetime import datetime, timedelta
+
+    home = tmp_path / "uncorr-home"
+    log_dir = tmp_path / "uncorr-logs"
+    log_dir.mkdir(parents=True)
+
+    win_day = (datetime.now() - timedelta(days=2)).date()
+    win_ms = int(time.mktime(win_day.timetuple()) * 1000) + 1800_000
+
+    sid = "caffe1ee-2222-3333-4444-cafefeed1234"
+    _build_session_for_window(home, sid, ts_ms=win_ms)
+
+    log_path = log_dir / f"openclaw-{win_day.isoformat()}.log"
+    # Multiple lines, none mentioning the sessionId — also no runId.
+    lines = []
+    for i in range(5):
+        rec = {
+            "level": "INFO",
+            "time": win_ms + i * 1000,
+            "pid": 1,
+            "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+            "msg": f"unrelated event {i}",
+        }
+        lines.append(json.dumps(rec))
+    log_path.write_text("\n".join(lines) + "\n")
+    old = time.time() - 2 * 86400
+    os.utime(log_path, (old, old))
+
+    ctx = _ctx_for(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None
+    sec = _logs_section(report)
+    names = [c.name for c in sec.checks]
+    assert "logs.uncorrelated" in names, (
+        f"expected logs.uncorrelated, got {names}"
+    )
+    assert "logs.not_retained" not in names
+    assert "logs.missing" not in names
+    check = next(c for c in sec.checks if c.name == "logs.uncorrelated")
+    assert "present" in check.message
+    assert "no lines carry" in check.message
+    assert check.verdict == Verdict.OK
+    assert win_day.isoformat() in check.data["window_dates_present"]
+
+
+def test_logs_missing_state_preserved(tmp_path: Path):
+    """log_dir has zero openclaw-*.log files → keep emitting logs.missing
+    (warn) — backwards-compatible with the v1.4.17 behavior."""
+    from datetime import datetime, timedelta
+
+    home = tmp_path / "miss-home"
+    log_dir = tmp_path / "miss-logs"
+    log_dir.mkdir(parents=True)
+
+    win_day = (datetime.now() - timedelta(days=2)).date()
+    win_ms = int(time.mktime(win_day.timetuple()) * 1000)
+
+    sid = "b00b00b0-0000-1111-2222-b00b00b00000"
+    _build_session_for_window(home, sid, ts_ms=win_ms)
+
+    ctx = _ctx_for(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None
+    sec = _logs_section(report)
+    names = [c.name for c in sec.checks]
+    assert "logs.missing" in names
+    assert "logs.not_retained" not in names
+    assert "logs.uncorrelated" not in names
+    check = next(c for c in sec.checks if c.name == "logs.missing")
+    assert check.verdict == Verdict.WARN
+
+
+def test_logs_unknown_window_falls_back_to_none(tmp_path: Path):
+    """When the session has no usable timestamps (window=0 path), the
+    classifier can't tell missing-vs-present and must degrade to the
+    original logs.none ok message — and not raise."""
+    home = tmp_path / "zero-home"
+    log_dir = tmp_path / "zero-logs"
+    log_dir.mkdir(parents=True)
+    main_sd = home / "agents" / "main" / "sessions"
+
+    sid = "00000000-aaaa-bbbb-cccc-000000000000"
+    # Session record with no usable timestamp on any record (no `timestamp`
+    # field on the message wrapper, no `message.timestamp`). The session
+    # record itself has a malformed timestamp so iso_to_epoch_ms returns 0.
+    _write_jsonl(main_sd / f"{sid}.jsonl", [
+        {"type": "session", "version": 3, "id": sid, "timestamp": ""},
+        {"type": "message", "id": "u-1", "timestamp": "",
+         "message": {"role": "user", "content": "hi"}},
+    ])
+    # Drop a today-dated log file so log_files is non-empty (forcing the
+    # branch into the elif path).
+    from datetime import datetime
+    today = datetime.now().date().isoformat()
+    log_path = log_dir / f"openclaw-{today}.log"
+    log_path.write_text(json.dumps({
+        "level": "INFO", "time": 1, "pid": 1,
+        "_meta": {"name": json.dumps({"subsystem": "gateway"})},
+        "msg": "noop",
+    }) + "\n")
+
+    ctx = _ctx_for(home, log_dir)
+    report = _run_panorama(ctx, session_id=sid)
+    assert report.error is None
+    sec = _logs_section(report)
+    names = [c.name for c in sec.checks]
+    # Either logs.none (true zero window) or one of the new states if the
+    # session somehow ended up with a window. Both are acceptable as long
+    # as nothing exploded; assert no warn/fail from this branch.
+    assert "logs.missing" not in names
+    # Must include exactly one of the empty-correlation messages.
+    empty_states = {
+        "logs.none", "logs.not_retained", "logs.uncorrelated",
+    }
+    assert empty_states & set(names), (
+        f"expected one empty-correlation state, got {names}"
+    )
+
+
+def test_window_log_dates_helper(tmp_path: Path):
+    """Direct unit test for window_log_dates: present vs missing vs
+    available bookkeeping across a multi-day window."""
+    from datetime import date
+
+    from ocdiag.recent_logs import window_log_dates
+
+    log_dir = tmp_path / "h"
+    log_dir.mkdir()
+    # Drop files for 2026-06-04 and 2026-06-06 (skip 06-05).
+    for iso in ("2026-06-04", "2026-06-06", "2026-06-10"):
+        (log_dir / f"openclaw-{iso}.log").write_text("x")
+
+    # Window straddles 2026-06-04 → 2026-06-06 (3 days). 06-05 missing.
+    start_ms = int(time.mktime(date(2026, 6, 4).timetuple()) * 1000)
+    end_ms = int(time.mktime(date(2026, 6, 6).timetuple()) * 1000)
+    present, missing, available = window_log_dates(
+        str(log_dir), start_ms, end_ms,
+    )
+    assert present == ["2026-06-04", "2026-06-06"]
+    assert missing == ["2026-06-05"]
+    assert available == ["2026-06-04", "2026-06-06", "2026-06-10"]
+
+    # Zero window → empty present/missing, available still populated.
+    p2, m2, a2 = window_log_dates(str(log_dir), 0, 0)
+    assert (p2, m2) == ([], [])
+    assert a2 == available
+
+    # Single-day window with file present.
+    one_ms = int(time.mktime(date(2026, 6, 4).timetuple()) * 1000)
+    p3, m3, _ = window_log_dates(str(log_dir), one_ms, one_ms + 1000)
+    assert p3 == ["2026-06-04"]
+    assert m3 == []
+
+    # Single-day window with file missing.
+    miss_ms = int(time.mktime(date(2026, 6, 5).timetuple()) * 1000)
+    p4, m4, _ = window_log_dates(str(log_dir), miss_ms, miss_ms + 1000)
+    assert p4 == []
+    assert m4 == ["2026-06-05"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

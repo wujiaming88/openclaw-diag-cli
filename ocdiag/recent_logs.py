@@ -140,6 +140,58 @@ def discover_logs_for_window(
     return [p for _, p in matched]
 
 
+def window_log_dates(
+    log_dir: str,
+    window_start_ms: int,
+    window_end_ms: int,
+) -> tuple:
+    """Classify the dates a session window spans by whether the log_dir
+    holds the matching ``openclaw-YYYY-MM-DD.log`` file.
+
+    Returns ``(present, missing, available)`` where each element is a list
+    of ``YYYY-MM-DD`` strings, sorted ascending. ``present`` lists the
+    window dates whose log file exists; ``missing`` lists the window dates
+    whose file is absent; ``available`` lists every openclaw-*.log date
+    in the directory (regardless of window).
+
+    When ``window_start_ms`` and ``window_end_ms`` are both 0/falsey the
+    window is unknown — returns ``([], [], available)`` so callers can
+    detect the degenerate case.
+    """
+    available: List[str] = []
+    for f in glob.glob(os.path.join(log_dir, _LOG_FILE_GLOB)):
+        d = _filename_date(f)
+        if d is not None:
+            available.append(d.isoformat())
+    available.sort()
+
+    if not window_start_ms and not window_end_ms:
+        return ([], [], available)
+
+    start_ms = window_start_ms or window_end_ms
+    end_ms = window_end_ms or window_start_ms
+    if start_ms > end_ms:
+        start_ms, end_ms = end_ms, start_ms
+    try:
+        start_d = datetime.fromtimestamp(start_ms / 1000).date()
+        end_d = datetime.fromtimestamp(end_ms / 1000).date()
+    except (OverflowError, OSError, ValueError):
+        return ([], [], available)
+
+    present: List[str] = []
+    missing: List[str] = []
+    d = start_d
+    while d <= end_d:
+        iso = d.isoformat()
+        path = os.path.join(log_dir, f"openclaw-{iso}.log")
+        if os.path.isfile(path):
+            present.append(iso)
+        else:
+            missing.append(iso)
+        d += timedelta(days=1)
+    return (present, missing, available)
+
+
 def latest_app_log(log_dir: str) -> Optional[str]:
     pattern = os.path.join(log_dir, "openclaw-[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].log")
     matched: List[tuple] = []

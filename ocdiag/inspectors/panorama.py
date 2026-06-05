@@ -70,7 +70,11 @@ from ..correlation import (
     filter_log_files_with_otel,
 )
 from ..jsonlog import get_log_subsystem, parse_log_msg
-from ..recent_logs import discover_logs_for_window, discover_recent_logs
+from ..recent_logs import (
+    discover_logs_for_window,
+    discover_recent_logs,
+    window_log_dates,
+)
 from ..sensitive import sanitize_text
 from ..timeutil import fmt_duration, fmt_epoch_local
 from ..tracing import (
@@ -3404,7 +3408,54 @@ class PanoramaInspector:
         if not log_files:
             s_logs.warn("logs.missing", "no app log files found in log_dir")
         elif not correlated_logs:
-            s_logs.ok("logs.none", "no correlated log entries found")
+            # v1.4.18: distinguish three empty-correlation states so
+            # operators can tell "logs were rotated away" from "logs are
+            # there but nothing carries this sessionId" — the former is
+            # an environment/retention issue, the latter is a real
+            # correlation miss worth investigating.
+            present_dates, missing_dates, avail_dates = window_log_dates(
+                str(ctx.log_dir), window_start, window_end,
+            )
+            if not window_start and not window_end:
+                # Unknown window — can't classify; preserve the original
+                # honest fallback.
+                s_logs.ok("logs.none", "no correlated log entries found")
+            elif missing_dates and not present_dates:
+                # Every date the session window touches is missing from
+                # log_dir → the log was rotated/deleted before we got
+                # here. Not a session bug.
+                avail_preview = avail_dates[-5:] if avail_dates else []
+                avail_note = (
+                    f" (log_dir has: {', '.join(avail_preview)})"
+                    if avail_preview else " (log_dir has none)"
+                )
+                s_logs.ok(
+                    "logs.not_retained",
+                    f"session-window log not retained: "
+                    f"{', '.join(missing_dates)}{avail_note} — "
+                    f"app_log correlation/timeline unavailable for "
+                    f"this window",
+                    data={
+                        "window_dates_missing": missing_dates,
+                        "window_dates_present": present_dates,
+                        "available_log_dates": avail_dates,
+                    },
+                )
+            else:
+                # Window dates present but no lines correlated — could
+                # be a real bug (sessionId/runId not being logged) or
+                # a strict-correlation miss.
+                s_logs.ok(
+                    "logs.uncorrelated",
+                    f"no correlated entries — session-date log(s) "
+                    f"present ({', '.join(present_dates)}) but no "
+                    f"lines carry this sessionId/runId",
+                    data={
+                        "window_dates_missing": missing_dates,
+                        "window_dates_present": present_dates,
+                        "available_log_dates": avail_dates,
+                    },
+                )
         else:
             error_entries = [
                 rec for rec in correlated_logs

@@ -1,3 +1,3 @@
 """ocdiag — shared library for openclaw-diag-cli scripts."""
 
-__version__ = "1.4.17"
+__version__ = "1.4.18"

@@ -1,5 +1,57 @@
 # Changelog
 
+## v1.4.18 — honest empty-correlation states (2026-06-05)
+
+### Changed
+- **Panorama · Correlated Logs & Signals** distinguishes three reasons
+  the section can be empty instead of collapsing them into one
+  ambiguous line. Before, a session whose log was already rotated out
+  of `/tmp/openclaw/` rendered the same `no correlated log entries
+  found` as a session whose log files were intact but never carried
+  the `sessionId` — which made it impossible to tell "we lost the
+  evidence" from "the evidence is here but the link is broken (likely
+  bug)". The three states are now:
+  1. `logs.missing` (warn) — `no app log files found in log_dir`. No
+     `openclaw-*.log` at all. Unchanged from v1.4.17.
+  2. `logs.not_retained` (ok) — every date the session window spans is
+     missing from `log_dir`, but adjacent days exist (so `log_files`
+     was non-empty via the ±1 day discovery margin). Renders as
+     `session-window log not retained: 2026-06-03 (log_dir has:
+     2026-06-04, 2026-06-05) — app_log correlation/timeline
+     unavailable for this window`. Environmental, not a session
+     fault — emitted as **ok** so it doesn't pollute the verdict's
+     warn count.
+  3. `logs.uncorrelated` (ok) — at least one window-date log file is
+     present but no lines carry this sessionId/runId. Renders as `no
+     correlated entries — session-date log(s) present (2026-06-05)
+     but no lines carry this sessionId/runId`. This is the state worth
+     investigating (logger version mismatch, strict-correlation miss).
+  4. `logs.none` (ok) — the original "unknown window" fallback (when
+     `window_start` and `window_end` are both 0). Preserved for the
+     degenerate path so we never raise.
+- Each new check carries structured `data`:
+  `{window_dates_missing, window_dates_present, available_log_dates}`
+  so JSON consumers can branch programmatically.
+
+### Added
+- `ocdiag.recent_logs.window_log_dates(log_dir, start_ms, end_ms)` —
+  helper that classifies the dates the session window spans into
+  present/missing relative to `log_dir`, and lists every available
+  `openclaw-*.log` date. Reuses the existing `_filename_date` regex.
+
+### Tests
+- Five new regression cases in `tests/test_panorama.py`:
+  - `test_logs_not_retained_state` — window day's file rotated away;
+    adjacent days drag in a non-empty `log_files` set.
+  - `test_logs_uncorrelated_state` — window day's file present, lines
+    don't mention the sessionId.
+  - `test_logs_missing_state_preserved` — empty `log_dir` keeps
+    emitting `logs.missing` (warn).
+  - `test_logs_unknown_window_falls_back_to_none` — `window=0` path
+    doesn't raise.
+  - `test_window_log_dates_helper` — direct helper unit test across
+    multi-day windows + edge cases.
+
 ## v1.4.17 — readable Tool Execution layout (2026-06-05)
 
 ### Changed

@@ -1,5 +1,58 @@
 # Changelog
 
+## v1.4.20 — performance: decouple latency from availability verdict + 7-day mtime window for daily trend (2026-06-05)
+
+### Fixed
+- **`ocdiag/collectors/performance.py` · `_section_models`** — model-performance
+  verdict no longer flags slow-but-healthy heavy models as `fail`. Latency and
+  availability are now separate signals:
+  - `fail` → only when `min_success_rate < 90%` across models with `calls >= 10`
+    (real availability problem; `verdict_trigger="availability_critical"`).
+  - `warn` → `min_success_rate < 95%` (`verdict_trigger="availability"`) **or**
+    `max_p95 > 60s` while availability is fine (`verdict_trigger="latency"`).
+  - `ok` → otherwise (`verdict_trigger="ok"`).
+  Models with `calls < 10` still appear in detail/data but are excluded from
+  the verdict-driving min computation (sample too small to trust). When no
+  model qualifies, verdict falls back to latency-only and a high P95 is at
+  most a `warn`. Output `data` adds `min_success_rate_pct`,
+  `min_success_rate_model`, and `verdict_trigger`. Existing `models` /
+  `model_p95_max` payload fields are unchanged.
+
+  Real-world driver: `amazon-bedrock/claude-opus-4-6` on long agentic turns
+  routinely runs P95=60–70s with 97–100% success rate. The previous rule
+  (`max_p95 > 60 → fail`) misclassified that as a failure. Now the same
+  trace warns on latency without crying availability fault.
+
+- **`ocdiag/collectors/performance.py` · daily trend sampling** — `_section_daily_trend`
+  now reads from an independent **7-day mtime window** of session files, not
+  from the latest-20-files perf sample. Previously, a host with many sessions
+  per day (e.g. 68 files total, ~30/day) had its 20-file perf sample skew
+  toward today/yesterday; older days inside the rendered 7-day trend reported
+  `0 calls` despite having tens of real model calls (observed: 06-03 reported
+  `0` while the actual count was 48 cross-agent calls).
+
+  New helper `_collect_session_files_by_window(sessions_base, days=7)` filters
+  by `mtime >= now - days*86400` with no count cap. New helper
+  `_parse_daily_stats(files)` does a lightweight per-line parse (timestamp +
+  assistant marker + duration + output tokens only) so the 7-day scan stays
+  cheap. The latest-20 perf window for `_section_models` /
+  `_section_tools` / etc. is unchanged. Section detail/data now exposes
+  `trend_file_count` ("数据来源: 7 天 mtime 窗口内 N 个 session 文件").
+
+### Tests
+- `tests/test_performance_verdict.py` — 11 new tests:
+  - **Verdict matrix (8)**: high-P95 + 100% → warn-latency; high-P95 + 85% →
+    fail-critical; low-P95 + 85% → fail-critical; low-P95 + 98% → ok; 92% +
+    20s → warn-availability; calls<10 + 0% → ok (excluded); calls<10 + P95=70s
+    → warn-latency only; multi-model → min picks worst.
+  - **daily_trend window (3)**: 8-day-old files excluded; 1-day-old included;
+    days outside latest-20 perf sample but inside 7-day window report real
+    call counts (P50 derived from constructed durations); files outside the
+    7-day window do not pollute daily_stats.
+
+  Total suite: 139 passed / 1 skipped (up from 128 / 1; panorama suite
+  unchanged at 109 / 1 within the total).
+
 ## v1.4.19 — SKILL.md upgraded to AI-agent diagnostic playbook (2026-06-05)
 
 ### Changed

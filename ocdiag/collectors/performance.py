@@ -119,6 +119,82 @@ def _collect_session_files(sessions_base, limit=50):
     return [p for _, p in files[:limit]]
 
 
+def _collect_session_files_by_window(sessions_base, days: int = 7):
+    """Return all session files whose mtime is within the last `days` days.
+
+    Used by daily_trend to give an honest view: the perf-sampling window
+    (latest 20 files by mtime) skews toward today/yesterday and would
+    silently report 0 calls for older days that still have real activity.
+    """
+    cutoff = time.time() - days * 86400
+    files = []
+    pattern1 = os.path.join(sessions_base, "*", "*", "*.jsonl")
+    pattern2 = os.path.join(sessions_base, "*", "*", "*.jsonl.reset.*")
+    for pat in (pattern1, pattern2):
+        for p in glob.glob(pat):
+            if p.endswith(".trajectory.jsonl"):
+                continue
+            if ".acp-stream" in p:
+                continue
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if m < cutoff:
+                continue
+            files.append((m, p))
+    files.sort(reverse=True)
+    return [p for _, p in files]
+
+
+def _parse_daily_stats(session_files):
+    """Lightweight parse: only what daily_trend needs.
+
+    Reads timestamp + assistant/usage + duration + output tokens. Skips
+    openclaw/* internal markers (matches _analyze_sessions filter).
+    """
+    daily_stats = defaultdict(lambda: {"calls": 0, "durs": [], "output": 0})
+    for path in session_files:
+        max_msg_ms = 0
+        for raw_line in _tail_lines(path):
+            raw_line = raw_line.strip()
+            if not raw_line:
+                continue
+            try:
+                obj = json.loads(raw_line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            msg = obj.get("message", {}) or {}
+            if msg.get("role") != "assistant":
+                continue
+            if (msg.get("provider") or "") == "openclaw":
+                continue
+            msg_ts_raw = msg.get("timestamp")
+            if msg_ts_raw is not None:
+                if msg_ts_raw < max_msg_ms - 1000:
+                    continue
+                if msg_ts_raw > max_msg_ms:
+                    max_msg_ms = msg_ts_raw
+            obj_ts = parse_obj_ts(obj.get("timestamp"))
+            if not obj_ts:
+                continue
+            usage = msg.get("usage", {}) or {}
+            out_v = usage.get("output", 0) or 0
+            msg_ts = parse_msg_ts(msg_ts_raw)
+            dur = None
+            if msg_ts:
+                d = (obj_ts - msg_ts).total_seconds()
+                if 0 <= d <= 600:
+                    dur = d
+            day_key = obj_ts.astimezone().strftime("%m-%d")
+            d = daily_stats[day_key]
+            d["calls"] += 1
+            if dur is not None:
+                d["durs"].append(dur)
+            d["output"] += out_v
+    return daily_stats
+
+
 def _tail_lines(path, n=2000):
     """Read the last n lines of a file. Increased from 500 to capture more tool calls."""
     try:
@@ -483,26 +559,82 @@ def _section_models(s: Section, data: dict, file_count: int) -> dict:
     out_data["models"] = models_payload
     out_data["model_p95_max"] = round(max_p95, 3)
 
-    if max_p95 > 60:
-        s.fail(
-            "perf.models",
-            f"模型性能: 最大 P95 {max_p95:.1f}s（>60s）",
-            detail="\n".join(detail_lines),
-            data={"models": models_payload, "max_p95_s": round(max_p95, 3)},
+    # Decouple availability from latency: fail only when success rate is bad.
+    # Slow-but-healthy heavy models (e.g. Opus on long agentic turns) get
+    # demoted to warn instead of being flagged as a failure. Sample size of
+    # <10 calls is too small to drive verdict on success rate alone; those
+    # models still appear in detail/data but are excluded from min computation.
+    eligible = {
+        k: v for k, v in models_payload.items() if v["calls"] >= 10
+    }
+    if eligible:
+        min_success_model = min(
+            eligible, key=lambda k: eligible[k]["success_rate_pct"],
         )
-    elif max_p95 > 30:
-        s.warn(
-            "perf.models",
-            f"模型性能: 最大 P95 {max_p95:.1f}s（>30s）",
+        min_success_rate = eligible[min_success_model]["success_rate_pct"]
+    else:
+        min_success_model = None
+        min_success_rate = None
+
+    out_data["min_success_rate_pct"] = min_success_rate
+    out_data["min_success_rate_model"] = min_success_model
+
+    payload_data = {
+        "models": models_payload,
+        "max_p95_s": round(max_p95, 3),
+        "min_success_rate_pct": min_success_rate,
+        "min_success_rate_model": min_success_model,
+    }
+
+    if min_success_rate is not None and min_success_rate < 90:
+        trigger = "availability_critical"
+        msg = (
+            f"模型可用性: 最低成功率 {min_success_rate:.0f}% "
+            f"({min_success_model}) <90%"
+        )
+        if max_p95 > 60:
+            msg += f"；最大 P95 {max_p95:.1f}s"
+        out_data["verdict_trigger"] = trigger
+        s.fail(
+            "perf.models", msg,
             detail="\n".join(detail_lines),
-            data={"models": models_payload, "max_p95_s": round(max_p95, 3)},
+            data={**payload_data, "verdict_trigger": trigger},
+        )
+    elif min_success_rate is not None and min_success_rate < 95:
+        trigger = "availability"
+        msg = (
+            f"模型可用性: 最低成功率 {min_success_rate:.0f}% "
+            f"({min_success_model}) <95%"
+        )
+        if max_p95 > 60:
+            msg += f"；最大 P95 {max_p95:.1f}s"
+        out_data["verdict_trigger"] = trigger
+        s.warn(
+            "perf.models", msg,
+            detail="\n".join(detail_lines),
+            data={**payload_data, "verdict_trigger": trigger},
+        )
+    elif max_p95 > 60:
+        trigger = "latency"
+        msg = f"模型延迟: 最大 P95 {max_p95:.1f}s（>60s，可用性正常）"
+        out_data["verdict_trigger"] = trigger
+        s.warn(
+            "perf.models", msg,
+            detail="\n".join(detail_lines),
+            data={**payload_data, "verdict_trigger": trigger},
         )
     else:
+        trigger = "ok"
+        msg = (
+            f"模型性能: {len(models_payload)} 模型 / 最大 P95 {max_p95:.1f}s"
+        )
+        if min_success_rate is not None:
+            msg += f" / 最低成功率 {min_success_rate:.0f}%"
+        out_data["verdict_trigger"] = trigger
         s.ok(
-            "perf.models",
-            f"模型性能: {len(models_payload)} 模型 / 最大 P95 {max_p95:.1f}s",
+            "perf.models", msg,
             detail="\n".join(detail_lines),
-            data={"models": models_payload, "max_p95_s": round(max_p95, 3)},
+            data={**payload_data, "verdict_trigger": trigger},
         )
     return out_data
 
@@ -706,14 +838,18 @@ def _section_e2e(s: Section, data: dict) -> dict:
     return out_data
 
 
-def _section_daily_trend(s: Section, data: dict) -> dict:
+def _section_daily_trend(
+    s: Section, daily_stats: dict, trend_file_count: int,
+) -> dict:
     out_data: dict = {}
-    daily_stats = data["daily_stats"]
     if not daily_stats:
         s.ok(
             "perf.daily_trend",
             "每日趋势: 数据不足",
-            data={"trend": []},
+            detail=(
+                f"数据来源: 7 天 mtime 窗口内 {trend_file_count} 个 session 文件"
+            ),
+            data={"trend": [], "trend_file_count": trend_file_count},
         )
         out_data["daily_trend"] = []
         return out_data
@@ -722,6 +858,8 @@ def _section_daily_trend(s: Section, data: dict) -> dict:
         (today - timedelta(days=i)).strftime("%m-%d") for i in range(7)
     ]
     detail_lines = [
+        f"数据来源: 7 天 mtime 窗口内 {trend_file_count} 个 session 文件",
+        "",
         f"    {'日期':<10} {'调用数':>8} {'P50延迟':>10} {'输出tokens':>14}",
     ]
     daily_payload = []
@@ -749,11 +887,15 @@ def _section_daily_trend(s: Section, data: dict) -> dict:
             "output_tokens": d["output"],
         })
     out_data["daily_trend"] = daily_payload
+    days_with_data = sum(1 for d in daily_payload if d["calls"])
     s.ok(
         "perf.daily_trend",
-        f"每日趋势 (最近 7 天): {sum(1 for d in daily_payload if d['calls'])} 天有数据",
+        f"每日趋势 (最近 7 天): {days_with_data} 天有数据",
         detail="\n".join(detail_lines),
-        data={"trend": daily_payload},
+        data={
+            "trend": daily_payload,
+            "trend_file_count": trend_file_count,
+        },
     )
     return out_data
 
@@ -1078,6 +1220,12 @@ class PerformanceCollector:
         session_files = _collect_session_files(sessions_base, limit=20)
         report.data["session_files_analyzed"] = len(session_files)
 
+        # daily_trend uses an independent 7-day mtime window so days with
+        # real activity that fall outside the latest-20 perf sample aren't
+        # silently reported as 0 calls.
+        trend_files = _collect_session_files_by_window(sessions_base, days=7)
+        report.data["trend_files_analyzed"] = len(trend_files)
+
         if session_files:
             data = _analyze_sessions(session_files)
 
@@ -1097,7 +1245,12 @@ class PerformanceCollector:
             report.data.update(_section_e2e(s_e2e, data))
 
             s_daily = report.section("7.6 每日趋势")
-            report.data.update(_section_daily_trend(s_daily, data))
+            daily_stats_trend = _parse_daily_stats(trend_files)
+            report.data.update(
+                _section_daily_trend(
+                    s_daily, daily_stats_trend, len(trend_files),
+                ),
+            )
 
             s_cache = report.section("7.7 Session cache 命中率")
             report.data.update(_section_cache_session(s_cache, data))

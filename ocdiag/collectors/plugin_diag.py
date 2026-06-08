@@ -712,9 +712,9 @@ def _section_deps(s: Section, config_path: str) -> dict:
 
 
 def _section_trajectory(
-    s: Section, sessions_base: str, configured: Dict[str, bool],
+    s: Section, ctx: DiagContext, configured: Dict[str, bool],
 ) -> dict:
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "plugin.trajectory",
@@ -723,7 +723,7 @@ def _section_trajectory(
         )
         return {"trajectory_plugins": {"found": False}}
 
-    runs = trajectory.collect_runs(files)
+    runs = ctx.collect_runs()
     runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
     recent = [r for r in runs[:30] if r.plugin_entries]
     if not recent:
@@ -912,7 +912,7 @@ class PluginDiagCollector:
 
         s_traj = report.section("9.6 Trajectory 插件快照 + 漂移")
         report.data.update(
-            _section_trajectory(s_traj, str(ctx.sessions_base), configured),
+            _section_trajectory(s_traj, ctx, configured),
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

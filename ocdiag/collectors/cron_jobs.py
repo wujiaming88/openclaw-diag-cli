@@ -647,9 +647,9 @@ def _section_system_crontab(s: Section) -> dict:
     return data
 
 
-def _section_cron_trajectory(s: Section, sessions_base: str) -> dict:
+def _section_cron_trajectory(s: Section, ctx: DiagContext) -> dict:
     data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "trajectory.cron",
@@ -657,8 +657,8 @@ def _section_cron_trajectory(s: Section, sessions_base: str) -> dict:
             data={"found": False},
         )
         return data
-    runs = trajectory.collect_runs(
-        files, since_ms=trajectory.ms_ago(7 * 86400 * 1000),
+    runs = ctx.collect_runs(
+        since_ms=trajectory.ms_ago(7 * 86400 * 1000),
     )
     cron_runs = [r for r in runs if r.trigger == "cron"]
     if not cron_runs:
@@ -819,7 +819,7 @@ class CronJobsCollector:
 
         s_traj = report.section("6.4 Trajectory cron 审计 (7d)")
         report.data.update(
-            _section_cron_trajectory(s_traj, str(ctx.sessions_base)),
+            _section_cron_trajectory(s_traj, ctx),
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

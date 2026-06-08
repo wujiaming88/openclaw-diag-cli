@@ -11,8 +11,6 @@ from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 from ..trajectory import (
     Run,
-    collect_runs,
-    discover_trajectory_files,
     ms_ago,
     now_ms,
 )
@@ -415,7 +413,7 @@ class RunHealthCollector:
         report = Report(module_id=self.id, title=self.title)
 
         sessions_base = str(ctx.sessions_base)
-        files = discover_trajectory_files(sessions_base)
+        files = ctx.trajectory_files()
         if not files:
             s = report.section("11.1 Trajectory 数据")
             s.ok(
@@ -426,7 +424,7 @@ class RunHealthCollector:
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
-        all_runs = collect_runs(files)
+        all_runs = ctx.collect_runs()
         report.data["trajectory_files"] = len(files)
         report.data["runs_total_all_time"] = len(all_runs)
 

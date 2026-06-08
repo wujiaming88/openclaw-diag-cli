@@ -505,6 +505,12 @@ def _section_stuck(s: Section, log_dir: str) -> dict:
 
 
 def _section_trajectory(s: Section, sessions_base: str) -> dict:
+    # NOTE: this collector uses ``collect_summaries`` (per-file aggregate
+    # counts), not ``collect_runs`` (full Run dataclass list). Those are
+    # separate API surfaces in ``ocdiag.trajectory`` and they don't share a
+    # cache today; the in-process trajectory cache on DiagContext only covers
+    # ``collect_runs``. Migrating ``collect_summaries`` is a separate pass —
+    # keep this code untouched so the v1.5.0 refactor stays surgical.
     data: dict = {}
     files = trajectory.discover_trajectory_files(sessions_base)
     if not files:

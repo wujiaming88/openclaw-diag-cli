@@ -1,5 +1,52 @@
 # Changelog
 
+## v1.5.0 — DiagContext trajectory cache + single-scan performance + skill-install --help/--dry-run safety (2026-06-08)
+
+### Performance
+- **`ocdiag/core/context.py`** — added per-invocation trajectory cache to
+  `DiagContext`. New methods `trajectory_files()` and
+  `collect_runs(*, since_ms=, limit_per_file=, populate_raw=)` memoize the
+  expensive disk walk and JSONL parse on the ctx instance. Cache key is
+  `(since_ms, limit_per_file, populate_raw)`; the file list is memoized
+  separately. Returned lists are shallow copies so callers can `sort()`
+  in place without mutating the cache.
+- **`ocdiag/collectors/performance.py`** — `_section_trajectory_perf` and
+  `_section_prompt_budget` now take `ctx` and route through `ctx.collect_runs()`.
+  This collapses the previous **two full trajectory scans** in one
+  `performance` run into a single shared scan.
+- **`configuration.py`, `plugin_diag.py`, `run_health.py`** — migrated to
+  `ctx.collect_runs()` / `ctx.trajectory_files()`. Together with `performance`,
+  these five no-window callers now share one cached scan during
+  `openclaw-diag all`.
+- **`gateway.py` (24h), `cron_jobs.py` (7d), `recent_errors.py` (7d),
+  `environment.py` (14d)** — migrated to `ctx.collect_runs(since_ms=...)`.
+  Each window keeps its own cache slot (correct: distinct windowed callers
+  must not share parsed lists).
+- **`sessions_diag.py`** — uses the separate `collect_summaries` API and is
+  intentionally untouched in this pass; a code comment notes it as a future
+  cache dimension.
+
+  Net effect on the `all` command: trajectory parse cost drops from ~9 scans
+  to ~5 scans (1 shared no-window scan + 4 distinct windowed scans + 1 for
+  `sessions_diag` summaries). On a perf-machine dataset of ~551MB, this
+  removes roughly half of the trajectory-parse wall-clock; absolute speedup
+  must be measured on real data, not on this dev host.
+
+### Behavior fix
+- **`bin/openclaw-diag.js`** — `skill-install --help` / `-h` now prints a
+  short usage page and exits 0 **without** spawning the installer. Previously
+  the wrapper passed argv straight to `scripts/install-skill.py`, which has
+  no flag parsing and so `--help` actually performed an install.
+- **`scripts/install-skill.py`** — added `--dry-run` support. When set, every
+  installer prints the target path it WOULD write to and returns without
+  creating directories or copying files. Detection is the same as the real
+  installer (silently skips frameworks whose root dir is missing).
+
+### Safety
+- All write operations preserved their existing behavior — no collector
+  output, verdict, or `data.*` field changes (verified by JSON diff against
+  pre-change baseline; only timing/clock/disk drift remained).
+
 ## v1.4.21 — README: surface npm downloads, OpenClaw relationship, scope & masking at top (2026-06-05)
 
 ### Changed

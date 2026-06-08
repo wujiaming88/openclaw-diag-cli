@@ -959,9 +959,12 @@ def _section_cache_session(s: Section, data: dict) -> dict:
     return out_data
 
 
-def _section_trajectory_perf(s: Section, sessions_base: str) -> dict:
+def _section_trajectory_perf(s: Section, ctx: DiagContext) -> dict:
     out_data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    # Use the per-ctx trajectory cache so the second `_section_prompt_budget`
+    # call in this same collector — and any of the other no-window callers in
+    # the `all` command — share the parse instead of redoing it.
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "trajectory.cache_health",
@@ -969,7 +972,7 @@ def _section_trajectory_perf(s: Section, sessions_base: str) -> dict:
             data={"found": False},
         )
         return out_data
-    runs = trajectory.collect_runs(files)
+    runs = ctx.collect_runs()
     runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
     recent = runs[:100]
     if not recent:
@@ -1079,9 +1082,9 @@ def _section_trajectory_perf(s: Section, sessions_base: str) -> dict:
     return out_data
 
 
-def _section_prompt_budget(s: Section, sessions_base: str) -> dict:
+def _section_prompt_budget(s: Section, ctx: DiagContext) -> dict:
     out_data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "trajectory.prompt_budget",
@@ -1089,7 +1092,7 @@ def _section_prompt_budget(s: Section, sessions_base: str) -> dict:
             data={"found": False},
         )
         return out_data
-    runs = trajectory.collect_runs(files)
+    runs = ctx.collect_runs()
     runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
     sample = [r for r in runs[:50] if r.system_prompt_chars > 0]
     if not sample:
@@ -1263,10 +1266,10 @@ class PerformanceCollector:
             )
 
         s_traj = report.section("7.8 Trajectory cache + compaction")
-        report.data.update(_section_trajectory_perf(s_traj, sessions_base))
+        report.data.update(_section_trajectory_perf(s_traj, ctx))
 
         s_pb = report.section("7.9 Trajectory prompt budget")
-        report.data.update(_section_prompt_budget(s_pb, sessions_base))
+        report.data.update(_section_prompt_budget(s_pb, ctx))
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

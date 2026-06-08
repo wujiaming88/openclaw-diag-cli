@@ -375,9 +375,9 @@ def _section_env_vars(s: Section, unmask: bool) -> dict:
     return data
 
 
-def _section_trajectory_versions(s: Section, sessions_base: str) -> dict:
+def _section_trajectory_versions(s: Section, ctx: DiagContext) -> dict:
     data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "trajectory.versions",
@@ -387,8 +387,8 @@ def _section_trajectory_versions(s: Section, sessions_base: str) -> dict:
         data["version_history"] = []
         return data
 
-    runs = trajectory.collect_runs(
-        files, since_ms=trajectory.ms_ago(14 * 86400 * 1000),
+    runs = ctx.collect_runs(
+        since_ms=trajectory.ms_ago(14 * 86400 * 1000),
     )
     if not runs:
         s.ok("trajectory.versions", "最近 14d 无 trajectory run")
@@ -490,7 +490,7 @@ class EnvironmentCollector:
 
         s_traj = report.section("2.6 Trajectory 版本漂移 (14d)")
         report.data.update(
-            _section_trajectory_versions(s_traj, str(ctx.sessions_base)),
+            _section_trajectory_versions(s_traj, ctx),
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

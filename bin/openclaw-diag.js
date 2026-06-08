@@ -167,12 +167,34 @@ function main() {
   }
 
   if (head === 'skill-install') {
+    const skillArgs = argv.slice(1);
+    // Intercept --help/-h BEFORE spawning the installer. install-skill.py
+    // has no flag parsing of its own, so spawning it with --help would
+    // actually run the install — we print our own help here and exit.
+    if (skillArgs.includes('--help') || skillArgs.includes('-h')) {
+      const help = [
+        'openclaw-diag skill-install — 把 openclaw-diag 技能安装到支持的 agent 框架',
+        '',
+        '用法：',
+        '  openclaw-diag skill-install              安装到所有已检测到的框架',
+        '  openclaw-diag skill-install --dry-run    只打印将写入的目标路径，不写文件',
+        '  openclaw-diag skill-install --help       本帮助',
+        '',
+        '安装目标（仅当对应目录存在时写入）：',
+        '  OpenClaw:    ~/.openclaw/skills/openclaw-diag/SKILL.md',
+        '  Claude Code: ~/.claude/commands/openclaw-diag.md',
+        '  Codex:       ~/.codex/instructions/openclaw-diag.md',
+        '  Cursor:      ~/.cursor/rules/openclaw-diag.mdc',
+      ];
+      console.log(help.join('\n'));
+      process.exit(0);
+    }
     const skillScript = path.join(REPO_ROOT, 'scripts', 'install-skill.py');
     if (!fs.existsSync(skillScript)) {
       console.error(`Error: skill installer not found at ${skillScript}`);
       process.exit(1);
     }
-    const r = spawnSync(py.cmd, [skillScript, ...argv.slice(1)], { stdio: 'inherit' });
+    const r = spawnSync(py.cmd, [skillScript, ...skillArgs], { stdio: 'inherit' });
     process.exit(r.status == null ? 1 : r.status);
   }
 

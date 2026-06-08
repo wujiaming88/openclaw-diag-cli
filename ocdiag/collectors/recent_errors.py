@@ -312,9 +312,9 @@ def _section_session_errors(s: Section, sessions_base: str) -> dict:
     return data
 
 
-def _section_trajectory_errors(s: Section, sessions_base: str) -> dict:
+def _section_trajectory_errors(s: Section, ctx: DiagContext) -> dict:
     data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "trajectory.errors",
@@ -323,8 +323,8 @@ def _section_trajectory_errors(s: Section, sessions_base: str) -> dict:
         )
         return data
 
-    runs = trajectory.collect_runs(
-        files, since_ms=trajectory.ms_ago(7 * 86400 * 1000),
+    runs = ctx.collect_runs(
+        since_ms=trajectory.ms_ago(7 * 86400 * 1000),
     )
     if not runs:
         s.ok(
@@ -542,7 +542,7 @@ class RecentErrorsCollector:
 
         s_traj = report.section("5.4 Trajectory 错误信号 (7d)")
         report.data.update(
-            _section_trajectory_errors(s_traj, str(ctx.sessions_base)),
+            _section_trajectory_errors(s_traj, ctx),
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

@@ -877,9 +877,9 @@ def _section_gateway_errors(s: Section, app_log: str) -> dict:
     return data
 
 
-def _section_run_frequency(s: Section, sessions_base: str) -> dict:
+def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
     data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok(
             "gateway.run_frequency",
@@ -887,8 +887,8 @@ def _section_run_frequency(s: Section, sessions_base: str) -> dict:
             data={"runs_24h": 0},
         )
         return data
-    runs_24h = trajectory.collect_runs(
-        files, since_ms=trajectory.ms_ago(24 * 3600 * 1000),
+    runs_24h = ctx.collect_runs(
+        since_ms=trajectory.ms_ago(24 * 3600 * 1000),
     )
     if not runs_24h:
         s.ok(
@@ -972,7 +972,7 @@ class GatewayCollector:
         report.data.update(_section_gateway_errors(s_err, app_log or ""))
 
         s_freq = report.section("4.6 Trajectory 24h Run 频率")
-        report.data.update(_section_run_frequency(s_freq, str(ctx.sessions_base)))
+        report.data.update(_section_run_frequency(s_freq, ctx))
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

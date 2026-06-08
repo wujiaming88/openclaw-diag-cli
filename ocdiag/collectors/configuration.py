@@ -93,13 +93,13 @@ def _emit_config(out: List[str], obj, prefix: str = "") -> None:
         out.append(f"{prefix} = {display}")
 
 
-def _section_trajectory_runtime_config(s: Section, sessions_base: str) -> dict:
+def _section_trajectory_runtime_config(s: Section, ctx: DiagContext) -> dict:
     data: dict = {}
-    files = trajectory.discover_trajectory_files(sessions_base)
+    files = ctx.trajectory_files()
     if not files:
         s.ok("trajectory.runtime", "未发现 trajectory 文件 — 跳过")
         return data
-    runs = trajectory.collect_runs(files)
+    runs = ctx.collect_runs()
     runs.sort(key=lambda r: r.started_ts_ms, reverse=True)
     if not runs:
         s.ok("trajectory.runtime", "最近无 trajectory run — 跳过")
@@ -226,7 +226,7 @@ class ConfigurationCollector:
 
         s_traj = report.section("3.3 Trajectory 最新 runtime config")
         report.data.update(
-            _section_trajectory_runtime_config(s_traj, str(ctx.sessions_base)),
+            _section_trajectory_runtime_config(s_traj, ctx),
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

@@ -1,5 +1,51 @@
 # Changelog
 
+## v1.5.2 — superset cache filter for windowed queries + gateway mtime prefilter & undated-run count fix (2026-06-08)
+
+### Performance
+- **`ocdiag/core/context.py`** — `DiagContext.collect_runs` now reuses the
+  in-process full-scan cache to serve windowed queries instead of
+  re-scanning disk. When a no-window full scan is already cached (the
+  typical case in `all`, where `configuration` / `performance` populate it
+  first), the gateway 24h / cron_jobs 7d / recent_errors 7d / environment
+  14d windows are filtered IN MEMORY with the exact predicate from
+  `trajectory.collect_runs` (`(not r.started_ts_ms) or (r.started_ts_ms >=
+  since_ms)`). On a 227-file / 1847-run dataset this drops each windowed
+  call from ~5s to <1ms — ≈5000× speedup, output-identical to a fresh
+  scan (proved by `tests/test_cache_superset.py`).
+- **`ocdiag/collectors/gateway.py`, `ocdiag/trajectory.py`,
+  `ocdiag/core/context.py`** — standalone `gateway` (no full-scan cache to
+  superset-filter) now opts into a file mtime prefilter for its 24h
+  windowed scan. `discover_trajectory_files` accepts an optional
+  `mtime_floor_ms` (backward-compatible, default = current behavior); the
+  context computes the floor as `since_ms - 2h grace` to absorb clock
+  skew. Cache key gains a `mtime_prefilter` dimension so prefiltered
+  (subset) results never pollute the complete-set keys. In the `all`
+  command the superset path takes precedence and the prefilter flag is a
+  no-op — gateway's reported numbers are identical either way.
+
+### Fix
+- **`ocdiag/collectors/gateway.py`** — `_section_run_frequency`'s reported
+  `runs_24h` count now excludes undated/incomplete runs (those without a
+  `started_ts_ms`), matching its own hourly histogram which already skips
+  them. Previously the count line and `data.runs_24h` inflated by the
+  number of undated runs in the cached set; the histogram never agreed
+  with the count line. On the reference dataset this drops `runs_24h`
+  from 24 → 20 (4 undated runs no longer counted); the histogram and
+  `data.run_frequency_24h` buckets are unchanged.
+
+### Tests
+- New `tests/test_cache_superset.py` (stdlib only): proves the superset
+  reuse path is set-equal to a fresh `trajectory.collect_runs(files,
+  since_ms=...)` for 24h / 7d / 14d windows including undated-run
+  preservation, that windowed calls reuse Run objects from the full-scan
+  cache (no re-parse), and that `mtime_prefilter` results never pollute
+  the non-prefilter cache key.
+- All existing suites pass: `run_trajectory_tests.py`,
+  `run_collector_tests.py`, `run_sessions_tests.py`, `test_panorama.py`.
+- `cron_jobs` / `recent_errors` `--json` output is byte-identical vs
+  v1.5.1 (verified by capturing pre/post and diffing).
+
 ## v1.5.1 — route all human output through pager, not just `all` (2026-06-08)
 
 ### Fix

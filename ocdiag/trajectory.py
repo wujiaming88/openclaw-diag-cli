@@ -200,15 +200,24 @@ def _safe_bool(v: Any) -> bool:
 
 def discover_trajectory_files(
     sessions_base: str = paths.SESSIONS_BASE,
+    *,
+    mtime_floor_ms: Optional[int] = None,
 ) -> List[str]:
     """Return absolute paths of every ``*.trajectory.jsonl`` under any agent.
 
     Returns paths sorted by mtime (newest first) so windowed callers can
     stop early. Missing ``sessions_base`` returns an empty list — that is a
     routine "no data" condition, not an error (axiom #5).
+
+    ``mtime_floor_ms`` (opt-in) drops files whose mtime is older than the
+    given epoch-ms threshold. Used by the gateway 24h windowed scan to skip
+    files that cannot possibly contain a run with ``started_ts_ms`` in the
+    requested window. Caller is responsible for adding any clock-skew /
+    write-buffering grace; see ``DiagContext.collect_runs``.
     """
     if not sessions_base or not os.path.isdir(sessions_base):
         return []
+    floor_s = (mtime_floor_ms / 1000.0) if mtime_floor_ms is not None else None
     files: List[tuple] = []
     for agent_dir in os.listdir(sessions_base):
         sd = os.path.join(sessions_base, agent_dir, "sessions")
@@ -222,6 +231,8 @@ def discover_trajectory_files(
                 try:
                     mt = os.path.getmtime(p)
                 except OSError:
+                    continue
+                if floor_s is not None and mt < floor_s:
                     continue
                 files.append((mt, p))
         except OSError:

@@ -887,10 +887,22 @@ def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
             data={"runs_24h": 0},
         )
         return data
+    # mtime_prefilter: in standalone ``gateway`` runs we don't have a full
+    # scan to superset-filter from, so narrow the file list by mtime instead
+    # of opening every trajectory. In the ``all`` command DiagContext serves
+    # this from the cached full scan via the superset path; the prefilter
+    # flag is harmless there (the superset path takes precedence).
     runs_24h = ctx.collect_runs(
         since_ms=trajectory.ms_ago(24 * 3600 * 1000),
+        mtime_prefilter=True,
     )
-    if not runs_24h:
+    # Count and histogram both restrict to DATED runs. ``collect_runs`` keeps
+    # undated (``started_ts_ms == 0``) runs in its result so other collectors
+    # (cron_jobs / recent_errors / environment) can still see them, but for
+    # the 24h frequency analysis they have no hour bucket and would inflate
+    # the count past what the histogram can attribute. Filter once, use both.
+    dated_24h = [r for r in runs_24h if r.started_ts_ms]
+    if not dated_24h:
         s.ok(
             "gateway.run_frequency",
             "Trajectory: 最近 24h 无 run",
@@ -899,9 +911,7 @@ def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
         return data
 
     histogram: dict = {}
-    for r in runs_24h:
-        if not r.started_ts_ms:
-            continue
+    for r in dated_24h:
         try:
             t = datetime.fromtimestamp(r.started_ts_ms / 1000)
             key = t.strftime("%Y-%m-%d %H")
@@ -917,10 +927,10 @@ def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
 
     s.ok(
         "gateway.run_frequency",
-        f"Trajectory: 24h 内 {len(runs_24h)} 个 run，分布在 {len(histogram)} 个小时桶",
+        f"Trajectory: 24h 内 {len(dated_24h)} 个 run，分布在 {len(histogram)} 个小时桶",
         detail=detail,
         data={
-            "runs_24h": len(runs_24h),
+            "runs_24h": len(dated_24h),
             "buckets": [
                 {"hour": h, "count": c}
                 for h, c in sorted(histogram.items())

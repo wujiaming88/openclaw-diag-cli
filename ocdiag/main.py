@@ -120,7 +120,8 @@ def _render(report: Report, args) -> None:
     elif fmt == "ndjson":
         NdjsonRenderer().write(report)
     else:
-        HumanRenderer(no_color=getattr(args, "no_color", False)).write(report)
+        text = HumanRenderer(no_color=getattr(args, "no_color", False)).render(report)
+        _paged_print(text + "\n")
 
 
 def _exit_code(report: Report) -> int:
@@ -479,6 +480,7 @@ def _dump_extract_records(report: Report, ctx: DiagContext) -> None:
     """
     import json as _json
     files_payload = report.data.get("files_payload", [])
+    buf: List[str] = []
     for entry in files_payload:
         records = entry.get("records")
         if not records:
@@ -486,12 +488,14 @@ def _dump_extract_records(report: Report, ctx: DiagContext) -> None:
         path = entry.get("path", "")
         state = entry.get("state", "")
         sep = "─" * 76
-        print(f"\n{sep}")
-        print(f"  Records: {os.path.basename(path)} [{state}]")
-        print(f"{sep}\n")
+        buf.append(f"\n{sep}\n")
+        buf.append(f"  Records: {os.path.basename(path)} [{state}]\n")
+        buf.append(f"{sep}\n\n")
         for rec in records:
-            print(_json.dumps(rec, indent=2, ensure_ascii=False))
-            print()
+            buf.append(_json.dumps(rec, indent=2, ensure_ascii=False) + "\n")
+            buf.append("\n")
+    if buf:
+        _paged_print("".join(buf))
 
 
 def _split_skip(rest: List[str]):

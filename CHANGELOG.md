@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.5.1 — route all human output through pager, not just `all` (2026-06-08)
+
+### Fix
+- **`ocdiag/main.py`** — `_render()` and `_dump_extract_records()` now route
+  pretty-format output through `_paged_print()`. Previously the pager was
+  wired into `cmd_all` only, so single collectors (e.g. `performance`) and
+  inspectors (`panorama` / `trace` / `extract`) wrote directly to stdout —
+  long human output blew past terminal scrollback. Both call sites now
+  page identically to `all`.
+- `extract` pretty mode pages the Report summary first and the per-file
+  records dump second (two sequential pager sessions, by design — keeps the
+  diff minimal and preserves the existing output ordering).
+
+### Behavior preserved
+- JSON / NDJSON modes still write directly — `--json | jq` and CI redirects
+  are byte-identical to v1.5.0 (verified on `performance` against a
+  pre-change baseline; only timestamps differ).
+- `_paged_print()` guards are unchanged: non-TTY stdout (pipes, redirects,
+  CI) and short output (≤ terminal height) still write directly. Set
+  `PAGER=cat` to disable paging interactively.
+
 ## v1.5.0 — DiagContext trajectory cache + single-scan performance + skill-install --help/--dry-run safety (2026-06-08)
 
 ### Performance

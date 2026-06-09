@@ -34,6 +34,7 @@ from .. import paths, trajectory
 from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
+from ..sensitive import sanitize_text
 from ..timeutil import fmt_age, fmt_ts
 from ..tokens import fmt_tokens, percentile
 
@@ -266,13 +267,18 @@ def _fetch_sqlite_runs(
     if not jid:
         return []
 
+    # ORDER BY DESC + LIMIT N picks the *most recent* N rows; we then
+    # reverse to ts-ascending in Python so _analyze() (which slices
+    # `finished[-20:]`) sees real recent runs. ASC + LIMIT would keep the
+    # oldest N — divergent from the legacy deque(maxlen=200) semantics
+    # and silently wrong once a job's log exceeds _RUN_LIMIT_PER_JOB.
     def _query(with_filter: bool) -> List[sqlite3.Row]:
         try:
             if with_filter and store_key_filter:
                 cur = conn.execute(
                     "SELECT entry_json, ts, seq FROM cron_run_logs "
                     "WHERE job_id=? AND store_key=? "
-                    "ORDER BY COALESCE(ts, 0) ASC, seq ASC "
+                    "ORDER BY COALESCE(ts, 0) DESC, seq DESC "
                     "LIMIT ?",
                     (jid, store_key_filter, _RUN_LIMIT_PER_JOB),
                 )
@@ -280,7 +286,7 @@ def _fetch_sqlite_runs(
                 cur = conn.execute(
                     "SELECT entry_json, ts, seq FROM cron_run_logs "
                     "WHERE job_id=? "
-                    "ORDER BY COALESCE(ts, 0) ASC, seq ASC "
+                    "ORDER BY COALESCE(ts, 0) DESC, seq DESC "
                     "LIMIT ?",
                     (jid, _RUN_LIMIT_PER_JOB),
                 )
@@ -300,6 +306,7 @@ def _fetch_sqlite_runs(
             entry = None
         if isinstance(entry, dict):
             out.append(entry)
+    out.reverse()
     return out
 
 
@@ -664,6 +671,201 @@ def _load_sqlite_runs_for(
             pass
 
 
+# ─── Job configuration surfacing ──────────────────────────────────────
+#
+# OpenClaw 2026.6.x moved cron config into SQLite, so users can no longer
+# `cat jobs.json` to see the full configuration. The collector now
+# surfaces every config field (payload model/message/timeout/tools,
+# delivery channel/to/thread, sessionTarget, wakeMode, …) in the JSON
+# envelope and a compact pretty block, so a `cron_jobs --json | jq` or
+# human inspection is enough to recover the full config view.
+
+# Cap the message preview shown in pretty detail. The full (sanitized)
+# text still lives in the JSON envelope under config.payload.message.
+_MSG_PREVIEW_CHARS = 200
+
+
+def _drop_empty(d: dict) -> dict:
+    """Drop keys whose value is None or an empty container.
+
+    Keeps booleans (incl. False) and numeric zeros — those are real
+    config values. Used so the JSON envelope stays clean instead of
+    flooding consumers with a sea of nulls.
+    """
+    return {
+        k: v for k, v in d.items()
+        if v is not None and v != "" and v != [] and v != {}
+    }
+
+
+def _preview_one_line(text: str, limit: int = _MSG_PREVIEW_CHARS) -> str:
+    """Collapse whitespace, sanitize, then truncate for one-line display."""
+    if not text:
+        return ""
+    flat = re.sub(r"\s+", " ", str(text)).strip()
+    flat = sanitize_text(flat, context="generic")
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit] + "…"
+
+
+def _build_job_config(j: dict) -> dict:
+    """Build the JSON-envelope `config` sub-object for one job.
+
+    Mirrors the legacy jobs.json shape (which is identical to the
+    SQLite job_json blob), with two differences: keys are snake_case
+    (collector convention) and free-form text fields go through
+    sanitize_text so embedded tokens / API keys are masked.
+    """
+    sched = j.get("schedule") or {}
+    payload = j.get("payload") or {}
+    delivery = j.get("delivery") or {}
+
+    msg_raw = payload.get("message")
+    msg_clean: Any = None
+    msg_len: Any = None
+    if isinstance(msg_raw, str) and msg_raw:
+        msg_len = len(msg_raw)
+        msg_clean = sanitize_text(msg_raw, context="generic")
+
+    text_raw = payload.get("text")
+    text_clean: Any = None
+    if isinstance(text_raw, str) and text_raw:
+        text_clean = sanitize_text(text_raw, context="generic")
+
+    payload_out = _drop_empty({
+        "kind": payload.get("kind"),
+        "model": payload.get("model"),
+        "fallbacks": payload.get("fallbacks"),
+        "thinking": payload.get("thinking"),
+        "timeout_seconds": payload.get("timeoutSeconds"),
+        "tools_allow": payload.get("toolsAllow"),
+        "allow_unsafe_external_content":
+            payload.get("allowUnsafeExternalContent"),
+        "light_context": payload.get("lightContext"),
+        "message": msg_clean,
+        "message_len": msg_len,
+        "text": text_clean,
+    })
+
+    delivery_out = _drop_empty({
+        "mode": delivery.get("mode"),
+        "channel": delivery.get("channel"),
+        "to": delivery.get("to"),
+        "thread_id": delivery.get("threadId"),
+        "account_id": delivery.get("accountId"),
+        "best_effort": delivery.get("bestEffort"),
+        "completion_mode": delivery.get("completionMode"),
+        "completion_to": delivery.get("completionTo"),
+    })
+
+    return _drop_empty({
+        "enabled": j.get("enabled", True),
+        "agent_id": j.get("agentId"),
+        "session_key": j.get("sessionKey"),
+        "session_target": j.get("sessionTarget"),
+        "wake_mode": j.get("wakeMode"),
+        "description": j.get("description"),
+        "delete_after_run": j.get("deleteAfterRun"),
+        "created_at_ms": j.get("createdAtMs"),
+        "schedule": dict(sched) if sched else {},
+        "payload": payload_out,
+        "delivery": delivery_out,
+    })
+
+
+def _detail_config_lines(j: dict) -> List[str]:
+    """Return compact 配置 block lines (4-space indent), skipping empties."""
+    payload = j.get("payload") or {}
+    delivery = j.get("delivery") or {}
+
+    out: List[str] = ["    配置:"]
+
+    head_bits = []
+    head_bits.append(
+        f"启用: {'是' if j.get('enabled', True) else '否'}",
+    )
+    if j.get("sessionTarget"):
+        head_bits.append(f"sessionTarget: {j['sessionTarget']}")
+    if j.get("wakeMode"):
+        head_bits.append(f"wakeMode: {j['wakeMode']}")
+    if j.get("agentId"):
+        head_bits.append(f"agentId: {j['agentId']}")
+    if j.get("sessionKey"):
+        head_bits.append(f"sessionKey: {j['sessionKey']}")
+    if j.get("deleteAfterRun"):
+        head_bits.append("deleteAfterRun: 是")
+    out.append("      " + " | ".join(head_bits))
+
+    if j.get("description"):
+        desc = re.sub(r"\s+", " ", str(j["description"])).strip()
+        if len(desc) > 120:
+            desc = desc[:120] + "…"
+        out.append(f"      description: {desc}")
+
+    if payload:
+        bits = []
+        kind = payload.get("kind")
+        if kind:
+            bits.append(str(kind))
+        if payload.get("model"):
+            bits.append(f"model={payload['model']}")
+        fb = payload.get("fallbacks")
+        if isinstance(fb, list) and fb:
+            bits.append(f"fallbacks={','.join(str(x) for x in fb)}")
+        if payload.get("timeoutSeconds") is not None:
+            bits.append(f"timeout={payload['timeoutSeconds']}s")
+        if payload.get("thinking") is not None:
+            bits.append(f"thinking={payload['thinking']}")
+        tools = payload.get("toolsAllow")
+        if isinstance(tools, list) and tools:
+            bits.append(f"tools=[{','.join(str(t) for t in tools)}]")
+        if payload.get("allowUnsafeExternalContent"):
+            bits.append("allowUnsafeExternalContent=true")
+        if payload.get("lightContext"):
+            bits.append("lightContext=true")
+        if bits:
+            out.append("      payload: " + " | ".join(bits))
+
+    if delivery:
+        bits = []
+        if delivery.get("mode"):
+            bits.append(str(delivery["mode"]))
+        chan = delivery.get("channel")
+        to = delivery.get("to")
+        thread = delivery.get("threadId")
+        target = " → ".join(
+            x for x in [chan, to] if x
+        ) if (chan or to) else ""
+        if target:
+            bits.append(target)
+        if thread:
+            bits.append(f"thread={thread}")
+        if delivery.get("accountId"):
+            bits.append(f"account={delivery['accountId']}")
+        if delivery.get("bestEffort"):
+            bits.append("bestEffort=true")
+        if delivery.get("completionMode"):
+            bits.append(f"completionMode={delivery['completionMode']}")
+        if delivery.get("completionTo"):
+            bits.append(f"completionTo={delivery['completionTo']}")
+        if bits:
+            out.append("      delivery: " + " | ".join(bits))
+
+    msg = payload.get("message")
+    if isinstance(msg, str) and msg:
+        out.append(
+            f"      message({len(msg)} 字): {_preview_one_line(msg)}",
+        )
+    txt = payload.get("text")
+    if isinstance(txt, str) and txt:
+        out.append(
+            f"      text({len(txt)} 字): {_preview_one_line(txt)}",
+        )
+
+    return out
+
+
 def _analyze_jobs_section(
     s: Section,
     jobs: List[dict],
@@ -717,6 +919,7 @@ def _analyze_jobs_section(
             "next_run_ts": state.get("nextRunAtMs"),
             "consecutive_errors": state.get("consecutiveErrors", 0) or 0,
             "flags": [{"kind": k, "msg": m} for k, m in a["flags"]],
+            "config": _build_job_config(j),
         })
     data["jobs"] = jobs_payload
 
@@ -810,6 +1013,7 @@ def _analyze_jobs_section(
             if a["dur_max"] is not None and a["dur_max"] != a["p50"]:
                 parts.append(f"Max={_fmt_duration(a['dur_max'])}")
             detail_lines.append("    耗时: " + " ".join(parts))
+        detail_lines.extend(_detail_config_lines(j))
         cerr = a.get("consecutive_errors", 0) or 0
         if cerr > max_consec:
             max_consec = cerr

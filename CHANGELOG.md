@@ -1,5 +1,90 @@
 # Changelog
 
+## v1.7.0 — Full cron config surfacing + SQLite run-order fix (2026-06-09)
+
+### Feature — full cron config in `cron_jobs` output
+- **`ocdiag/collectors/cron_jobs.py`** — after the SQLite migration in
+  OpenClaw 2026.6.x, `~/.openclaw/cron/jobs.json` is no longer the
+  authoritative store, so users lost the ability to `cat` the file and
+  see the full job configuration. The collector now surfaces every
+  configured field for each job, regardless of data source (SQLite
+  `cron_jobs.job_json` or legacy `cron/jobs.json`):
+  - **JSON envelope** — each entry under `data.jobs[]` gains a new
+    `config` sub-object with `enabled`, `agent_id`, `session_key`,
+    `session_target`, `wake_mode`, `description`, `delete_after_run`,
+    `created_at_ms`, the full `schedule` block, a `payload` block
+    (`kind` / `model` / `fallbacks` / `thinking` / `timeout_seconds` /
+    `tools_allow` / `allow_unsafe_external_content` / `light_context` /
+    `message` / `message_len` / `text`), and a `delivery` block
+    (`mode` / `channel` / `to` / `thread_id` / `account_id` /
+    `best_effort` / `completion_mode` / `completion_to`). Empty / null
+    fields are dropped to keep the JSON tidy. Existing fields
+    (`id`, `name`, `status`, `schedule`, `success_rate`, `p50_ms`,
+    `p95_ms`, `last_run_ts`, `next_run_ts`, `consecutive_errors`,
+    `flags`) are preserved unchanged — `config` is purely additive.
+  - **Pretty / detail block** — each per-job detail entry gains a
+    compact `配置:` block under 调度 / 上次执行 / 下次执行 / 成功率 /
+    耗时, with one line per group (`启用 / sessionTarget / wakeMode /
+    agentId / sessionKey`, `payload: kind | model=… | timeout=…s |
+    tools=[…]`, `delivery: mode → channel/to | thread=… | account=…`).
+    Empty fields are skipped per line to keep output tight.
+  - **Sensitive-text masking** — `payload.message` and `payload.text`
+    pass through `ocdiag.sensitive.sanitize_text` before output, so
+    any tokens / API keys embedded in a prompt body (`sk-ant-…`,
+    `ghp_…`, `Bearer …`, `KEY=value` env-var shapes) are masked. The
+    JSON envelope keeps the full sanitized text for `jq`-driven
+    auditing; `message_len` records the *original* character count so
+    truncation detection still works. The pretty block deliberately
+    shows only a one-line ~200-char preview prefixed with
+    `message(<n> 字):` — splatting a 14KB message into terminal output
+    would be unreadable. `delivery.to` / `sessionKey` are
+    open_id-style identifiers, not secrets, so they remain plain
+    (consistent with the existing `delivery_to` collector behavior).
+- No new flags or masking knobs — all surfacing reuses the existing
+  `sanitize_text` helper. Both data sources share the same code path,
+  since the SQLite `job_json` blob round-trips to the legacy job dict
+  shape verbatim.
+
+### Fix — SQLite cron run loader keeps most-recent 200 (not oldest)
+- **`ocdiag/collectors/cron_jobs.py`** — `_fetch_sqlite_runs` was issuing
+  `ORDER BY COALESCE(ts, 0) ASC, seq ASC LIMIT 200`, which kept the
+  *oldest* 200 entries from `cron_run_logs` for a job. The downstream
+  `_analyze()` consumer slices `finished[-20:]` to compute the recent
+  success rate / P50 / P95 / drift / silent / delivery-failure metrics,
+  and the legacy JSON loader (`_load_runs`) uses
+  `deque(maxlen=200)` (i.e. *most recent* 200). Once a job's run log
+  exceeded 200 entries, the SQLite path therefore analyzed "the tail of
+  the oldest 200" — silently stale data divergent from the legacy
+  semantics, with every aggregate reported wrong.
+  Both query branches (with and without `store_key` filter) now
+  `ORDER BY … DESC … LIMIT 200` (most recent N), then reverse the list
+  in Python so the returned shape stays ts-ascending — `_analyze()` is
+  unchanged. (v1.6.1 was prepared with this fix in the working tree but
+  never published to npm; it's folded into 1.7.0.)
+
+### Tests
+- **`tests/run_cron_sqlite_tests.py`** — now runs 6 cases:
+  - `[1/6]` SQLite-only path
+  - `[2/6]` Legacy JSON fallback
+  - `[3/6]` SQLite + legacy coexistence → `cron.source_inconsistency` warn
+  - `[4/6]` >200 runs → keep most recent 200, ts-ascending (regression
+    canary for the run-order fix: asserts loader truncation, recency,
+    ordering, and that `_analyze()`'s `success_rate` reads `0%` for a
+    failing tail rather than `100%` from a stale-ok prefix)
+  - `[5/6]` Config surfacing via SQLite source — asserts the new
+    `data.jobs[].config` block exists with all expected keys, that
+    `payload.message_len` matches the original ~14KB length, that the
+    full sanitized message survives in JSON, that an embedded fake
+    `sk-ant-…` token is masked from both JSON and detail, that the
+    pretty `配置:` block renders payload + delivery summary lines and
+    a `message(<n> 字):` preview, and that `len(detail) < message_len`
+    (full text never leaks)
+  - `[6/6]` Same surfacing assertions for the legacy JSON source
+- All other suites still pass: `run_collector_tests.py`,
+  `run_sessions_tests.py`, `run_trajectory_tests.py`,
+  `test_v2_collectors.py`, `test_cache_superset.py`,
+  `test_performance_verdict.py`, `test_panorama.py`. Zero regressions.
+
 ## v1.6.0 — SQLite-aware cron_jobs collector + legacy fallback + #90072 inconsistency detection (2026-06-09)
 
 ### Feature

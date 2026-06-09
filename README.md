@@ -35,7 +35,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 | 📋 configuration | openclaw.json validation, sensitive field sanitization |
 | 🌐 gateway | Process status, port, restarts, WebSocket lifecycle, error codes, model API endpoints |
 | ❗ recent_errors | Log aggregation by level, journalctl, session tool-call errors |
-| ⏰ cron_jobs | Schedule parsing, consecutive failures, drift, silent detection |
+| ⏰ cron_jobs | Schedule parsing, consecutive failures, drift, silent detection, full job config (payload/delivery/schedule, message sanitized) |
 | 📊 performance | Model/tool P50/P95, slow calls Top N, cache hit rate, throughput |
 | 💬 sessions_diag | Session count, sizes, stuck detection |
 | 🔌 plugin_diag | Plugin status, hook errors, DNS, trajectory drift |

@@ -17,6 +17,10 @@ CONFIG = _env_path("OPENCLAW_CONFIG", os.path.join(OPENCLAW_HOME, "openclaw.json
 CRON_JOBS = _env_path("OPENCLAW_CRON_JOBS", os.path.join(OPENCLAW_HOME, "cron", "jobs.json"))
 CRON_STATE = _env_path("OPENCLAW_CRON_STATE", os.path.join(OPENCLAW_HOME, "cron", "jobs-state.json"))
 CRON_RUNS_DIR = _env_path("OPENCLAW_CRON_RUNS", os.path.join(OPENCLAW_HOME, "cron", "runs"))
+# Shared OpenClaw SQLite store (cron_jobs, cron_run_logs, ...). Since
+# 2026.6.x the cron primary store moved here from the legacy JSON above;
+# the JSON is kept for fallback/legacy detection.
+STATE_DB = _env_path("OPENCLAW_STATE_DB", os.path.join(OPENCLAW_HOME, "state", "openclaw.sqlite"))
 SESSIONS_BASE = _env_path("OPENCLAW_SESSIONS", os.path.join(OPENCLAW_HOME, "agents"))
 EXTENSIONS_DIR = _env_path("OPENCLAW_EXTENSIONS", os.path.join(OPENCLAW_HOME, "extensions"))
 

@@ -1,5 +1,73 @@
 # Changelog
 
+## v1.6.0 — SQLite-aware cron_jobs collector + legacy fallback + #90072 inconsistency detection (2026-06-09)
+
+### Feature
+- **`ocdiag/collectors/cron_jobs.py`** — `_section_jobs` is now SQLite-aware.
+  OpenClaw 2026.6.x moved the cron primary store from
+  `~/.openclaw/cron/jobs.json` (+ sibling `jobs-state.json` and
+  `runs/<id>.jsonl`) to a shared SQLite database at
+  `~/.openclaw/state/openclaw.sqlite` (tables `cron_jobs` and
+  `cron_run_logs`). The collector now opens that DB read-only
+  (`file:…?mode=ro`, mirroring `task_health._open_db`), reads job
+  definitions from `cron_jobs.job_json` and re-hydrates runtime state
+  from the sibling `state_json` column (job_json's embedded `state` is
+  always emptied by the migrator), and feeds per-job runs to the
+  existing `_analyze()` from `cron_run_logs.entry_json` (which
+  round-trips to the legacy per-line shape).
+- **Legacy fallback** — when the SQLite store is missing, has no
+  `cron_jobs` table, has no rows, or fails to open / parse for any
+  reason, the collector falls back to the original
+  `cron/jobs.json` + `jobs-state.json` + `runs/*.jsonl` flow with no
+  behavioural change. Existing JSON envelope fields
+  (`total_jobs`, `jobs[]`, `status_overview`, `max_consecutive_errors`,
+  …) are preserved; the new `data.source` field reports `"sqlite"` |
+  `"legacy-json"` | `"both"` | `"none"`.
+- **#90072 inconsistency detection** — when the SQLite store has cron
+  rows AND `cron/jobs.json` still parses with jobs, the collector
+  reads from SQLite (authoritative) but emits a new
+  `cron.source_inconsistency` warn surfacing
+  `sqlite_job_count` vs `legacy_job_count` for the operator to
+  reconcile (silent migration loss is the symptom of OpenClaw issue
+  #90072). A separate `cron.store_key_mismatch` warn fires when the
+  `cron_jobs.store_key` rows resolve to a different absolute path than
+  the configured `OPENCLAW_CRON_JOBS` — the rows are still read, but
+  the mismatch is logged.
+
+### Robustness
+- All SQLite operations are read-only and try/except-wrapped: a missing
+  DB file, missing table, corrupt `job_json`/`state_json` blob, or
+  unreadable `entry_json` row degrades gracefully — never crashes the
+  collector. The dispatcher closes the DB before delegating to the
+  shared analyzer, and the per-job run loader re-opens the read-only
+  URI (cheap, keeps the lifetime short).
+- Per-job run cap preserved at `_RUN_LIMIT_PER_JOB = 200`, matching
+  the legacy `_load_runs()` `maxlen=200` budget — bounded memory on
+  hot jobs.
+
+### Paths
+- **`ocdiag/paths.py`** — added `STATE_DB` constant
+  (`OPENCLAW_STATE_DB` env override, default
+  `$OPENCLAW_HOME/state/openclaw.sqlite`). The legacy `CRON_JOBS` /
+  `CRON_STATE` / `CRON_RUNS_DIR` constants are unchanged because the
+  fallback path still needs them.
+
+### Tests
+- New `tests/run_cron_sqlite_tests.py` (stdlib only): seeds a temp
+  `openclaw.sqlite` with a minimal `cron_jobs` + `cron_run_logs`
+  schema and asserts (a) pure-SQLite read produces `source="sqlite"`,
+  correct job + run analysis, no inconsistency check; (b) SQLite
+  missing falls back to `source="legacy-json"`; (c) SQLite + legacy
+  `jobs.json` coexist → `source="both"`,
+  `cron.source_inconsistency` fires, verdict ≥ warn, the stranded
+  legacy-only job does NOT appear in `data.jobs`. Real OpenClaw state
+  is never touched (each test stages a fresh `tempfile.mkdtemp` HOME).
+- All existing suites still pass: `run_collector_tests.py` (20/20),
+  `run_sessions_tests.py` (20/20), `run_trajectory_tests.py`,
+  `test_v2_collectors.py`, `test_cache_superset.py`,
+  `test_performance_verdict.py`, `test_panorama.py` (109 passed,
+  1 skipped). Zero regressions.
+
 ## v1.5.2 — superset cache filter for windowed queries + gateway mtime prefilter & undated-run count fix (2026-06-08)
 
 ### Performance

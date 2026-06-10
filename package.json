@@ -28,6 +28,8 @@
     "bin/ocdiag",
     "ocdiag/*.py",
     "ocdiag/core/*.py",
+    "ocdiag/channels/*.py",
+    "ocdiag/channels/variants/*.py",
     "ocdiag/collectors/*.py",
     "ocdiag/inspectors/*.py",
     "ocdiag/render/*.py",

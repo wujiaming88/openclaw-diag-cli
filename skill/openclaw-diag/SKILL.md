@@ -1,6 +1,6 @@
 ---
 name: openclaw-diag
-description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract, full-session 360° diagnosis (panorama). 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住、session 全景、session 全方位诊断。"
+description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract, full-session 360° diagnosis (panorama), IM channel diagnostics (Feishu / Lark / DingTalk / WeCom: bot not replying, message dropped, credential / WS / webhook issues). 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住、session 全景、session 全方位诊断、飞书/钉钉/企微 机器人不回复、消息没响应、channel 卡住、凭证问题。"
 metadata:
   requires:
     bins: ["openclaw-diag"]
@@ -39,6 +39,7 @@ Before diagnosing, confirm the target execution context.
 - Session UUID + one specific user message/turn → `trace <uuid> --format json --mask`.
 - Need raw transcript / count / filter records → `extract <uuid> --summary --format json` first.
 - A collector verdict is warn/fail → run that collector alone only if more detail is needed.
+- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json` (add `--probe` for live credential check, `--sender <open_id>` to test if a specific sender's DM is silently dropped).
 
 ## Routing
 
@@ -54,6 +55,7 @@ Before diagnosing, confirm the target execution context.
 | Session health / why / 全貌 | `openclaw-diag panorama <uuid> --format json --mask` |
 | Specific message stuck/slow → trace | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
+| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (add `--probe` / `--sender ou_xxx`) |
 
 ## Workflow
 
@@ -151,6 +153,50 @@ Verdict mapping:
 - `fail`: trajectory `aborted/timedOut`, child task failed, or any ERROR-level correlated log.
 - `warn`: WARN-level correlated log, model fallback / context overflow decision, stall log, plugin activation error, or E2E > 5min.
 - `ok`: everything clean.
+
+## Channel
+
+Use `channel` when the user reports an IM channel symptom: bot not
+replying, message arrived but no response, channel 卡住, suspected
+credential / connection / allowlist issue. One unified collector covers
+five variants: `feishu-bundled` (`@openclaw/feishu`), `feishu-lark`
+(`@larksuite/openclaw-lark`), `dingtalk`, `wecom` (Bot WS + Agent
+webhook dual mode).
+
+```bash
+openclaw-diag channel --format json                    # passive: config + log scan
+openclaw-diag channel --probe --format json            # + active credential probe (read-only token endpoint)
+openclaw-diag channel --sender ou_xxxx --format json   # + predict whether a specific sender's DM gets dropped
+```
+
+Three layers run per detected variant:
+- **L1 config** — credential completeness, mode self-consistency,
+  account-policy sanity (per upstream zod schema). Emits findings like
+  `CRED_MISSING`, `CONN_MODE_INCONSISTENT`,
+  `DM_POLICY_OPEN_NO_WILDCARD`, `GATE_SENDER_NOT_IN_ALLOWLIST`
+  (only with `--sender`).
+- **L2/L3 log scan** — anchored on literal log strings extracted
+  from each plugin's dist tree (drops, WS lifecycle, pairing,
+  webhook anomalies). Self-pollution defense filters out the
+  gateway console-relay sink so chat content quoting these signatures
+  doesn't trigger findings.
+- **L5 active probe** — only with `--probe`. Hits each platform's
+  canonical token-introspection endpoint. Three result states:
+  `valid`, `invalid` (platform rejected), `unreachable` (network/
+  timeout — explicitly NOT classified as invalid). WeCom Bot mode
+  has no HTTP token endpoint and reports
+  `WECOM_BOT_NO_PROBE_ENDPOINT` honestly.
+
+Reading discipline: a `warn` log finding such as
+`LOG_GROUP_DID_NOT_MENTION_BOT` or `LOG_BLOCKED_UNAUTHORIZED_DM` is
+often the explanation for "my message got no reply" — the channel
+plugin silently dropped it per policy. Surface those literally before
+speculating about Agent or model issues.
+
+Secrets are never echoed back: per-account `appSecret` shows as
+`literal` or `ref:<source>:<provider>` only. `--probe` resolves
+SecretRef objects in memory for the urllib request alone; nothing
+plaintext lands in `Report.data` / `evidence`.
 
 ## JSON Notes
 

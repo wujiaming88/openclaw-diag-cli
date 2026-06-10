@@ -1,5 +1,158 @@
 # Changelog
 
+## v1.8.0 — Channel diagnostic collector (5 IM variants + active probe + self-pollution defense) (2026-06-10)
+
+### Feature — single `channel` collector covering Feishu / Lark / DingTalk / WeCom
+
+**Goal:** diagnose "bot not replying / no response" symptoms across IM
+channel plugins. One unified collector per the design principle that
+"channel" is one diagnostic dimension regardless of which IM variant
+is installed; config / log / probe are layers within it, not separate
+commands.
+
+#### Variant detection — `ocdiag/channels/detect.py`
+- Identifies which IM channel plugin variants are installed by walking
+  `~/.openclaw/npm/projects/*/node_modules/` (strongest evidence) with
+  `channels.<provider>` config keys as a fallback. Five variants
+  recognized: `feishu-bundled` (`@openclaw/feishu` /
+  `@m1heng-clawd/feishu`), `feishu-lark`
+  (`@larksuite/openclaw-lark`), `dingtalk`
+  (`@dingtalk-real-ai/dingtalk-connector`, accepts both
+  `channels.dingtalk` and the canonical `channels.dingtalk-connector`
+  config key), `wecom` (`@wecom/wecom-openclaw-plugin`). Multiple
+  variants on the same host are diagnosed independently. Unknown
+  variant or detection miss surfaces honestly as
+  `NO_CHANNEL_DETECTED` rather than guessing.
+
+#### Layered diagnosis — `ocdiag/channels/variants/{feishu_bundled,feishu_lark,dingtalk,wecom}.py`
+Each variant module runs three layers per call:
+
+- **L1 config** — credential completeness, connection-mode self-
+  consistency, account-policy sanity (per upstream zod schema). Notable
+  rules: `CRED_MISSING` (fail), `CONN_MODE_INCONSISTENT` /
+  `BOT_WEBHOOK_INCONSISTENT` / `AGENT_AES_KEY_INVALID` (fail),
+  `DM_POLICY_OPEN_NO_WILDCARD` (warn),
+  `DM_POLICY_PAIRING_UNSUPPORTED` (warn — DingTalk silently degrades
+  pairing to open at runtime), `WEBHOOK_PORT_DEFAULT` (warn),
+  `GROUP_ALLOWFROM_LEGACY_CHATID` (warn — Lark deprecation),
+  `DOMAIN_MISMATCH` (warn — Lark account claiming
+  `domain="feishu"`), `GATE_SENDER_NOT_IN_ALLOWLIST` (warn — only
+  when `--sender <open_id>` is passed, predicts whether that sender's
+  DM will be silently dropped). WeCom dual-mode (Bot WS +
+  Agent webhook) handled with strict per-mode rules. Feishu accounts
+  inherit top-level fields per the runtime's resolution; checked here
+  too.
+
+- **L2/L3 log signature scan** — anchored on literal log strings
+  extracted from each plugin's dist tree (NOT paraphrased). Coverage:
+  - feishu-bundled: 21 signatures (WS lifecycle / drop reasons /
+    pairing / probe timeout / webhook anomaly), with the SDK error
+    constants (`reconnect exhausted`, `autoReconnect is disabled`)
+    promoted from inside the plugin's outer log lines instead of
+    matched standalone — earlier draft regexes anchored those
+    constants directly with a `feishu[acct]:` prefix that never
+    appears in real logs (false negative). Notable adds: `bot
+    identity background retry exhausted` and `requireMention group
+    messages stay gated until bot identity recovery succeeds` —
+    both signal a silent skip of all requireMention group messages
+    until restart.
+  - feishu-lark: 17 signatures from `messaging/inbound/{gate,policy,
+    permission,mention,dispatch}.ts`, `channel/monitor.ts`. Uses
+    Lark-specific drops (different literal strings from bundled).
+  - dingtalk: 16 signatures from `core/connection.ts` /
+    `core/message-handler.ts` / `channel.ts` (Chinese strings:
+    `DM 被拦截:` / `群聊被拦截:` / `重连失败：` / `dmPolicy="pairing"
+    暂不支持` etc.).
+  - wecom: 22 signatures (`[WeCom] Blocked DM ...`, `[wecom-agent]
+    duplicate msgId ... skipped`, `[wecom] Media rejected`, MCP
+    doc-auth-error, WS lifecycle including `WSAuthFailureError` /
+    `WSReconnectExhaustedError` class names promoted to fail).
+  Severity classes: connection-broken signals → fail (e.g.
+  `bot_identity_retry_exhausted`, `WSAuthFailureError`); drops &
+  policy violations → warn (so silent drops surface during
+  diagnosis); informational/expected (pairing requests, dedup,
+  empty messages) → ok.
+
+- **L5 active credential probe** — only when `--probe` is passed.
+  Hits the canonical token-introspection endpoint per platform
+  (read-only, no message side-effects, no quota spend beyond a
+  single auth call):
+  - Feishu: `POST {domain}/open-apis/auth/v3/tenant_access_token/internal`
+    (`open.feishu.cn` / `open.larksuite.com` / explicit https URL).
+  - DingTalk: `POST https://api.dingtalk.com/v1.0/oauth2/accessToken`.
+  - WeCom Agent: `GET https://qyapi.weixin.qq.com/cgi-bin/gettoken`.
+  - WeCom Bot: NOT probed — no HTTP token endpoint exists; reports
+    `WECOM_BOT_NO_PROBE_ENDPOINT` info honestly.
+  Three result states: `valid` (live credential) / `invalid`
+  (platform rejected, with the platform's own error code) /
+  `unreachable` (network/timeout/DNS — explicitly NOT classified as
+  invalid so a transient outage doesn't false-positive a credential
+  rejection). 10s hard timeout per call.
+
+#### Secret resolution — `ocdiag/channels/probe.py`
+- OpenClaw stores credentials as `SecretRef` (`{source, provider,
+  id}`). The public `openclaw config get` redacts these on purpose,
+  so the probe path resolves them itself by reading
+  `secrets.providers.<name>` and following the underlying store:
+  - `source: env` → `os.environ[id]`
+  - `source: file`, `mode: json` → JSON pointer (`id`) into the
+    JSON file
+  - `source: file`, `mode: singleValue` → entire file body trimmed
+- `source: exec` is intentionally NOT supported (would spawn external
+  process whose policy varies per host); reports
+  `SECRET_UNRESOLVED` and skips the network call.
+- Plaintext secrets are held in memory only for the urllib request
+  itself — never copied into `Report.data`, `evidence`, or any
+  output field. The variant report exposes only
+  `ref:<source>:<provider>` metadata so a reader sees *where* a
+  credential comes from, never *what* it is. Even secret length is
+  intentionally not surfaced (length is a brute-force oracle for
+  some token formats).
+
+#### `--sender <open_id>` flag — `ocdiag/main.py` + `ocdiag/core/context.py`
+Predicts whether a specific user's DM would be silently dropped by
+the dmPolicy/allowFrom configuration. When absent the rule is
+skipped (no false-positive on a hypothetical sender).
+
+#### Self-pollution defense — `ocdiag/channels/log_utils.py`
+Critical safety: OpenClaw gateway has a console-relay sink
+(`/dist/console-*.js`) that captures the *assistant's own outbound
+chat* into the same log stream. Without filtering, a chat message
+that quotes a signature literal (e.g. discussing the channel
+collector itself) would re-trigger the regex, including a recursive
+"diagnostic caught a real failure" → "diagnostic caught the diagnostic's
+report" loop. Defense: each scanner reads `_meta.path.fullFilePath`
+and rejects entries from the gateway relay (`/dist/console-`); only
+lines emitted from the plugin's own dist tree count.
+
+#### Output schema
+- Single envelope with sections per variant: `0. 检测概览`,
+  `<variant> · L1 配置 (<detect_basis>)`,
+  `<variant> · L2/L3 日志签名`, and (when `--probe`)
+  `<variant> · L5 主动凭证探测`. Each account renders a one-line
+  summary (`connectionMode`/`dmPolicy`/`groupPolicy`/`requireMention`/
+  `domain`/`appId`/`appSecret` labels) followed by per-rule findings.
+- Verdict mapping respects the existing legacy `status: ok|error`
+  contract (warn folds to ok), with per-finding `verdict: ok|warn|fail`
+  surfaced for finer-grained Agent consumption. Exit code rules
+  unchanged.
+
+#### Tests — `tests/test_channel.py`
+103 collector tests (variant detection × 4, secret resolution × 7,
+L1 rules × 17 across all variants, log signature regex × 32, probe
+paths × 9, secret-leak sentinel × 1, end-to-end fixture flows ×
+4 + 5 self-pollution reverse fixtures). Total suite: **242 passed,
+1 skipped** (was 139 + 1).
+
+### Skill — `skill/openclaw-diag/SKILL.md`
+- Trigger description gains channel-relevant Chinese phrases ("飞书/
+  钉钉/企微", "机器人不回", "消息没有响应", "channel 卡住").
+- One Routing row added linking the symptom to `channel`.
+- A new `## Channel` section documents the variant concept,
+  `--probe`, `--sender`, and the silent-drop reading discipline.
+  No structural reshuffle of Decision Ladder / Routing / Workflow
+  per the established maintenance discipline.
+
 ## v1.7.0 — Full cron config surfacing + SQLite run-order fix (2026-06-09)
 
 ### Feature — full cron config in `cron_jobs` output

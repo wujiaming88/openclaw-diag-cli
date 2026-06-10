@@ -94,6 +94,8 @@ def _build_context(args) -> DiagContext:
         unmask=getattr(args, "unmask", False),
         no_color=getattr(args, "no_color", False),
         json_mode=fmt != "pretty",
+        probe=getattr(args, "probe", False),
+        sender_open_id=getattr(args, "sender", None) or None,
     )
 
 
@@ -111,6 +113,16 @@ def _common_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="Alias for --format json.")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--unmask", action="store_true")
+    p.add_argument(
+        "--probe", action="store_true",
+        help="Enable active probes (network calls — only safe read-only "
+             "endpoints; off by default).",
+    )
+    p.add_argument(
+        "--sender", default=None,
+        help="Open ID of a sender to gate-check against the channel "
+             "allowlist (channel collector; off by default).",
+    )
 
 
 def _render(report: Report, args) -> None:
@@ -223,6 +235,9 @@ def cmd_doctor(args, node_version: Optional[str] = None) -> int:
 
 def cmd_all(args, skip_ids: List[str]) -> int:
     ctx = _build_context(args)
+    # The `all` aggregator never runs active probes — channel collector and
+    # any future probe-enabled collectors must stay passive in this path.
+    ctx.probe = False
     state = [c for c in registry.all_state() if c.id not in skip_ids]
     rc_overall = 0
     fmt = _resolve_format(args)

@@ -23,6 +23,8 @@ class DiagContext:
     unmask: bool = False
     no_color: bool = False
     json_mode: bool = False
+    probe: bool = False
+    sender_open_id: Optional[str] = None
     _config_cache: Optional[Dict[str, Any]] = field(default=None, repr=False)
     # Per-invocation trajectory caches. Used by ``trajectory_files`` and
     # ``collect_runs`` to dedup the expensive disk scan + JSONL parse across

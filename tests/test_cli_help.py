@@ -38,7 +38,10 @@ def test_channel_help_shows_usage_not_diagnostic():
     # argparse usage line carries the prog we set; a real diagnostic run
     # would print the human renderer banner instead.
     assert "usage: openclaw-diag channel" in out
+    # Channel keeps the channel-only flags.
     assert "--account" in out
+    assert "--sender" in out
+    assert "--probe" in out
     # Negative control: the human renderer's banner must not appear.
     assert "OPENCLAW-DIAG" not in out
 
@@ -46,7 +49,12 @@ def test_channel_help_shows_usage_not_diagnostic():
 def test_gateway_help_shows_usage_not_diagnostic():
     out = _capture_help(["gateway", "--help"])
     assert "usage: openclaw-diag gateway" in out
-    assert "--account" in out
+    # Common flags still present.
+    assert "--format" in out
+    # Channel-only flags must not leak into a non-channel collector's help.
+    assert "--account" not in out
+    assert "--sender" not in out
+    assert "--probe" not in out
     assert "OPENCLAW-DIAG" not in out
 
 
@@ -54,6 +62,8 @@ def test_cron_jobs_help_shows_usage_not_diagnostic():
     out = _capture_help(["cron_jobs", "--help"])
     assert "usage: openclaw-diag cron_jobs" in out
     assert "--format" in out
+    # Channel-only flag must not appear here either.
+    assert "--account" not in out
 
 
 def test_collector_short_h_flag_also_shows_help():
@@ -71,4 +81,18 @@ def test_channel_without_help_runs_collector():
     does not steal normal invocations.
     """
     rc = ocdiag_main.main(["channel"])
+    assert isinstance(rc, int)
+
+
+def test_gateway_without_help_runs_without_attribute_error():
+    """Regression guard for the v1.8.3 split.
+
+    `gateway`'s parser no longer registers --probe/--sender/--account.
+    `_build_context` must read them via getattr-with-default so the
+    args namespace lacking those attributes does not raise AttributeError.
+    """
+    try:
+        rc = ocdiag_main.main(["gateway"])
+    except AttributeError as e:
+        pytest.fail(f"gateway run raised AttributeError: {e}")
     assert isinstance(rc, int)

@@ -114,6 +114,9 @@ def _common_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--json", action="store_true", help="Alias for --format json.")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--unmask", action="store_true")
+
+
+def _channel_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--probe", action="store_true",
         help="Enable active probes (network calls — only safe read-only "
@@ -616,6 +619,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             add_help=True,
         )
         _common_arguments(cparser)
+        if head == "channel":
+            _channel_arguments(cparser)
         args, _ = cparser.parse_known_args(rest)
         return cmd_run_collector(args, head)
 

@@ -39,7 +39,7 @@ Before diagnosing, confirm the target execution context.
 - Session UUID + one specific user message/turn → `trace <uuid> --format json --mask`.
 - Need raw transcript / count / filter records → `extract <uuid> --summary --format json` first.
 - A collector verdict is warn/fail → run that collector alone only if more detail is needed.
-- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json`. On a multi-account host, scope with `--account <account_id>` (if the account is unknown, run `channel --format json` first and read the account list from the output). Add `--sender <open_id>` — paired with `--account` when known — to test if a specific sender's DM is silently dropped; use `--probe` only when you need a live credential check.
+- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json`. On a multi-account host, scope with `--account <account_id>` (if the account is unknown, run `channel --format json` first and read the account list from the output). Add `--sender <platform_sender_id>` — paired with `--account` when known — to test if a specific sender's DM is silently dropped (Feishu/Lark: `open_id`; DingTalk: senderId / user id; WeCom: user id); use `--probe` only when you need a live credential check.
 
 ## Routing
 
@@ -55,7 +55,7 @@ Before diagnosing, confirm the target execution context.
 | Session health / why / 全貌 | `openclaw-diag panorama <uuid> --format json --mask` |
 | Specific message stuck/slow → trace | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
-| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (multi-account: `--account <id>`; add `--sender ou_xxx` / `--probe`) |
+| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (multi-account: `--account <id>`; add `--sender <platform_sender_id>` / `--probe`) |
 
 ## Workflow
 
@@ -167,8 +167,9 @@ Agent self-built app), not two variants.
 ```bash
 openclaw-diag channel --format json                                  # passive: config + log scan (start here)
 openclaw-diag channel --account main --format json                   # scope to one account on a multi-account host
-openclaw-diag channel --account main --sender ou_xxxx --format json  # predict if a sender's DM is dropped (scope to the sender's own account)
-openclaw-diag channel --probe --format json                          # + active credential probe — outbound HTTP, use sparingly (see L5 below)
+openclaw-diag channel --account main --sender ou_xxxx --format json  # predict if a sender's DM is dropped (Feishu/Lark open_id; scope to the sender's own account)
+openclaw-diag channel --account main --probe --format json           # + active credential probe for ONE account — outbound HTTP, use sparingly (see L5 below)
+openclaw-diag channel --probe --format json                          # probe ALL accounts — only when you intend to hit every account's token endpoint
 ```
 
 **Multi-account hosts:** without `--account`, every configured account

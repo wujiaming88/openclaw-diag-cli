@@ -1,6 +1,6 @@
 {
   "name": "openclaw-diag-cli",
-  "version": "1.8.4",
+  "version": "1.8.5",
   "description": "OpenClaw observer-only diagnostic CLI. Zero-dependency Python scripts wrapped in Node for npx-friendly install.",
   "keywords": [
     "openclaw",

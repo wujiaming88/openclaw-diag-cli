@@ -1,6 +1,6 @@
 ---
 name: openclaw-diag
-description: "OpenClaw diagnostics CLI. Use for OpenClaw health checks, slow responses, stuck sessions, gateway/connectivity errors, cron not firing, plugin issues, recent errors, task/subagent failures, task timeouts, stuck task runs, session trace/extract, full-session 360° diagnosis (panorama), IM channel diagnostics (Feishu / Lark / DingTalk / WeCom: bot not replying, message dropped, credential / WS / webhook issues). 中文触发：系统慢、卡住、报错、健康检查、性能差、定时任务没触发、插件异常、网关连不上、session 卡死、查看 session、任务失败、子 Agent 异常、任务超时、任务卡住、session 全景、session 全方位诊断、飞书/钉钉/企微 机器人不回复、消息没响应、channel 卡住、凭证问题。"
+description: "Diagnostics CLI for OpenClaw systems ONLY. Use when troubleshooting an OpenClaw deployment: health, gateway, cron, sessions, panorama/trace/extract, plugins, tasks/subagents, recent errors, or IM channel issues (Feishu / Lark / DingTalk / WeCom bot not replying). 中文触发（仅限 OpenClaw）：OpenClaw 健康检查、网关、定时任务、session、panorama、channel、任务、插件。"
 metadata:
   requires:
     bins: ["openclaw-diag"]
@@ -39,7 +39,7 @@ Before diagnosing, confirm the target execution context.
 - Session UUID + one specific user message/turn → `trace <uuid> --format json --mask`.
 - Need raw transcript / count / filter records → `extract <uuid> --summary --format json` first.
 - A collector verdict is warn/fail → run that collector alone only if more detail is needed.
-- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json` (add `--probe` for live credential check, `--sender <open_id>` to test if a specific sender's DM is silently dropped).
+- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json`. On a multi-account host, scope with `--account <account_id>` (if the account is unknown, run `channel --format json` first and read the account list from the output). Add `--sender <open_id>` — paired with `--account` when known — to test if a specific sender's DM is silently dropped; use `--probe` only when you need a live credential check.
 
 ## Routing
 
@@ -55,7 +55,7 @@ Before diagnosing, confirm the target execution context.
 | Session health / why / 全貌 | `openclaw-diag panorama <uuid> --format json --mask` |
 | Specific message stuck/slow → trace | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
-| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (add `--probe` / `--sender ou_xxx`) |
+| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (multi-account: `--account <id>`; add `--sender ou_xxx` / `--probe`) |
 
 ## Workflow
 
@@ -159,15 +159,24 @@ Verdict mapping:
 Use `channel` when the user reports an IM channel symptom: bot not
 replying, message arrived but no response, channel 卡住, suspected
 credential / connection / allowlist issue. One unified collector covers
-five variants: `feishu-bundled` (`@openclaw/feishu`), `feishu-lark`
-(`@larksuite/openclaw-lark`), `dingtalk`, `wecom` (Bot WS + Agent
-webhook dual mode).
+four channel variants: `feishu-bundled` (`@openclaw/feishu`),
+`feishu-lark` (`@larksuite/openclaw-lark`), `dingtalk`, and `wecom`.
+WeCom is a single dual-mode variant (Bot — WS or webhook — and/or an
+Agent self-built app), not two variants.
 
 ```bash
-openclaw-diag channel --format json                    # passive: config + log scan
-openclaw-diag channel --probe --format json            # + active credential probe (read-only token endpoint)
-openclaw-diag channel --sender ou_xxxx --format json   # + predict whether a specific sender's DM gets dropped
+openclaw-diag channel --format json                                  # passive: config + log scan (start here)
+openclaw-diag channel --account main --format json                   # scope to one account on a multi-account host
+openclaw-diag channel --account main --sender ou_xxxx --format json  # predict if a sender's DM is dropped (scope to the sender's own account)
+openclaw-diag channel --probe --format json                          # + active credential probe — outbound HTTP, use sparingly (see L5 below)
 ```
+
+**Multi-account hosts:** without `--account`, every configured account
+is diagnosed and `--sender` is checked against *every* account's
+allowlist — producing spurious `GATE_SENDER_NOT_IN_ALLOWLIST` warnings
+for accounts the sender doesn't belong to. If you know the account, pass
+`--account <id>`; if not, run `channel --format json` first and read the
+account list from the output, then re-run scoped to the right one.
 
 Three layers run per detected variant:
 - **L1 config** — credential completeness, mode self-consistency,
@@ -180,8 +189,15 @@ Three layers run per detected variant:
   webhook anomalies). Self-pollution defense filters out the
   gateway console-relay sink so chat content quoting these signatures
   doesn't trigger findings.
-- **L5 active probe** — only with `--probe`. Hits each platform's
-  canonical token-introspection endpoint. Three result states:
+- **L5 active probe** — only with `--probe`. Makes an OUTBOUND HTTP
+  request to each platform's canonical token endpoint (Feishu/Lark &
+  DingTalk: POST; WeCom Agent: GET) — e.g. `open.feishu.cn`,
+  `api.dingtalk.com`, `qyapi.weixin.qq.com`. It is read-only
+  token-introspection: it does NOT modify OpenClaw or remote state and
+  never echoes secrets — but it DOES reach the external platform, so it
+  can leave access-log entries and counts against the platform's rate
+  limit. Default to the passive `channel` run; add `--probe` only when
+  you must confirm a credential is actually valid. Three result states:
   `valid`, `invalid` (platform rejected), `unreachable` (network/
   timeout — explicitly NOT classified as invalid). WeCom Bot mode
   has no HTTP token endpoint and reports

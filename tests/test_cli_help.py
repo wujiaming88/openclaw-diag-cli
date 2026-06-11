@@ -1,0 +1,74 @@
+"""Regression tests for `openclaw-diag <collector> --help`.
+
+Before v1.8.2 the generic state-collector dispatch in ``ocdiag.main.main``
+shared an ``add_help=False`` parser via ``parse_known_args`` — so ``-h`` /
+``--help`` fell into the discarded "unknown args" bucket and the collector
+just ran. These tests pin the fixed behavior: collector --help prints
+argparse usage and exits 0, instead of executing the diagnostic.
+"""
+
+from __future__ import annotations
+
+import io
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from ocdiag import main as ocdiag_main  # noqa: E402
+
+
+def _capture_help(argv):
+    """Run main(argv) expecting an argparse SystemExit(0); return stdout."""
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        with pytest.raises(SystemExit) as exc:
+            ocdiag_main.main(argv)
+    assert exc.value.code == 0, (
+        f"expected argparse to exit 0 for {argv!r}, got {exc.value.code!r}"
+    )
+    return buf.getvalue()
+
+
+def test_channel_help_shows_usage_not_diagnostic():
+    out = _capture_help(["channel", "--help"])
+    # argparse usage line carries the prog we set; a real diagnostic run
+    # would print the human renderer banner instead.
+    assert "usage: openclaw-diag channel" in out
+    assert "--account" in out
+    # Negative control: the human renderer's banner must not appear.
+    assert "OPENCLAW-DIAG" not in out
+
+
+def test_gateway_help_shows_usage_not_diagnostic():
+    out = _capture_help(["gateway", "--help"])
+    assert "usage: openclaw-diag gateway" in out
+    assert "--account" in out
+    assert "OPENCLAW-DIAG" not in out
+
+
+def test_cron_jobs_help_shows_usage_not_diagnostic():
+    out = _capture_help(["cron_jobs", "--help"])
+    assert "usage: openclaw-diag cron_jobs" in out
+    assert "--format" in out
+
+
+def test_collector_short_h_flag_also_shows_help():
+    # `-h` is registered alongside `--help` by argparse's auto help action;
+    # cover it explicitly so the regression can't sneak back through `-h`.
+    out = _capture_help(["channel", "-h"])
+    assert "usage: openclaw-diag channel" in out
+
+
+def test_channel_without_help_runs_collector():
+    """Negative control: omitting --help must still execute the diagnostic.
+
+    We only assert the call returns an int exit code (no SystemExit raised
+    by argparse). This proves the help branch is gated on -h/--help and
+    does not steal normal invocations.
+    """
+    rc = ocdiag_main.main(["channel"])
+    assert isinstance(rc, int)

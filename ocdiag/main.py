@@ -605,7 +605,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     if coll is not None:
         if coll.kind == "inspector":
             return cmd_inspector(head, rest)
-        args, _ = parser.parse_known_args(rest)
+        # Build a per-collector parser with add_help=True so `<id> --help`
+        # prints usage + flag docs and exits, instead of being swallowed by
+        # parse_known_args (which would otherwise execute the diagnostic).
+        # parse_known_args is preserved to keep the existing lenient handling
+        # of unrecognized flags from external callers.
+        cparser = argparse.ArgumentParser(
+            prog=f"openclaw-diag {head}",
+            description=f"{coll.title} ({coll.id})",
+            add_help=True,
+        )
+        _common_arguments(cparser)
+        args, _ = cparser.parse_known_args(rest)
         return cmd_run_collector(args, head)
 
     print(f"Error: 未知命令 '{head}'", file=sys.stderr)

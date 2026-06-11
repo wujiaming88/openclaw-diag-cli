@@ -34,12 +34,22 @@ Before diagnosing, confirm the target execution context.
 
 ## Decision Ladder
 
-- No session UUID + broad symptom → `all --format json`.
-- Session UUID + open-ended question / health / slow / stuck / "why" → `panorama <uuid> --format json --mask`.
-- Session UUID + one specific user message/turn → `trace <uuid> --format json --mask`.
-- Need raw transcript / count / filter records → `extract <uuid> --summary --format json` first.
-- A collector verdict is warn/fail → run that collector alone only if more detail is needed.
-- IM channel symptom (bot not replying / message dropped / credential issue / 飞书钉钉企微 不回) → `channel --format json`. On a multi-account host, scope with `--account <account_id>` (if the account is unknown, run `channel --format json` first and read the account list from the output). Add `--sender <platform_sender_id>` — paired with `--account` when known — to test if a specific sender's DM is silently dropped (Feishu/Lark: `open_id`; DingTalk: senderId / user id; WeCom: user id); use `--probe` only when you need a live credential check.
+Pick the entry point by answering two questions, then look up the exact
+command in the **Routing** table below (and the per-command sections for
+flags).
+
+- **No session UUID?** Broad / unknown symptom → start with `all`. A
+  specific subsystem symptom (gateway / performance / cron / plugin /
+  task / channel) → run that one collector directly.
+- **Have a session UUID?** Open-ended ("is it healthy / why stuck / pull
+  everything") → `panorama`; one specific user message/turn → `trace`;
+  need raw transcript or record counts → `extract` first.
+- A collector comes back warn/fail → drill into that collector alone only
+  if you need more detail (see Workflow §3).
+- IM channel symptom (飞书 / 钉钉 / 企微 bot not replying, message dropped,
+  credential issue) → `channel`; see the **Channel** section for
+  `--account` / `--sender` / `--probe` usage (incl. multi-account
+  scoping).
 
 ## Routing
 
@@ -69,15 +79,13 @@ openclaw-diag all --format json
    - `ok=false`: report the `error.code`, `message`, and hint.
    - `ok=true`: inspect `data.module`, `data.verdict`, `data.summary`, and non-ok checks in `data.sections`.
 
-3. Drill down only where needed:
-   - `gateway != ok` → run `openclaw-diag gateway --format json`
-   - `performance != ok` → run `openclaw-diag performance --format json`
-   - `recent_errors != ok` → run `openclaw-diag recent_errors --format json`
-   - `cron_jobs != ok` → run `openclaw-diag cron_jobs --format json`
-   - `plugin_diag != ok` → run `openclaw-diag plugin_diag --format json`
-   - `run_health != ok` → run `openclaw-diag run_health --format json`, then use `trace` if a session UUID is involved
-   - `task_health != ok` → run `openclaw-diag task_health --format json`, check failure samples, top_error_patterns, timeout_analysis, stuck_analysis, and runtime breakdown
-   - `sessions_diag != ok` → run `openclaw-diag sessions_diag --format json`, then use `extract <uuid> --summary --format json` when a session UUID is known
+3. Drill down only where needed. For any module whose verdict is
+   warn/fail, re-run that single module with `--format json` for full
+   detail (exact commands in the **Routing** table). A few have specific
+   follow-ups:
+   - `run_health` warn/fail → after re-running, use `trace <uuid>` if a session UUID is involved.
+   - `task_health` warn/fail → check failure samples, `top_error_patterns`, `timeout_analysis`, `stuck_analysis`, and the runtime breakdown.
+   - `sessions_diag` warn/fail → use `extract <uuid> --summary --format json` when a session UUID is known.
 
 4. Final answer should include:
    - Overall verdict

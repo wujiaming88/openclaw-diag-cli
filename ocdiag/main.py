@@ -96,6 +96,7 @@ def _build_context(args) -> DiagContext:
         json_mode=fmt != "pretty",
         probe=getattr(args, "probe", False),
         sender_open_id=getattr(args, "sender", None) or None,
+        account_id=getattr(args, "account", None) or None,
     )
 
 
@@ -122,6 +123,11 @@ def _common_arguments(p: argparse.ArgumentParser) -> None:
         "--sender", default=None,
         help="Open ID of a sender to gate-check against the channel "
              "allowlist (channel collector; off by default).",
+    )
+    p.add_argument(
+        "--account", default=None,
+        help="Scope channel diagnostics to a single account id "
+             "(channel collector; default: all accounts).",
     )
 
 

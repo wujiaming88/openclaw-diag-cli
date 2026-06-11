@@ -2475,6 +2475,221 @@ def test_wecom_self_pollution_console_relay_ignored(tmp_path):
     )
 
 
+# ─── --account scoping ──────────────────────────────────────────────
+#
+# `--account <id>` narrows ``channel`` diagnostics to a single account.
+# The motivating bug: GATE_SENDER_NOT_IN_ALLOWLIST runs against EVERY
+# account when --sender is set, since a sender belongs to one account
+# the others all emit a spurious warn. Scoping kills that noise.
+
+
+def test_account_filter_narrows_to_single_account():
+    """``account_filter='a1'`` → only that AccountReport is returned;
+    other configured accounts are skipped entirely."""
+    rep = _diagnose_with(
+        {
+            "appId": "cli_top", "appSecret": "s_top",
+            "accounts": {
+                "a1": {"appId": "cli_a1", "appSecret": "s1"},
+                "a2": {"appId": "cli_a2", "appSecret": "s2"},
+                "a3": {"appId": "cli_a3", "appSecret": "s3"},
+            },
+        },
+        account_filter="a1",
+    )
+    ids = sorted(a.account_id for a in rep.accounts)
+    assert ids == ["a1"]
+
+
+def test_account_filter_unknown_id_emits_note_and_no_accounts():
+    """Filter set to an id that doesn't exist → zero accounts iterated
+    AND a note listing the available ids so the user gets actionable
+    feedback rather than a silent-empty diagnosis."""
+    rep = _diagnose_with(
+        {
+            "accounts": {
+                "a1": {"appId": "cli_a1", "appSecret": "s1"},
+                "a2": {"appId": "cli_a2", "appSecret": "s2"},
+            },
+        },
+        account_filter="nonexistent",
+    )
+    assert rep.accounts == []
+    note_blob = " ".join(rep.notes)
+    assert "nonexistent" in note_blob
+    assert "a1" in note_blob and "a2" in note_blob
+
+
+def test_account_filter_none_preserves_all_accounts():
+    """Regression guard: ``account_filter=None`` (default) must keep
+    today's all-accounts behavior."""
+    rep = _diagnose_with({
+        "accounts": {
+            "a1": {"appId": "cli_a1", "appSecret": "s1"},
+            "a2": {"appId": "cli_a2", "appSecret": "s2"},
+        },
+    })
+    ids = sorted(a.account_id for a in rep.accounts)
+    assert ids == ["a1", "a2"]
+
+
+def test_account_filter_silences_cross_account_sender_gate_noise():
+    """The core value test. Two accounts; --sender is in account A's
+    allowFrom only. Without --account → account B emits a spurious
+    GATE_SENDER_NOT_IN_ALLOWLIST. With ``account_filter='A'`` →
+    only A is diagnosed, so the cross-account warn is silenced."""
+    cfg = {
+        "accounts": {
+            "A": {
+                "appId": "cli_A", "appSecret": "sA",
+                "dmPolicy": "allowlist",
+                "allowFrom": ["ou_alice"],
+            },
+            "B": {
+                "appId": "cli_B", "appSecret": "sB",
+                "dmPolicy": "allowlist",
+                "allowFrom": ["ou_bob"],  # alice NOT here
+            },
+        },
+    }
+    # Without --account: alice fires the warn against B.
+    rep_all = _diagnose_with(cfg, sender_open_id="ou_alice")
+    by_id_all = {a.account_id: a for a in rep_all.accounts}
+    assert "GATE_SENDER_NOT_IN_ALLOWLIST" in [
+        f.code for f in by_id_all["B"].findings
+    ]
+    # With --account=A: only A diagnosed, no spurious B warn.
+    rep_scoped = _diagnose_with(
+        cfg, sender_open_id="ou_alice", account_filter="A",
+    )
+    ids_scoped = [a.account_id for a in rep_scoped.accounts]
+    assert ids_scoped == ["A"]
+    a_codes = [f.code for f in rep_scoped.accounts[0].findings]
+    # alice IS in A's allowFrom so the gate doesn't fire on A either —
+    # net result: zero GATE_SENDER findings, which is the whole point.
+    assert "GATE_SENDER_NOT_IN_ALLOWLIST" not in a_codes
+
+
+def test_lark_account_filter_narrows():
+    rep = _diagnose_lark_with(
+        {
+            "accounts": {
+                "primary": {"appId": "cli_p", "appSecret": "sp"},
+                "secondary": {"appId": "cli_s", "appSecret": "ss"},
+            },
+        },
+        account_filter="secondary",
+    )
+    ids = [a.account_id for a in rep.accounts]
+    assert ids == ["secondary"]
+
+
+def test_lark_account_filter_unknown_id_emits_note():
+    rep = _diagnose_lark_with(
+        {
+            "accounts": {
+                "primary": {"appId": "cli_p", "appSecret": "sp"},
+            },
+        },
+        account_filter="ghost",
+    )
+    assert rep.accounts == []
+    note_blob = " ".join(rep.notes)
+    assert "ghost" in note_blob and "primary" in note_blob
+
+
+def test_dingtalk_account_filter_narrows():
+    rep = _diagnose_dingtalk_with(
+        {
+            "accounts": {
+                "a1": {"clientId": "ding_a1", "clientSecret": "s1"},
+                "a2": {"clientId": "ding_a2", "clientSecret": "s2"},
+            },
+        },
+        account_filter="a2",
+    )
+    ids = [a.account_id for a in rep.accounts]
+    assert ids == ["a2"]
+
+
+def test_wecom_account_filter_narrows():
+    rep = _diagnose_wecom_with(
+        {
+            "accounts": {
+                "team1": {"botId": "b1", "secret": "s1"},
+                "team2": {"botId": "b2", "secret": "s2"},
+            },
+        },
+        account_filter="team1",
+    )
+    ids = [a.account_id for a in rep.accounts]
+    assert ids == ["team1"]
+
+
+def test_main_build_context_populates_account_id():
+    """``main._build_context(args)`` must lift ``args.account`` (the
+    --account CLI flag) into ``ctx.account_id`` so the channel
+    collector can reach it without a kwargs hack."""
+    from argparse import Namespace
+    from ocdiag.main import _build_context
+
+    args = Namespace(
+        config="/tmp/cfg.json", log_dir="/tmp/logs",
+        sessions_base="/tmp/sessions", openclaw_home="/tmp/home",
+        format=None, json=False, no_color=False, unmask=False,
+        probe=False, sender=None, account="prod-account-1",
+    )
+    ctx = _build_context(args)
+    assert ctx.account_id == "prod-account-1"
+
+    args.account = None
+    ctx = _build_context(args)
+    assert ctx.account_id is None
+
+
+def test_collector_account_filter_via_ctx_scopes_diagnosis(tmp_path):
+    """End-to-end: setting ``ctx.account_id`` (the path the CLI's
+    ``--account`` flag uses) must scope the channel diagnosis to a
+    single account in the rendered Report sections."""
+    registry.discover()
+    home = tmp_path
+    (home / "agents").mkdir(parents=True, exist_ok=True)
+    cfg_path = home / "openclaw.json"
+    cfg_path.write_text(json.dumps({
+        "gateway": {"port": 18795},
+        "agents": {"defaults": {}, "list": []},
+        "channels": {"feishu": {
+            "accounts": {
+                "alpha": {"appId": "cli_a", "appSecret": "sa"},
+                "beta": {"appId": "cli_b", "appSecret": "sb"},
+            },
+        }},
+    }))
+    log_dir = home / "logs"
+    log_dir.mkdir(exist_ok=True)
+    pkg_dir = (
+        home / "npm" / "projects" / "openclaw-feishu-test"
+        / "node_modules" / "@openclaw" / "feishu"
+    )
+    pkg_dir.mkdir(parents=True)
+    ctx = DiagContext(
+        openclaw_home=home,
+        config_path=cfg_path,
+        log_dir=log_dir,
+        sessions_base=home / "agents",
+    )
+    ctx.account_id = "alpha"
+    coll = registry.get("channel")
+    report = coll.collect(ctx)
+    assert report.data.get("account_filter") == "alpha"
+    # Per-account header check is named
+    # ``channel.account.<account_id>`` — only alpha's header should
+    # appear in the rendered sections.
+    names = [c.name for s in report.sections for c in s.checks]
+    assert "channel.account.alpha" in names
+    assert "channel.account.beta" not in names
+
+
 def test_self_pollution_anchor_blocks_embedded_signature(tmp_path):
     """Anchor defence (independent of path filter): even on an
     unknown path (no _meta.path field at all), a signature string

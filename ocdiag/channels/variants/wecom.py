@@ -61,7 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .. import probe as probe_mod
 from ..log_utils import extract_ts, iter_plugin_log_lines
-from .base import AccountReport, Finding, VariantReport
+from .base import AccountReport, Finding, VariantReport, apply_account_filter
 
 
 # WeCom plugin npm scope is ``@wecom``. Include the openclaw runtime
@@ -732,7 +732,10 @@ def diagnose(
     detect_basis: str,
     do_probe: bool = False,
     sender_open_id: Optional[str] = None,
+    account_filter: Optional[str] = None,
 ) -> VariantReport:
+    """``account_filter`` (``--account``) scopes the diagnosis to a
+    single account id; None preserves all-accounts behavior."""
     report = VariantReport(variant="wecom", detect_basis=detect_basis)
 
     wecom_cfg = (
@@ -746,7 +749,9 @@ def diagnose(
         )
         return report
 
-    for account_id in _list_account_ids(wecom_cfg):
+    all_ids = _list_account_ids(wecom_cfg)
+    iter_ids = apply_account_filter(all_ids, account_filter, report)
+    for account_id in iter_ids:
         merged = _merge_account_config(wecom_cfg, account_id)
         acct_rep = _diagnose_account_config(
             account_id, merged, sender_open_id=sender_open_id,

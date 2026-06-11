@@ -275,6 +275,16 @@ class ChannelCollector:
             or getattr(ctx, "sender_open_id", None)
         )
 
+        # ``--account`` parameter — same precedence shape as --sender.
+        # When set, variant diagnoses iterate only the matching account
+        # id, killing cross-account noise from rules like
+        # GATE_SENDER_NOT_IN_ALLOWLIST that fire per-account.
+        account_filter: Optional[str] = (
+            kwargs.get("account_filter")
+            or getattr(ctx, "account_id", None)
+        )
+        report.data["account_filter"] = account_filter
+
         # Group detected variants by id so multiple-evidence (npm + config)
         # collapses into one diagnosis run.
         seen: set = set()
@@ -302,6 +312,7 @@ class ChannelCollector:
                 detect_basis=d.detect_basis,
                 do_probe=bool(getattr(ctx, "probe", False)),
                 sender_open_id=sender_open_id,
+                account_filter=account_filter,
             )
             _section_for_variant(report, d.variant, variant_report)
 

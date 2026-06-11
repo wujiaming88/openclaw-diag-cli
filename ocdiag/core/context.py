@@ -25,6 +25,13 @@ class DiagContext:
     json_mode: bool = False
     probe: bool = False
     sender_open_id: Optional[str] = None
+    # Optional single-account scope for the channel collector. When set,
+    # variant diagnoses run only for the matching account id and skip
+    # the rest — silences cross-account noise from rules like
+    # ``GATE_SENDER_NOT_IN_ALLOWLIST`` where a sender belongs to one
+    # account but every other account otherwise emits a spurious
+    # "sender not in allowlist" warn. None → unchanged (all accounts).
+    account_id: Optional[str] = None
     _config_cache: Optional[Dict[str, Any]] = field(default=None, repr=False)
     # Per-invocation trajectory caches. Used by ``trajectory_files`` and
     # ``collect_runs`` to dedup the expensive disk scan + JSONL parse across

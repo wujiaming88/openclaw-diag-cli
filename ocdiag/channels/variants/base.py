@@ -44,3 +44,30 @@ class VariantReport:
     log_findings: List[Finding] = field(default_factory=list)
     probe_findings: List[Finding] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
+
+
+def apply_account_filter(
+    all_ids: List[str],
+    account_filter: Optional[str],
+    report: "VariantReport",
+) -> List[str]:
+    """Narrow the account-id iteration list by ``--account``.
+
+    Three cases:
+      - ``account_filter is None`` → return ``all_ids`` unchanged.
+      - filter matches an id      → iterate only ``[account_filter]``.
+      - filter set but no match   → iterate nothing AND append an
+        actionable note to ``report.notes`` listing the available ids,
+        so the user gets a clear reason instead of a silent-empty
+        diagnosis.
+    """
+    if not account_filter:
+        return all_ids
+    if account_filter in all_ids:
+        return [account_filter]
+    available = ", ".join(all_ids) if all_ids else "(无)"
+    report.notes.append(
+        f"请求的 account '{account_filter}' 未在配置中找到 — "
+        f"可用账号: {available}",
+    )
+    return []

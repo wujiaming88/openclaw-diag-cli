@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .. import probe as probe_mod
 from ..log_utils import extract_ts, iter_plugin_log_lines
-from .base import AccountReport, Finding, VariantReport
+from .base import AccountReport, Finding, VariantReport, apply_account_filter
 
 
 # Lark variant has two distinct npm publishing paths (the larksuite
@@ -629,6 +629,7 @@ def diagnose(
     detect_basis: str,
     do_probe: bool = False,
     sender_open_id: Optional[str] = None,
+    account_filter: Optional[str] = None,
 ) -> VariantReport:
     """Run all enabled layers for feishu-lark.
 
@@ -636,6 +637,9 @@ def diagnose(
     detected variant is lark but the config block is missing we surface
     the same "config absent" note bundled does — the variant detection
     layer already disambiguated bundled vs lark before we got here.
+
+    ``account_filter`` (the CLI's ``--account`` flag) scopes the
+    diagnosis to a single account id when set.
     """
     report = VariantReport(variant="feishu-lark", detect_basis=detect_basis)
 
@@ -650,7 +654,9 @@ def diagnose(
         )
         return report
 
-    for account_id in _list_account_ids(feishu_cfg):
+    all_ids = _list_account_ids(feishu_cfg)
+    iter_ids = apply_account_filter(all_ids, account_filter, report)
+    for account_id in iter_ids:
         merged = _merge_account_config(feishu_cfg, account_id)
         acct_rep = _diagnose_account_config(
             account_id, merged, sender_open_id=sender_open_id,

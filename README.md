@@ -6,15 +6,15 @@
 [![Node.js](https://img.shields.io/badge/node-%3E%3D18-blue.svg)](https://nodejs.org/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.8-blue.svg)](https://www.python.org/)
 
-Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 13 diagnostic modules, 3 inspectors, structured output, zero dependencies.
+Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw) — built for humans and AI Agents. 14 diagnostic modules, 3 inspectors, structured output, zero dependencies.
 
 [Install](#installation) · [Quick Start](#quick-start) · [Commands](#commands) · [AI Agent Skill](#ai-agent-skill) · [Output Formats](#output-formats) · [Examples](#examples) · [Contributing](#contributing)
 
 ## About & Scope
 
 - **Relationship to OpenClaw** — Independent, community-maintained companion tool for [OpenClaw](https://github.com/openclaw/openclaw). NOT an official OpenClaw product and not affiliated with the OpenClaw maintainers. It reads OpenClaw's on-disk artifacts (`openclaw.json`, `/tmp/openclaw/*.log`, `agents/*/sessions/*.jsonl`, `cron/`, `state/openclaw.sqlite`, `tasks/runs.sqlite`) — it does not embed or modify OpenClaw itself.
-- **Maintenance scope** — Covers 13 diagnostic modules + 3 session inspectors (trace / extract / panorama), tracking current OpenClaw releases. Zero runtime dependencies (Python stdlib + Node thin-shell). Out of scope by design: no remediation, no config writes, no service restarts, no telemetry — diagnosis only.
-- **Security & masking** — Observer-only: read-only file reads plus read-only DNS/TCP/HTTP probes (no POST/PUT/DELETE, no state mutation). Masking is per-command: `extract` is masked by default; `trace` and `panorama` are unmasked by default (pass `--mask` before sharing externally); config/log collectors always redact API keys / tokens / secrets. No data leaves the host. See [Security](#security) for details.
+- **Maintenance scope** — Covers 14 diagnostic modules + 3 session inspectors (trace / extract / panorama), tracking current OpenClaw releases. Zero runtime dependencies (Python stdlib + Node thin-shell). Out of scope by design: no remediation, no config writes, no service restarts, no telemetry — diagnosis only.
+- **Security & masking** — Observer-only: read-only file reads plus read-only connectivity probes; no OpenClaw state is ever modified. The default run keeps everything on-host. The one opt-in exception is `channel --probe`, which makes a read-only token-validation call to the IM platform's own API (POST for Feishu/Lark/DingTalk, GET for WeCom) — see [Security](#security). Masking is per-command: `extract` is masked by default; `trace` and `panorama` are unmasked by default (pass `--mask` before sharing externally); config/log collectors always redact API keys / tokens / secrets.
 
 ## Why openclaw-diag?
 
@@ -22,7 +22,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 - **Zero Dependencies** — Pure Python stdlib + Node thin-shell. No pip packages, no build steps
 - **Observer-Only** — Never modifies system state. Safe to run anytime, anywhere
 - **Explicit Verdicts** — Every check produces `ok` / `warn` / `fail` with clear thresholds, not regex-guessed
-- **13 Diagnostic Modules** — From system health to model performance to cron jobs, comprehensive coverage
+- **14 Diagnostic Modules** — From system health to model performance to cron jobs to IM channels, comprehensive coverage
 - **Session Forensics** — Trace a single message's full lifecycle, or extract entire session history
 - **Default Sanitization** — API keys, tokens, secrets masked in config/log output. Trajectory-sourced fields are plaintext by default; use `trace --mask` when sharing output
 
@@ -41,6 +41,7 @@ Observer-only diagnostic CLI for [OpenClaw](https://github.com/openclaw/openclaw
 | 🔌 plugin_diag | Plugin status, hook errors, DNS, trajectory drift |
 | 🏃 run_health | 24h/7d/30d run health, abort rate, active leak detection |
 | 📋 task_health | Task/subagent success rate, failures, timeouts, stuck detection |
+| 📡 channel | IM channel diagnostics (Feishu / Lark / DingTalk / WeCom): config rules, log-signature drop detection, optional read-only credential probe; `--account` scoping + `--sender` allowlist gate-check |
 | 🐚 shell_history | Dangerous command detection in shell history |
 | 🩺 doctor | Environment self-check (Node, Python, OpenClaw, paths) |
 
@@ -139,6 +140,18 @@ openclaw-diag panorama <uuid> --strict-correlation  # Only sessionId/runId match
 openclaw-diag panorama <uuid> --unmask        # Show full tool args/results
 openclaw-diag panorama <uuid> --format json   # JSON output for programmatic use
 ```
+
+### Channel (IM channel diagnostics)
+
+```bash
+openclaw-diag channel                                  # Passive: config rules + log-signature scan
+openclaw-diag channel --account main                   # Scope to one account (multi-account hosts)
+openclaw-diag channel --account main --sender ou_xxxx  # Predict whether a sender's DM is silently dropped
+openclaw-diag channel --account main --probe           # + read-only credential probe (outbound HTTP, opt-in)
+openclaw-diag channel --format json                    # JSON output for AI Agents
+```
+
+Covers four variants: `feishu-bundled`, `feishu-lark`, `dingtalk`, `wecom` (Bot + Agent dual-mode). `--sender` id is platform-specific (Feishu/Lark `open_id`, DingTalk senderId, WeCom user id). `--probe` makes an outbound read-only token-validation call to the platform API — see [Security](#security).
 
 ### Utility
 
@@ -299,7 +312,8 @@ Masking default is per-command: `extract` is masked by default (`--unmask` for t
 
 - **Observer-only diagnostics**: diagnostic commands never write, delete, or modify OpenClaw state. `skill-install` writes skill files to agent framework paths by explicit request
 - **Default sanitization**: API keys, tokens, secrets are masked in config/log collectors. Trajectory-sourced free-form fields (message content, tool output) are plaintext by default — use `trace --mask` when sharing output externally; `extract` is masked by default, use `--unmask` only for trusted local analysis
-- **Read-only probes**: some collectors perform DNS lookups, TCP connects, or HTTP GET/HEAD probes (sys_health, gateway, plugin_diag) for connectivity checks. No POST/PUT/DELETE, no service restarts, no runtime state mutation
+- **Read-only connectivity probes**: sys_health, gateway, and plugin_diag perform DNS lookups, TCP connects, or HTTP GET/HEAD probes for connectivity checks — no service restarts, no runtime state mutation
+- **`channel --probe` (opt-in, off by default)**: validates IM-channel credentials by calling the platform's own token endpoint — POST for Feishu/Lark/DingTalk, GET for WeCom (`open.feishu.cn`, `api.dingtalk.com`, `qyapi.weixin.qq.com`). This is read-only token introspection: it does NOT modify OpenClaw or remote state, and secrets are never echoed into output — but it is an outbound call to a third-party platform (leaves platform-side access logs, counts toward rate limits), which is why it is gated behind the explicit `--probe` flag
 - **No dependencies**: no supply-chain attack surface beyond Node.js + Python stdlib
 
 ## Contributing

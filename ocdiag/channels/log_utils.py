@@ -44,6 +44,35 @@ import os
 from typing import Iterable, Iterator, Optional, Sequence, Tuple
 
 
+# Channel-line markers
+# --------------------
+# The openclaw logger writes the structured-args field ``_meta.name`` as a
+# JSON-ENCODED STRING that holds ``{"subsystem":"<name>"}``. Field ``"0"``
+# of the line carries the same string. To classify a line as a CHANNEL
+# emission we extract the inner ``subsystem`` value and check whether it
+# (lowercased) contains any of these tokens. Note that the lark plugin
+# also logs through subsystem ``feishu/<...>`` (see
+# ``channel-src/openclaw-lark/src/core/lark-logger.ts`` —
+# ``resolveRuntimeLogger`` builds the name as ``feishu/${subsystem}``).
+# So matching ``"feishu"`` covers both bundled feishu AND lark; we never
+# require the literal token ``"lark"``.
+CHANNEL_SUBSYSTEM_TOKENS = ("feishu", "lark", "dingtalk", "wecom")
+
+# Some channel emissions don't carry a subsystem at all (older lines,
+# secondary loggers). As a fallback, accept message bodies whose first
+# few characters match a known channel prefix.
+CHANNEL_MESSAGE_PREFIXES = (
+    "feishu[",
+    "[DingTalk]",
+    "[DingTalk:",
+    "DingTalk:",
+    "dingtalk-connector[",
+    "[wecom",
+    "[WeCom",
+    "[webhook]",
+)
+
+
 # Paths that always indicate the openclaw gateway's console relay,
 # never a plugin's own diagnostic emission. Reject everywhere — assistant
 # chat captured by the relay must not feed the scanner. The substring
@@ -84,6 +113,15 @@ def _extract_message(obj: dict) -> Optional[str]:
     if isinstance(arg0, str):
         return arg0
     return None
+
+
+# Public alias — the leading underscore is historical (this function
+# used to be an internal helper of ``iter_plugin_log_lines``). New
+# callers that need the message body without going through the
+# iteration helper should use :func:`extract_message` directly.
+def extract_message(obj: dict) -> Optional[str]:
+    """Public alias for :func:`_extract_message` (see docstring)."""
+    return _extract_message(obj)
 
 
 def iter_plugin_log_lines(
@@ -164,8 +202,112 @@ def iter_plugin_log_lines(
 
 
 def extract_ts(obj: Optional[dict]) -> str:
-    """Pull a ``time`` field for sample display; tolerate missing obj."""
+    """Pull a ``time`` field for sample display; tolerate missing obj.
+
+    Falls back to ``_meta.date`` (the openclaw logger's UTC timestamp)
+    when the top-level ``time`` field is absent — older lines in the
+    log archive sometimes have one but not the other.
+    """
     if not isinstance(obj, dict):
         return ""
     ts = obj.get("time")
-    return str(ts)[:19] if isinstance(ts, str) else ""
+    if isinstance(ts, str):
+        return ts[:19]
+    meta = obj.get("_meta")
+    if isinstance(meta, dict):
+        date = meta.get("date")
+        if isinstance(date, str):
+            return date[:19]
+    return ""
+
+
+def extract_subsystem(obj: Optional[dict]) -> Optional[str]:
+    """Pull the channel subsystem name from a parsed line.
+
+    The openclaw logger encodes the structured ``name`` field as a JSON
+    string holding ``{"subsystem":"<name>"}``. The same string is also
+    written to field ``"0"`` of the top-level record. We try the
+    ``_meta.name`` location first since it's the canonical source.
+
+    Returns the inner ``subsystem`` value (e.g. ``"channels/feishu"``)
+    or ``None`` when the line has no parseable subsystem.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    candidates = []
+    meta = obj.get("_meta")
+    if isinstance(meta, dict):
+        name = meta.get("name")
+        if isinstance(name, str):
+            candidates.append(name)
+    field0 = obj.get("0")
+    if isinstance(field0, str):
+        candidates.append(field0)
+
+    for cand in candidates:
+        # Cheap parse attempt — these strings are JSON-encoded by the
+        # logger but malformed strings are common (older logs, tools
+        # that hand-build a record). We tolerate failures silently.
+        if not cand or "subsystem" not in cand:
+            continue
+        try:
+            parsed = json.loads(cand)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            sub = parsed.get("subsystem")
+            if isinstance(sub, str):
+                return sub
+    return None
+
+
+def is_console_relay_path(obj: Optional[dict]) -> bool:
+    """True when the line came from the gateway's console relay.
+
+    Used by the channel collector's pre-classification gate: console-
+    relay lines are assistant chat captured by the openclaw runtime
+    and MUST never be matched against signature phrases (otherwise
+    diagnostic output containing those phrases self-pollinates the
+    next run). The full file path is recognisable by the
+    ``/dist/console-`` substring (no plugin emits a file under that
+    naming convention).
+    """
+    if not isinstance(obj, dict):
+        return False
+    full = _full_file_path(obj)
+    if not full:
+        return False
+    return any(needle in full for needle in _GATEWAY_RELAY_REJECT)
+
+
+def is_channel_subsystem(subsystem: Optional[str]) -> bool:
+    """True when the subsystem (lowercased) carries a channel token.
+
+    Subsystems are slash-paths like ``channels/feishu``,
+    ``gateway/channels/feishu``, ``feishu/channel/monitor`` (lark's
+    runtime-prefixed form). Substring matching against
+    :data:`CHANNEL_SUBSYSTEM_TOKENS` covers all these shapes.
+    """
+    if not subsystem:
+        return False
+    lowered = subsystem.lower()
+    return any(token in lowered for token in CHANNEL_SUBSYSTEM_TOKENS)
+
+
+def is_channel_message_prefix(message: Optional[str]) -> bool:
+    """True when the message body starts with a known channel prefix.
+
+    Used as a fallback when a line has no parseable subsystem (older
+    log lines, plugins that bypass the structured logger). Anchored
+    at the start of the message body — substring elsewhere doesn't
+    qualify, which is part of the self-pollution defence: relay echo
+    of "we found feishu[main]: ..." in the middle of a sentence
+    doesn't trip the prefix check.
+    """
+    if not message:
+        return False
+    for prefix in CHANNEL_MESSAGE_PREFIXES:
+        if message.startswith(prefix):
+            return True
+    return False

@@ -38,10 +38,13 @@ def test_channel_help_shows_usage_not_diagnostic():
     # argparse usage line carries the prog we set; a real diagnostic run
     # would print the human renderer banner instead.
     assert "usage: openclaw-diag channel" in out
-    # Channel keeps the channel-only flags.
+    # Channel keeps its single channel-only flag.
     assert "--account" in out
-    assert "--sender" in out
-    assert "--probe" in out
+    # ``--probe`` and ``--sender`` were removed in v1.9.0 when the
+    # channel collector dropped config interpretation and the active
+    # probe path. Pin the absence so the flags don't sneak back in.
+    assert "--sender" not in out
+    assert "--probe" not in out
     # Negative control: the human renderer's banner must not appear.
     assert "OPENCLAW-DIAG" not in out
 
@@ -51,8 +54,9 @@ def test_gateway_help_shows_usage_not_diagnostic():
     assert "usage: openclaw-diag gateway" in out
     # Common flags still present.
     assert "--format" in out
-    # Channel-only flags must not leak into a non-channel collector's help.
+    # Channel-only flag must not leak into a non-channel collector's help.
     assert "--account" not in out
+    # ``--probe`` / ``--sender`` are gone everywhere.
     assert "--sender" not in out
     assert "--probe" not in out
     assert "OPENCLAW-DIAG" not in out

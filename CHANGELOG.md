@@ -1,5 +1,80 @@
 # Changelog
 
+## v1.9.0 — channel collector reduced to a pure log scanner (2026-06-12)
+
+### Breaking — `channel` no longer interprets config or runs network probes
+
+The `channel` collector has been redesigned around a single,
+durable question: *"what does the log actually say went wrong on the
+IM-channel side?"* Prior versions detected which IM variant was
+installed, walked per-variant config rules, and (with `--probe`)
+made outbound HTTP calls to platform token endpoints. That worked
+but produced noisy bundled-vs-lark double reports, required
+maintaining a per-variant rule table that lagged upstream plugin
+changes, and meant operators had to reason about three layers (L1
+config / L2-L3 log / L5 probe) before answering a basic "what's in
+the logs" question.
+
+This release strips all of that. The collector now:
+
+- Walks `openclaw-*.log` files in the configured `--log-dir`
+  over the last 7 days.
+- Classifies each JSON line as channel iff its subsystem
+  (lowercased) contains one of `feishu`, `lark`, `dingtalk`,
+  `wecom`, or its message body starts with a known channel
+  prefix (`feishu[`, `[DingTalk]`, `[DingTalk:`, `DingTalk:`,
+  `[wecom`, `[WeCom`, `[webhook]`). Note: lark logs through
+  subsystem `feishu/<sub>` — detection NEVER requires the literal
+  word "lark".
+- Collects a channel line as a signal when EITHER its log level is
+  WARN or ERROR (`logLevelId>=4`) OR its message matches a phrase
+  from the source-mined catalog at
+  `ocdiag/channels/signals.py` (silent drops, gating decisions,
+  bot-identity recovery, pairing flow, etc., including the dingtalk
+  Chinese phrase `群聊被拦截`).
+- Sorts signals newest-first, displays at most 20 (with a 倒序 cap
+  note when more matched), and preserves the FULL message body
+  per line — `日志信息完整` is a hard requirement.
+- Reuses the existing console-relay self-pollution guard — lines on
+  paths containing `/dist/console-` are dropped before classification.
+
+Severity ⇒ verdict: `error` → FAIL, `warn` → WARN, benign info
+(`skipping duplicate`, `drop self-echo`, etc.) is collected but does
+not bump the verdict.
+
+#### CLI surface
+- **Removed**: `--probe`, `--sender`. The active credential probe and
+  the per-sender allowlist gate-check no longer exist on this
+  collector.
+- **Kept**: `--account <substring>` — now interpreted as a substring
+  filter on the message body (matches the channel-prefix portion,
+  e.g. `--account default` keeps lines containing `feishu[default]:`).
+
+#### Files
+- **Deleted**: `ocdiag/channels/detect.py`,
+  `ocdiag/channels/probe.py`, the entire
+  `ocdiag/channels/variants/` package
+  (`base.py`, `feishu_bundled.py`, `feishu_lark.py`,
+  `dingtalk.py`, `wecom.py`).
+- **Added**: `ocdiag/channels/signals.py` — phrase catalog +
+  `classify(message)` helper, with source-cite comments pointing back
+  to the plugin emission sites.
+- **Rewritten**: `ocdiag/collectors/channel.py` (pure scanner),
+  `tests/test_channel.py` (28 tests for the new shape).
+- **Updated**: `ocdiag/main.py` (drop `--probe`/`--sender` plumbing,
+  drop `ctx.probe = False` in the `all` aggregator),
+  `ocdiag/core/context.py` (drop unused `probe` /
+  `sender_open_id` fields), `ocdiag/channels/log_utils.py`
+  (added subsystem extraction, channel classification,
+  console-relay path helper), `tests/test_cli_help.py`,
+  `skill/openclaw-diag/SKILL.md`.
+
+Migration: callers that previously used `--probe` or `--sender` need
+to replace those with manual log inspection or live platform-side
+checks — credential validity is no longer surfaced through this
+collector. Per-account scoping continues to work via
+`--account <substring>`.
+
 ## v1.8.0 — Channel diagnostic collector (5 IM variants + active probe + self-pollution defense) (2026-06-10)
 
 ### Feature — single `channel` collector covering Feishu / Lark / DingTalk / WeCom

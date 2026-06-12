@@ -46,10 +46,11 @@ flags).
   need raw transcript or record counts → `extract` first.
 - A collector comes back warn/fail → drill into that collector alone only
   if you need more detail (see Workflow §3).
-- IM channel symptom (飞书 / 钉钉 / 企微 bot not replying, message dropped,
-  credential issue) → `channel`; see the **Channel** section for
-  `--account` / `--sender` / `--probe` usage (incl. multi-account
-  scoping).
+- IM channel symptom (飞书 / 钉钉 / 企微 bot not replying, message dropped) →
+  `channel`; see the **Channel** section. The collector is a pure log
+  scanner (no config interpretation, no active probe); use
+  `--account <substring>` to filter by a per-account log prefix on
+  multi-account hosts.
 
 ## Routing
 
@@ -65,7 +66,7 @@ flags).
 | Session health / why / 全貌 | `openclaw-diag panorama <uuid> --format json --mask` |
 | Specific message stuck/slow → trace | `openclaw-diag trace <uuid> --format json --mask` |
 | Inspect session records | `openclaw-diag extract <uuid> --summary --format json` |
-| IM channel: bot not replying / silent drops / credential | `openclaw-diag channel --format json` (multi-account: `--account <id>`; add `--sender <platform_sender_id>` / `--probe`) |
+| IM channel: bot not replying / silent drops | `openclaw-diag channel --format json` (multi-account: `--account <substring>`) |
 
 ## Workflow
 
@@ -166,62 +167,55 @@ Verdict mapping:
 
 Use `channel` when the user reports an IM channel symptom: bot not
 replying, message arrived but no response, channel 卡住, suspected
-credential / connection / allowlist issue. One unified collector covers
-four channel variants: `feishu-bundled` (`@openclaw/feishu`),
-`feishu-lark` (`@larksuite/openclaw-lark`), `dingtalk`, and `wecom`.
-WeCom is a single dual-mode variant (Bot — WS or webhook — and/or an
-Agent self-built app), not two variants.
+silent drop. The collector is a **pure log scanner** — it surfaces
+ERROR/WARNING entries from IM-channel subsystems plus a curated
+catalog of INFO-level "silent drop / gating" phrases (blocked
+sender, group disabled, did-not-mention-bot, bot-identity gating,
+pairing requests, etc.). It does NOT interpret `channels.*` config,
+does NOT detect installed packages, and does NOT make any outbound
+network call.
 
 ```bash
-openclaw-diag channel --format json                                  # passive: config + log scan (start here)
-openclaw-diag channel --account main --format json                   # scope to one account on a multi-account host
-openclaw-diag channel --account main --sender ou_xxxx --format json  # predict if a sender's DM is dropped (Feishu/Lark open_id; scope to the sender's own account)
-openclaw-diag channel --account main --probe --format json           # + active credential probe for ONE account — outbound HTTP, use sparingly (see L5 below)
-openclaw-diag channel --probe --format json                          # probe ALL accounts — only when you intend to hit every account's token endpoint
+openclaw-diag channel --format json                       # default: scan last 7 days of logs
+openclaw-diag channel --log-dir /tmp/openclaw             # explicit log dir
+openclaw-diag channel --account default --format json     # filter to lines containing "default"
+                                                          # (matches feishu[default]: ..., [DingTalk:default] ..., etc.)
 ```
 
-**Multi-account hosts:** without `--account`, every configured account
-is diagnosed and `--sender` is checked against *every* account's
-allowlist — producing spurious `GATE_SENDER_NOT_IN_ALLOWLIST` warnings
-for accounts the sender doesn't belong to. If you know the account, pass
-`--account <id>`; if not, run `channel --format json` first and read the
-account list from the output, then re-run scoped to the right one.
+What gets collected:
+- A line is classified as **channel** when its subsystem (lowercased)
+  contains one of `feishu`, `lark`, `dingtalk`, `wecom`, OR its
+  message body starts with a known channel prefix (`feishu[`,
+  `[DingTalk]`, `[DingTalk:`, `DingTalk:`, `[wecom`, `[WeCom`,
+  `[webhook]`). Note: the lark plugin logs through subsystem
+  `feishu/<sub>` — we never key on the literal word "lark".
+- A channel line becomes a **signal** if EITHER its log level is
+  WARN or ERROR (logLevelId>=4) OR its message matches a phrase from
+  the source-mined catalog (`ocdiag/channels/signals.py`).
 
-Three layers run per detected variant:
-- **L1 config** — credential completeness, mode self-consistency,
-  account-policy sanity (per upstream zod schema). Emits findings like
-  `CRED_MISSING`, `CONN_MODE_INCONSISTENT`,
-  `DM_POLICY_OPEN_NO_WILDCARD`, `GATE_SENDER_NOT_IN_ALLOWLIST`
-  (only with `--sender`).
-- **L2/L3 log scan** — anchored on literal log strings extracted
-  from each plugin's dist tree (drops, WS lifecycle, pairing,
-  webhook anomalies). Self-pollution defense filters out the
-  gateway console-relay sink so chat content quoting these signatures
-  doesn't trigger findings.
-- **L5 active probe** — only with `--probe`. Makes an OUTBOUND HTTP
-  request to each platform's canonical token endpoint (Feishu/Lark &
-  DingTalk: POST; WeCom Agent: GET) — e.g. `open.feishu.cn`,
-  `api.dingtalk.com`, `qyapi.weixin.qq.com`. It is read-only
-  token-introspection: it does NOT modify OpenClaw or remote state and
-  never echoes secrets — but it DOES reach the external platform, so it
-  can leave access-log entries and counts against the platform's rate
-  limit. Default to the passive `channel` run; add `--probe` only when
-  you must confirm a credential is actually valid. Three result states:
-  `valid`, `invalid` (platform rejected), `unreachable` (network/
-  timeout — explicitly NOT classified as invalid). WeCom Bot mode
-  has no HTTP token endpoint and reports
-  `WECOM_BOT_NO_PROBE_ENDPOINT` honestly.
+Severity → verdict mapping:
+- `error` (logLevelId>=5) → FAIL
+- `warn` (logLevelId==4 or attention phrase) → WARN
+- `info` (benign drop phrase, e.g. duplicate / empty / self-echo) → OK
+  (still displayed)
 
-Reading discipline: a `warn` log finding such as
-`LOG_GROUP_DID_NOT_MENTION_BOT` or `LOG_BLOCKED_UNAUTHORIZED_DM` is
-often the explanation for "my message got no reply" — the channel
-plugin silently dropped it per policy. Surface those literally before
-speculating about Agent or model issues.
+Display: signals are sorted newest-first and capped at 20 per render
+(JSON output keeps the full list under `data.signals`). When more
+than 20 matched, a 倒序 cap note is appended.
 
-Secrets are never echoed back: per-account `appSecret` shows as
-`literal` or `ref:<source>:<provider>` only. `--probe` resolves
-SecretRef objects in memory for the urllib request alone; nothing
-plaintext lands in `Report.data` / `evidence`.
+Self-pollution defense: lines whose `_meta.path.fullFilePath` matches
+the gateway console-relay sink (`/dist/console-`) are dropped before
+classification — chat output captured by the relay can't pollute the
+catalog.
+
+Reading discipline: a `warn` signal whose body says "blocked
+unauthorized sender" or "did not mention bot" is usually the direct
+answer to "my message got no reply" — the channel plugin silently
+dropped it per policy. Surface those literally before speculating
+about Agent or model issues. If the user needs to know whether their
+credentials are valid (was the symptom "auth failure"?), inspect the
+ERROR-level lines that surfaced; the collector no longer probes
+remote endpoints.
 
 ## JSON Notes
 

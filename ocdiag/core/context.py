@@ -23,14 +23,10 @@ class DiagContext:
     unmask: bool = False
     no_color: bool = False
     json_mode: bool = False
-    probe: bool = False
-    sender_open_id: Optional[str] = None
-    # Optional single-account scope for the channel collector. When set,
-    # variant diagnoses run only for the matching account id and skip
-    # the rest — silences cross-account noise from rules like
-    # ``GATE_SENDER_NOT_IN_ALLOWLIST`` where a sender belongs to one
-    # account but every other account otherwise emits a spurious
-    # "sender not in allowlist" warn. None → unchanged (all accounts).
+    # Optional account substring used by the ``channel`` collector to
+    # filter the log scan — matched against the channel-prefix portion
+    # of the message body (e.g. ``default`` matches
+    # ``feishu[default]: ...``). ``None`` → no filter.
     account_id: Optional[str] = None
     _config_cache: Optional[Dict[str, Any]] = field(default=None, repr=False)
     # Per-invocation trajectory caches. Used by ``trajectory_files`` and

@@ -26,6 +26,7 @@ from ..core.types import Report, Section, Verdict
 from ..tracing import (
     analyze_phases,
     build_system_prompt_info,
+    extract_text,
     extract_trace_records,
     find_first_message,
     find_gateway_logs,
@@ -370,6 +371,152 @@ def _section_gateway(s: Section, gw: Dict[str, Any]) -> None:
         )
 
 
+def _user_text_snippet(user_rec: Dict[str, Any], max_chars: int = 80) -> str:
+    """One-line preview of a user message's text content.
+
+    Used in the per-turn meta header when --all-messages is on so the reader
+    can tell turns apart at a glance. Whitespace is collapsed to single
+    spaces; the result is truncated with an ellipsis.
+    """
+    msg = user_rec.get("message") or {}
+    text = extract_text(msg.get("content", "")) or ""
+    text = " ".join(text.split())
+    if len(text) > max_chars:
+        text = text[:max_chars - 1] + "…"
+    return text
+
+
+def _build_turn_sections(
+    report: Report,
+    *,
+    analysis: Dict[str, Any],
+    user_msg_ordinal: int,
+    user_msg_id: str,
+    total_user_msgs: int,
+    turn_label: str,
+    user_snippet: str,
+) -> None:
+    """Append the per-turn timeline / summary / model / tool sections.
+
+    ``turn_label`` is prepended to each section title so multi-turn output
+    keeps the per-turn blocks visually delimited (e.g. ``"Turn #2/5 · "``).
+
+    Per-turn vs session-level enrichment split (see TraceInspector.collect):
+      Per-turn here = timeline + summary + model breakdown + tool breakdown.
+      Trajectory + System Prompt + Gateway are session-scoped (one per file)
+      and are emitted ONCE by the caller, not per turn.
+    """
+    s_meta = report.section(f"{turn_label}Trace · 元信息")
+    s_meta.ok(
+        "user_message",
+        f"user message #{user_msg_ordinal} of {total_user_msgs} "
+        f"(id: {user_msg_id})  {user_snippet}",
+        data={
+            "index": user_msg_ordinal,
+            "id": user_msg_id,
+            "total": total_user_msgs,
+            "snippet": user_snippet,
+        },
+    )
+
+    s_timeline = report.section(f"{turn_label}Trace · 时间轴")
+    _section_timeline(s_timeline, analysis)
+
+    s_summary = report.section(f"{turn_label}Trace · 汇总")
+    _section_summary(s_summary, analysis)
+
+    if analysis["model_calls"]:
+        s_models = report.section(f"{turn_label}Trace · Model 拆解")
+        _section_model_breakdown(s_models, analysis)
+
+    if analysis["tool_execs"]:
+        s_tools = report.section(f"{turn_label}Trace · 工具拆解")
+        _section_tool_breakdown(s_tools, analysis)
+
+    # Slow E2E → WARN. Attach to this turn's summary section so the verdict
+    # surfaces without inventing a new section.
+    total_ms = analysis["summary"]["total_ms"]
+    if total_ms > SLOW_THRESHOLD_MS:
+        s_summary.warn(
+            "trace.slow",
+            f"E2E elapsed {fmt_duration(total_ms)} > "
+            f"{SLOW_THRESHOLD_MS // 1000}s",
+            data={"total_ms": total_ms, "threshold_ms": SLOW_THRESHOLD_MS},
+        )
+
+
+def _section_aggregate(
+    s: Section, per_turn: List[Dict[str, Any]],
+) -> None:
+    """Render the cross-turn summary at the end of an --all-messages run.
+
+    Aggregates totals across every turn (count, cumulative E2E / model /
+    tool time, cumulative tokens) and surfaces any turn whose E2E exceeded
+    SLOW_THRESHOLD_MS as a per-turn WARN line.
+    """
+    n = len(per_turn)
+    total_e2e = sum(t["summary"]["total_ms"] for t in per_turn)
+    total_model = sum(t["summary"]["model_total_ms"] for t in per_turn)
+    total_tool = sum(t["summary"]["tool_total_ms"] for t in per_turn)
+    total_in = sum(t["summary"]["total_input_tokens"] for t in per_turn)
+    total_out = sum(t["summary"]["total_output_tokens"] for t in per_turn)
+    total_cr = sum(t["summary"]["total_cache_read"] for t in per_turn)
+    total_cw = sum(t["summary"]["total_cache_write"] for t in per_turn)
+    total_models = sum(t["summary"]["model_count"] for t in per_turn)
+    total_tools = sum(t["summary"]["tool_count"] for t in per_turn)
+
+    s.ok(
+        "agg.turns", f"Turns: {n}",
+        data={"count": n},
+    )
+    s.ok(
+        "agg.total", f"Cumulative E2E: {fmt_duration(total_e2e)}",
+        data={"total_ms": total_e2e},
+    )
+    s.ok(
+        "agg.model",
+        f"Cumulative model time: {fmt_duration(total_model)} "
+        f"across {total_models} call(s)",
+        data={"total_ms": total_model, "count": total_models},
+    )
+    s.ok(
+        "agg.tool",
+        f"Cumulative tool time: {fmt_duration(total_tool)} "
+        f"across {total_tools} call(s)",
+        data={"total_ms": total_tool, "count": total_tools},
+    )
+    tok_msg = f"Cumulative tokens: in={total_in} out={total_out}"
+    if total_cr:
+        tok_msg += f" cache_read={total_cr}"
+    if total_cw:
+        tok_msg += f" cache_write={total_cw}"
+    s.ok(
+        "agg.tokens", tok_msg,
+        data={
+            "input": total_in,
+            "output": total_out,
+            "cache_read": total_cr,
+            "cache_write": total_cw,
+        },
+    )
+
+    for t in per_turn:
+        if t["summary"]["total_ms"] > SLOW_THRESHOLD_MS:
+            s.warn(
+                f"agg.slow.{t['index']}",
+                f"Turn #{t['index'] + 1} slow: "
+                f"{fmt_duration(t['summary']['total_ms'])} > "
+                f"{SLOW_THRESHOLD_MS // 1000}s "
+                f"(id: {t['user_message_id']})",
+                data={
+                    "index": t["index"],
+                    "user_message_id": t["user_message_id"],
+                    "total_ms": t["summary"]["total_ms"],
+                    "threshold_ms": SLOW_THRESHOLD_MS,
+                },
+            )
+
+
 @register
 class TraceInspector:
     id = "trace"
@@ -398,6 +545,28 @@ class TraceInspector:
                 code="INVALID_QUERY",
                 message=msg,
                 details={"query": session_id},
+            )
+            report.elapsed_ms = (time.time() - t0) * 1000
+            return report
+
+        # --all-messages is mutually exclusive with the single-turn selectors.
+        # The CLI parser already rejects the combination, but inspectors can
+        # also be called programmatically (tests, future SDK callers); guard
+        # here so the contract holds end-to-end.
+        all_messages = bool(kwargs.get("all_messages"))
+        if all_messages and (
+            kwargs.get("msg_index") is not None
+            or kwargs.get("msg_id") is not None
+            or kwargs.get("msg_match") is not None
+        ):
+            report.error = (
+                "--all-messages cannot be combined with "
+                "--msg-index/--msg-id/--msg-match"
+            )
+            report.diag_error = DiagError(
+                code="INVALID_ARGUMENT",
+                message=report.error,
+                hint="pick either --all-messages OR a single-turn selector",
             )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
@@ -466,41 +635,69 @@ class TraceInspector:
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
-        rec_idx, user_rec = select_user_message(
-            records,
-            kwargs.get("msg_index"),
-            kwargs.get("msg_id"),
-            kwargs.get("msg_match"),
-        )
-        try:
-            user_msg_ordinal = next(
-                i for i, (ri, _) in enumerate(user_msgs) if ri == rec_idx
+        # ── Pick which user turn(s) to analyze ──
+        # Single-turn (default, or any --msg-* selector) → one analysis.
+        # All-messages → analyze every user turn from find_user_messages.
+        # We still call analyze_phases per turn so each block has its own
+        # base_epoch_ms / timeline / summary identical to a single-turn run.
+        total_user_msgs = len(user_msgs)
+        if all_messages:
+            selected: List[tuple] = list(user_msgs)
+        else:
+            rec_idx, user_rec = select_user_message(
+                records,
+                kwargs.get("msg_index"),
+                kwargs.get("msg_id"),
+                kwargs.get("msg_match"),
             )
-        except StopIteration:
-            user_msg_ordinal = 0
-        user_msg_id = user_rec.get("id", "?")
-        report.data["user_message_index"] = user_msg_ordinal
-        report.data["user_message_id"] = user_msg_id
+            selected = [(rec_idx, user_rec)]
 
-        trace_records = extract_trace_records(records, rec_idx)
-        analysis = analyze_phases(trace_records)
-        report.data["base_epoch_ms"] = analysis["base_epoch_ms"]
-        report.data["timeline"] = analysis["events"]
-        report.data["model_calls"] = analysis["model_calls"]
-        report.data["tool_execs"] = analysis["tool_execs"]
-        report.data["summary"] = analysis["summary"]
+        # Run analyze_phases for each selected turn. The first turn's
+        # analysis seeds the session-level enrichment (trajectory / system
+        # prompt / gateway) — those data sources are session-scoped, not
+        # per-turn, so they are computed ONCE using the first turn's
+        # base_epoch_ms (which is the earliest timestamp in selected turns).
+        per_turn_analyses: List[Dict[str, Any]] = []
+        for ordinal, (rec_idx, user_rec) in enumerate(selected):
+            try:
+                turn_index = next(
+                    i for i, (ri, _) in enumerate(user_msgs) if ri == rec_idx
+                )
+            except StopIteration:
+                turn_index = ordinal
+            turn_records = extract_trace_records(records, rec_idx)
+            analysis = analyze_phases(turn_records)
+            per_turn_analyses.append({
+                "index": turn_index,
+                "user_message_id": user_rec.get("id", "?"),
+                "user_record": user_rec,
+                "analysis": analysis,
+            })
+
+        # ── Session-level enrichment (computed once) ──
+        # Trajectory / system prompt / gateway timing reflect properties of
+        # the whole run/file, not a single user turn. Computing them once
+        # keeps cost down on long sessions and avoids duplicating identical
+        # blocks per turn. The base epoch we hand to load_trajectory_info /
+        # load_gateway_timing is the FIRST selected turn's base_epoch_ms;
+        # for single-turn this matches the legacy behaviour exactly, and for
+        # all-messages it puts the trajectory offsets on the same axis as
+        # the first turn block (the most useful anchor point).
+        first_analysis = per_turn_analyses[0]["analysis"]
+        base_epoch_ms = first_analysis["base_epoch_ms"]
 
         traj_info: Optional[Dict[str, Any]] = None
         if not kwargs.get("no_trajectory"):
             traj_path = find_trajectory_file(session_file)
             if traj_path:
-                traj_info = load_trajectory_info(traj_path, analysis["base_epoch_ms"])
+                traj_info = load_trajectory_info(traj_path, base_epoch_ms)
                 if traj_info is not None:
                     _apply_traj_redaction(
                         traj_info,
                         mask=bool(kwargs.get("mask")),
                         show_tool_metas=bool(kwargs.get("show_tool_metas")),
-                        show_plugin_snapshot=bool(kwargs.get("show_plugin_snapshot")),
+                        show_plugin_snapshot=bool(
+                            kwargs.get("show_plugin_snapshot")),
                     )
 
         gw_info: Optional[Dict[str, Any]] = None
@@ -508,15 +705,15 @@ class TraceInspector:
             log_files = find_gateway_logs(str(ctx.log_dir))
             if log_files:
                 gw_info = load_gateway_timing(
-                    log_files, full_session_id, analysis["base_epoch_ms"],
+                    log_files, full_session_id, base_epoch_ms,
                 )
 
         store_report = sessions.lookup_system_prompt_report(
             session_file, full_session_id,
         )
         system_prompt = build_system_prompt_info(store_report, traj_info)
-        if system_prompt is not None and analysis.get("model_calls"):
-            first_call = analysis["model_calls"][0]
+        if system_prompt is not None and first_analysis.get("model_calls"):
+            first_call = first_analysis["model_calls"][0]
             actual_input = (
                 (first_call.get("tokens_in") or 0)
                 + (first_call.get("cache_read") or 0)
@@ -532,58 +729,179 @@ class TraceInspector:
         if system_prompt is not None:
             report.data["systemPrompt"] = system_prompt
 
+        # ── report.data wiring ──
+        # Single-turn path: keep the legacy keys (timeline, model_calls,
+        # tool_execs, summary, base_epoch_ms, user_message_*) at the top
+        # level so existing JSON consumers see no schema change.
+        # All-messages path: add report.data["all_messages"] (per-turn list)
+        # and report.data["aggregate"] (cumulative). The legacy single-turn
+        # keys are NOT populated in this mode — consumers that asked for
+        # all-messages should read the new keys.
+        if not all_messages:
+            single = per_turn_analyses[0]
+            report.data["base_epoch_ms"] = single["analysis"]["base_epoch_ms"]
+            report.data["timeline"] = single["analysis"]["events"]
+            report.data["model_calls"] = single["analysis"]["model_calls"]
+            report.data["tool_execs"] = single["analysis"]["tool_execs"]
+            report.data["summary"] = single["analysis"]["summary"]
+            report.data["user_message_index"] = single["index"]
+            report.data["user_message_id"] = single["user_message_id"]
+        else:
+            all_msgs_payload: List[Dict[str, Any]] = []
+            for t in per_turn_analyses:
+                a = t["analysis"]
+                all_msgs_payload.append({
+                    "index": t["index"],
+                    "user_message_id": t["user_message_id"],
+                    "user_message_snippet": _user_text_snippet(t["user_record"]),
+                    "base_epoch_ms": a["base_epoch_ms"],
+                    "timeline": a["events"],
+                    "model_calls": a["model_calls"],
+                    "tool_execs": a["tool_execs"],
+                    "summary": a["summary"],
+                })
+            report.data["all_messages"] = all_msgs_payload
+            report.data["aggregate"] = {
+                "turns": len(per_turn_analyses),
+                "total_ms": sum(
+                    t["analysis"]["summary"]["total_ms"]
+                    for t in per_turn_analyses
+                ),
+                "model_total_ms": sum(
+                    t["analysis"]["summary"]["model_total_ms"]
+                    for t in per_turn_analyses
+                ),
+                "tool_total_ms": sum(
+                    t["analysis"]["summary"]["tool_total_ms"]
+                    for t in per_turn_analyses
+                ),
+                "total_input_tokens": sum(
+                    t["analysis"]["summary"]["total_input_tokens"]
+                    for t in per_turn_analyses
+                ),
+                "total_output_tokens": sum(
+                    t["analysis"]["summary"]["total_output_tokens"]
+                    for t in per_turn_analyses
+                ),
+                "total_cache_read": sum(
+                    t["analysis"]["summary"]["total_cache_read"]
+                    for t in per_turn_analyses
+                ),
+                "total_cache_write": sum(
+                    t["analysis"]["summary"]["total_cache_write"]
+                    for t in per_turn_analyses
+                ),
+            }
+
         # ── Sections ──
-        s_meta = report.section("Trace · 元信息")
-        s_meta.ok(
-            "session", f"session: {full_session_id}",
-            data={"session_id": full_session_id, "file": session_file},
-        )
-        total_user_msgs = len(user_msgs)
-        msg_hint = (
-            f"user message #{user_msg_ordinal} of {total_user_msgs} (id: {user_msg_id})"
-        )
-        if total_user_msgs > 1:
-            msg_hint += f"  [use --msg-index 0~{total_user_msgs - 1} to select]"
-        s_meta.ok(
-            "user_message", msg_hint,
-            data={"index": user_msg_ordinal, "id": user_msg_id, "total": total_user_msgs},
-        )
-
-        s_timeline = report.section("Trace · 时间轴")
-        _section_timeline(s_timeline, analysis)
-
-        s_summary = report.section("Trace · 汇总")
-        _section_summary(s_summary, analysis)
-
-        if analysis["model_calls"]:
-            s_models = report.section("Trace · Model 拆解")
-            _section_model_breakdown(s_models, analysis)
-
-        if analysis["tool_execs"]:
-            s_tools = report.section("Trace · 工具拆解")
-            _section_tool_breakdown(s_tools, analysis)
-
-        if traj_info:
-            s_traj = report.section("Trace · Trajectory")
-            _section_trajectory(s_traj, traj_info)
-
-        if system_prompt:
-            s_sp = report.section("Trace · System Prompt")
-            _section_system_prompt(s_sp, system_prompt)
-
-        if gw_info:
-            s_gw = report.section("Trace · Gateway 计时")
-            _section_gateway(s_gw, gw_info)
-
-        # Slow E2E → WARN. Add as a synthetic check on the summary section so
-        # the verdict surfaces without inventing a new section.
-        total_ms = analysis["summary"]["total_ms"]
-        if total_ms > SLOW_THRESHOLD_MS:
-            s_summary.warn(
-                "trace.slow",
-                f"E2E elapsed {fmt_duration(total_ms)} > {SLOW_THRESHOLD_MS//1000}s",
-                data={"total_ms": total_ms, "threshold_ms": SLOW_THRESHOLD_MS},
+        if not all_messages:
+            # Single-turn: emit one "session" line under 元信息 followed by
+            # the per-turn block, byte-identical to pre-1.11.0 output.
+            single = per_turn_analyses[0]
+            s_meta = report.section("Trace · 元信息")
+            s_meta.ok(
+                "session", f"session: {full_session_id}",
+                data={"session_id": full_session_id, "file": session_file},
             )
+            msg_hint = (
+                f"user message #{single['index']} of {total_user_msgs} "
+                f"(id: {single['user_message_id']})"
+            )
+            if total_user_msgs > 1:
+                msg_hint += (
+                    f"  [use --msg-index 0~{total_user_msgs - 1} to select]"
+                )
+            s_meta.ok(
+                "user_message", msg_hint,
+                data={
+                    "index": single["index"],
+                    "id": single["user_message_id"],
+                    "total": total_user_msgs,
+                },
+            )
+            s_timeline = report.section("Trace · 时间轴")
+            _section_timeline(s_timeline, single["analysis"])
+            s_summary = report.section("Trace · 汇总")
+            _section_summary(s_summary, single["analysis"])
+            if single["analysis"]["model_calls"]:
+                s_models = report.section("Trace · Model 拆解")
+                _section_model_breakdown(s_models, single["analysis"])
+            if single["analysis"]["tool_execs"]:
+                s_tools = report.section("Trace · 工具拆解")
+                _section_tool_breakdown(s_tools, single["analysis"])
+
+            if traj_info:
+                s_traj = report.section("Trace · Trajectory")
+                _section_trajectory(s_traj, traj_info)
+            if system_prompt:
+                s_sp = report.section("Trace · System Prompt")
+                _section_system_prompt(s_sp, system_prompt)
+            if gw_info:
+                s_gw = report.section("Trace · Gateway 计时")
+                _section_gateway(s_gw, gw_info)
+
+            total_ms = single["analysis"]["summary"]["total_ms"]
+            if total_ms > SLOW_THRESHOLD_MS:
+                s_summary.warn(
+                    "trace.slow",
+                    f"E2E elapsed {fmt_duration(total_ms)} > "
+                    f"{SLOW_THRESHOLD_MS // 1000}s",
+                    data={
+                        "total_ms": total_ms,
+                        "threshold_ms": SLOW_THRESHOLD_MS,
+                    },
+                )
+        else:
+            # All-messages: a session-wide overview, then per-turn blocks
+            # delimited by a "Turn #i/N" prefix, then session-level
+            # enrichment ONCE, then a final aggregate section.
+            n = len(per_turn_analyses)
+            s_overview = report.section("Trace · 元信息 (全部消息)")
+            s_overview.ok(
+                "session", f"session: {full_session_id}",
+                data={"session_id": full_session_id, "file": session_file},
+            )
+            s_overview.ok(
+                "all_messages",
+                f"tracing all {n} user message(s) in this session",
+                data={"count": n},
+            )
+
+            for t in per_turn_analyses:
+                turn_label = f"Turn #{t['index'] + 1}/{total_user_msgs} · "
+                _build_turn_sections(
+                    report,
+                    analysis=t["analysis"],
+                    user_msg_ordinal=t["index"],
+                    user_msg_id=t["user_message_id"],
+                    total_user_msgs=total_user_msgs,
+                    turn_label=turn_label,
+                    user_snippet=_user_text_snippet(t["user_record"]),
+                )
+
+            # Session-scoped enrichment is rendered ONCE — emitting it per
+            # turn would duplicate large, identical blocks (system prompt
+            # alone can be 10k+ chars). Title-prefixed with "Session · " so
+            # the reader sees it is run-wide, not turn-specific.
+            if traj_info:
+                s_traj = report.section("Session · Trajectory")
+                _section_trajectory(s_traj, traj_info)
+            if system_prompt:
+                s_sp = report.section("Session · System Prompt")
+                _section_system_prompt(s_sp, system_prompt)
+            if gw_info:
+                s_gw = report.section("Session · Gateway 计时")
+                _section_gateway(s_gw, gw_info)
+
+            s_agg = report.section("Trace · 跨消息汇总")
+            _section_aggregate(s_agg, [
+                {
+                    "index": t["index"],
+                    "user_message_id": t["user_message_id"],
+                    "summary": t["analysis"]["summary"],
+                }
+                for t in per_turn_analyses
+            ])
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

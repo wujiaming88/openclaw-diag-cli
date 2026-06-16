@@ -125,6 +125,7 @@ openclaw-diag examples               # Show usage examples
 openclaw-diag trace <uuid>                    # Last user message
 openclaw-diag trace <uuid> --msg-index 0      # First message
 openclaw-diag trace <uuid> --msg-match "deploy"  # Match by content
+openclaw-diag trace <uuid> --all-messages     # Every user turn, one block each
 openclaw-diag trace <uuid> --no-trajectory    # Skip trajectory enrichment
 
 # Extract: dump session content

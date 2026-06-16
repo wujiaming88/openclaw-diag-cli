@@ -88,6 +88,15 @@ def test_channel_without_help_runs_collector():
     assert isinstance(rc, int)
 
 
+def test_trace_help_documents_all_messages():
+    """v1.11.0 introduced --all-messages/-A; pin the flag in trace --help."""
+    out = _capture_help(["trace", "--help"])
+    assert "usage: openclaw-diag trace" in out
+    assert "--all-messages" in out
+    # Negative control: the help branch must not run the inspector.
+    assert "OPENCLAW-DIAG" not in out
+
+
 def test_gateway_without_help_runs_without_attribute_error():
     """Regression guard for the v1.8.3 split.
 

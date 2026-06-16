@@ -323,7 +323,8 @@ _TRACE_EPILOG = """示例:
   openclaw-diag trace 7e9f3b31                    # 该 session 最后一条用户消息
   openclaw-diag trace 7e9f3b31 --msg-index 0      # 第一条
   openclaw-diag trace 7e9f3b31 --msg-match deploy # 按内容匹配
-  openclaw-diag trace 7e9f3b31 --format json      # JSON 输出
+  openclaw-diag trace 7e9f3b31 --all-messages     # 一次跑完全部用户消息（每轮一段）
+  openclaw-diag trace 7e9f3b31 -A --format json   # 全部用户消息，JSON 输出
 """
 
 _EXTRACT_EPILOG = """示例:
@@ -355,6 +356,10 @@ def _build_trace_parser() -> argparse.ArgumentParser:
     p.add_argument("--msg-id", default=None, help="Message by id field")
     p.add_argument("--msg-match", default=None,
                    help="First user message containing TEXT")
+    p.add_argument("-A", "--all-messages", action="store_true",
+                   dest="all_messages",
+                   help="Trace every user message in the session "
+                        "(mutually exclusive with --msg-index/--msg-id/--msg-match)")
     p.add_argument("--no-trajectory", action="store_true")
     p.add_argument("--no-log", action="store_true")
     p.add_argument("--show-tool-metas", action="store_true")
@@ -416,11 +421,24 @@ def cmd_inspector(head: str, rest: List[str]) -> int:
     if head == "trace":
         parser = _build_trace_parser()
         ns = parser.parse_args(rest)
+        # --all-messages traces every user turn; it is mutually exclusive with
+        # the single-turn selectors. Reject the combination at parse time so
+        # the inspector never sees an ambiguous request.
+        if ns.all_messages and (
+            ns.msg_index is not None
+            or ns.msg_id is not None
+            or ns.msg_match is not None
+        ):
+            parser.error(
+                "--all-messages/-A cannot be combined with "
+                "--msg-index/--msg-id/--msg-match",
+            )
         kwargs = {
             "session_id": ns.session_id,
             "msg_index": ns.msg_index,
             "msg_id": ns.msg_id,
             "msg_match": ns.msg_match,
+            "all_messages": ns.all_messages,
             "no_trajectory": ns.no_trajectory,
             "no_log": ns.no_log,
             "show_tool_metas": ns.show_tool_metas,

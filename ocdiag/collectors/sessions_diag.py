@@ -194,7 +194,7 @@ def _analyze_session_file(fpath: str) -> dict:
 
 
 def _section_inventory(s: Section, sessions_base: str) -> dict:
-    data: dict = {}
+    data: dict = {"session_files_scanned": 0}
     active_cutoff = time.time() - 7 * 86400
     all_files = []
     active_files = []
@@ -248,6 +248,7 @@ def _section_inventory(s: Section, sessions_base: str) -> dict:
         "large_file_count": len(large_files),
     }
     data["disk_summary"] = summary
+    data["session_files_scanned"] = total_files
 
     msg = (
         f"Session 总览: {total_files} 个文件, 总大小 {human_size(total_size)}, "
@@ -408,12 +409,13 @@ def _extract_stuck_match(obj):
 
 
 def _section_stuck(s: Section, log_dir: str) -> dict:
-    data: dict = {}
+    data: dict = {"app_log_files_scanned": 0}
     log_files = sorted(
         glob.glob(os.path.join(log_dir, "openclaw-*.log")),
         key=lambda p: os.path.getmtime(p) if os.path.isfile(p) else 0,
         reverse=True,
     )
+    data["app_log_files_scanned"] = len(log_files)
     if not log_files:
         s.ok(
             "sessions.stuck",
@@ -511,8 +513,9 @@ def _section_trajectory(s: Section, sessions_base: str) -> dict:
     # cache today; the in-process trajectory cache on DiagContext only covers
     # ``collect_runs``. Migrating ``collect_summaries`` is a separate pass —
     # keep this code untouched so the v1.5.0 refactor stays surgical.
-    data: dict = {}
+    data: dict = {"trajectory_files_scanned": 0, "trajectory_runs_scanned": 0}
     files = trajectory.discover_trajectory_files(sessions_base)
+    data["trajectory_files_scanned"] = len(files)
     if not files:
         s.ok(
             "sessions.trajectory",
@@ -523,6 +526,7 @@ def _section_trajectory(s: Section, sessions_base: str) -> dict:
 
     summaries = trajectory.collect_summaries(files)
     runs_total = sum(s_["total_runs"] for s_ in summaries)
+    data["trajectory_runs_scanned"] = runs_total
     incomplete_total = sum(s_["incomplete_runs"] for s_ in summaries)
     largest_bytes = max((s_["size_bytes"] for s_ in summaries), default=0)
     largest_mb = largest_bytes / (1024 * 1024)
@@ -674,23 +678,39 @@ class SessionsDiagCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
-        report.add_scope("sessions", "full", "active threshold 7d")
-        report.add_scope("app_logs", "full")
-        report.add_scope("trajectory", "full")
 
         s_inv = report.section("8.1 Session 文件清单")
         inv_data = _section_inventory(s_inv, str(ctx.sessions_base))
         active_files = inv_data.pop("_active_files", [])
         report.data.update(inv_data)
+        session_files_scanned = inv_data.get("session_files_scanned", 0)
+        report.add_scope(
+            "sessions", "full",
+            f"{session_files_scanned} files (active threshold 7d)",
+        )
 
         s_agent = report.section("8.2 Per-Agent 分析")
         report.data.update(_section_per_agent(s_agent, active_files))
 
         s_stuck = report.section("8.3 Stuck Session 探测")
-        report.data.update(_section_stuck(s_stuck, str(ctx.log_dir)))
+        stuck_data = _section_stuck(s_stuck, str(ctx.log_dir))
+        report.data.update(stuck_data)
+        app_log_files_scanned = stuck_data.get("app_log_files_scanned", 0)
+        report.add_scope(
+            "app_logs", "full",
+            f"{app_log_files_scanned} files",
+        )
 
         s_traj = report.section("8.4 Trajectory Run 健康度")
-        report.data.update(_section_trajectory(s_traj, str(ctx.sessions_base)))
+        traj_data = _section_trajectory(s_traj, str(ctx.sessions_base))
+        report.data.update(traj_data)
+        trajectory_files_scanned = traj_data.get("trajectory_files_scanned", 0)
+        trajectory_runs_scanned = traj_data.get("trajectory_runs_scanned", 0)
+        report.add_scope(
+            "trajectory", "full",
+            f"{trajectory_files_scanned} files, "
+            f"{trajectory_runs_scanned} runs",
+        )
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

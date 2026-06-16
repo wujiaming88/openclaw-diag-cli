@@ -98,3 +98,35 @@ def fmt_hms(ts: Optional[str]) -> str:
         return ts.split("T", 1)[1][:8]
     except Exception:
         return ts[:19]
+
+
+def window_token(ms: int) -> str:
+    """Render a scan-window duration in ms as the canonical scope token.
+
+    Single source of truth for `data_scope.window` strings derived from a
+    millisecond cutoff. Callers that pass the same `ms` value into
+    `collect_runs(since_ms=ms_ago(ms))` MUST also use this to produce the
+    displayed window — never a parallel literal — so the displayed scope
+    cannot drift from the actual scan.
+
+    Standard windows map to friendly tokens (24h/7d/14d/30d). Anything else
+    falls back to ``Nd`` if divisible by a day, otherwise ``Nh`` if
+    divisible by an hour, else ``<ms>ms``.
+    """
+    try:
+        ms_int = int(ms)
+    except (TypeError, ValueError):
+        return "?"
+    if ms_int == 24 * 3600 * 1000:
+        return "24h"
+    if ms_int == 7 * 86400 * 1000:
+        return "7d"
+    if ms_int == 14 * 86400 * 1000:
+        return "14d"
+    if ms_int == 30 * 86400 * 1000:
+        return "30d"
+    if ms_int > 0 and ms_int % 86400000 == 0:
+        return f"{ms_int // 86400000}d"
+    if ms_int > 0 and ms_int % 3600000 == 0:
+        return f"{ms_int // 3600000}h"
+    return f"{ms_int}ms"

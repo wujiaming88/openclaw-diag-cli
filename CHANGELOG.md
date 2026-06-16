@@ -1,5 +1,74 @@
 # Changelog
 
+## v1.10.1 — data_scope zero-drift: derive window/counts from actual scan (2026-06-16)
+
+A correctness fix on top of v1.10.0. The owner's hard requirement: the
+displayed `data_scope` MUST be IDENTICAL to the data the collector
+actually consumed — zero deviation. Two failure modes were eliminated:
+
+(A) **DRIFT** — scope window tokens (`24h` / `7d` / `14d` / `30d`) were
+hardcoded literals separate from the ms value passed into
+`ctx.collect_runs`. They could silently diverge if either side changed.
+
+(B) **MISLABEL** — a displayed count was sometimes NOT the actual scanned
+count. Two known cases fixed:
+
+- `plugin_diag` reported the filtered top-30 sample as if it were the
+  scope (`trajectory: 7d (30 runs)` even when 200+ runs were scanned to
+  produce the sample). Now reports `trajectory: 7d (104 runs scanned, 30
+  sampled)` — both numbers are real, both come from the actual winning
+  window. The summary JSON gains a new `trajectory_runs_scanned` field.
+- `performance` declared `sessions: 7d` but its primary perf sample was
+  the latest 20 session files by mtime; 7d was only the daily-trend
+  window. The single misleading scope item is now split into two honest
+  ones: `sessions: latest-20 (N files)` (perf sample) and
+  `sessions: 7d (M files)` (daily trend).
+
+### Single source of truth: `window_token()`
+
+New helper `ocdiag.timeutil.window_token(ms)` maps the SAME ms value used
+in the scan to the canonical window token (`24h` / `7d` / `14d` / `30d`,
+or `Nd` / `Nh` fallbacks). Every trajectory-window scope now derives its
+window token from this helper; literal strings are gone.
+
+### Real scanned counts everywhere
+
+`add_scope` is now called AFTER the scan, so the detail count reflects
+the actual size of the returned list (`len(runs)`, `len(files)`). No
+collector passes a filtered/capped subset count where the scope口径
+expects the scan口径.
+
+### Scan-window vs analysis-threshold distinction
+
+Clarified in code and tests:
+
+- **scan window** = how far back / which files were actually READ from
+  disk → goes in `window`.
+- **analysis threshold** = a cutoff applied to already-scanned data
+  (e.g. `task_health` 24h orphan, `sessions_diag` 7d active,
+  `run_health` 24h/7d/30d slices) → goes in `detail`, never in `window`.
+
+### Tests
+
+New `tests/test_scope_consistency.py` (12 tests):
+
+- `window_token()` mapping pinned for known windows + fallbacks.
+- For each windowed-trajectory collector (gateway 24h, cron_jobs 7d,
+  environment 14d, recent_errors 7d): independently recompute
+  `len(ctx.collect_runs(since_ms=ms_ago(W)))` and assert the displayed
+  scope detail embeds that exact count.
+- `plugin_diag`: assert summary carries both `trajectory_runs_scanned`
+  and `samples`, and that scope detail references both.
+- `performance`: assert exactly two `sessions` scope items
+  (`latest-20`, `7d`) with file counts equal to
+  `session_files_analyzed` / `trend_files_analyzed`.
+- `sessions_diag` / `task_health`: assert analysis thresholds appear in
+  detail text, never as the window token.
+- Universal regression guard: no collector emits a raw integer ms as a
+  window token.
+
+Total test suite: 196 passed, 1 skipped (was 184 + 12 new).
+
 ## v1.10.0 — plugin_diag layered trajectory fallback + unified data_scope (2026-06-16)
 
 ### plugin_diag — layered 7d → 30d → full trajectory scan

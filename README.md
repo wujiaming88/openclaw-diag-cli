@@ -182,7 +182,7 @@ Success:
     "elapsed_ms": 1234,
     "data_scope": [
       {"source": "gateway_status", "window": "current"},
-      {"source": "trajectory", "window": "24h"}
+      {"source": "trajectory", "window": "24h", "detail": "37 runs"}
     ],
     "sections": [...],
     "data": {...},
@@ -196,10 +196,28 @@ Every successful report carries a `data.data_scope` array describing the
 data window it actually scanned (e.g. `trajectory:7d`, `app_logs:today`,
 `session:<uuid8>`). Pretty output mirrors this with a `数据口径` line in
 the banner; NDJSON output emits a leading `{"kind":"scope", ...}` line
-before the section stream. `plugin_diag` additionally surfaces
+before the section stream.
+
+`data_scope` is **zero-drift** by contract: `window` is the actual scan
+window (derived from the same ms value passed into `collect_runs`, via
+the `window_token()` helper — never a parallel literal); `detail` is the
+real size of the returned/scanned list, captured at the scan site. So a
+report claiming `trajectory:7d (240 runs)` reflects what was read from
+disk, not a filtered/capped sample. Analysis thresholds (e.g.
+`task_health` 24h orphan cutoff, `sessions_diag` 7d active threshold,
+`run_health` 24h/7d/30d window slices applied to a full scan) belong in
+`detail` text — never as the `window` token. Two distinct scans yield
+two distinct scope items: e.g. `performance` emits both
+`sessions: latest-20 (20 files)` (perf sample) and `sessions: 7d
+(M files)` (daily trend) instead of collapsing them into one.
+
+`plugin_diag` additionally surfaces
 `data.trajectory_plugins.trajectory_scan_scope` (`7d` | `30d` |
 `full_fallback` | `none`) so callers can see which layered fallback
-window produced the result.
+window produced the result, and
+`data.trajectory_plugins.trajectory_runs_scanned` for the real number of
+runs read in that window (distinct from `samples`, which is the filtered
+top-30 sample size).
 
 Error:
 ```json

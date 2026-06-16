@@ -35,7 +35,7 @@ from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 from ..sensitive import sanitize_text
-from ..timeutil import fmt_age, fmt_ts
+from ..timeutil import fmt_age, fmt_ts, window_token
 from ..tokens import fmt_tokens, percentile
 
 try:
@@ -1209,7 +1209,7 @@ def _section_system_crontab(s: Section) -> dict:
 
 
 def _section_cron_trajectory(s: Section, ctx: DiagContext) -> dict:
-    data: dict = {}
+    data: dict = {"runs_scanned_7d": 0}
     files = ctx.trajectory_files()
     if not files:
         s.ok(
@@ -1221,6 +1221,7 @@ def _section_cron_trajectory(s: Section, ctx: DiagContext) -> dict:
     runs = ctx.collect_runs(
         since_ms=trajectory.ms_ago(7 * 86400 * 1000),
     )
+    data["runs_scanned_7d"] = len(runs)
     cron_runs = [r for r in runs if r.trigger == "cron"]
     if not cron_runs:
         s.ok(
@@ -1364,7 +1365,6 @@ class CronJobsCollector:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
         report.add_scope("cron_store", "current")
-        report.add_scope("trajectory", "7d")
 
         # We pull the legacy paths from $OPENCLAW_HOME (so test harnesses
         # that override only HOME/OPENCLAW_HOME continue to work) and the
@@ -1395,8 +1395,12 @@ class CronJobsCollector:
         report.data.update(_section_system_crontab(s_sys))
 
         s_traj = report.section("6.4 Trajectory cron 审计 (7d)")
-        report.data.update(
-            _section_cron_trajectory(s_traj, ctx),
+        traj_data = _section_cron_trajectory(s_traj, ctx)
+        report.data.update(traj_data)
+        runs_scanned_7d = traj_data.get("runs_scanned_7d", 0)
+        report.add_scope(
+            "trajectory", window_token(7 * 86400 * 1000),
+            f"{runs_scanned_7d} runs",
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

@@ -2547,9 +2547,12 @@ class PanoramaInspector:
             "session", f"session:{full_session_id[:8]}",
         )
         if log_files:
+            # ``session_window`` = the session's actual time window plus
+            # ±LOG_WINDOW_GRACE_MS for clock skew (see _bound_logs_to_window).
+            grace_ms = LOG_WINDOW_GRACE_MS
             report.add_scope(
                 "app_logs", "session_window",
-                f"{len(log_files)} files",
+                f"{len(log_files)} files (±{grace_ms // 1000}s grace)",
             )
 
         sources_present: Dict[str, bool] = {

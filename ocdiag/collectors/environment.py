@@ -16,6 +16,7 @@ from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 from ..sensitive import safe_val, sanitize_text
+from ..timeutil import window_token
 
 
 def _run(cmd, timeout: int = 5):
@@ -376,7 +377,7 @@ def _section_env_vars(s: Section, unmask: bool) -> dict:
 
 
 def _section_trajectory_versions(s: Section, ctx: DiagContext) -> dict:
-    data: dict = {}
+    data: dict = {"runs_scanned_14d": 0}
     files = ctx.trajectory_files()
     if not files:
         s.ok(
@@ -390,6 +391,7 @@ def _section_trajectory_versions(s: Section, ctx: DiagContext) -> dict:
     runs = ctx.collect_runs(
         since_ms=trajectory.ms_ago(14 * 86400 * 1000),
     )
+    data["runs_scanned_14d"] = len(runs)
     if not runs:
         s.ok("trajectory.versions", "最近 14d 无 trajectory run")
         return data
@@ -473,7 +475,6 @@ class EnvironmentCollector:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
         report.add_scope("system", "current")
-        report.add_scope("trajectory", "14d")
 
         s_ver = report.section("2.1 OpenClaw 版本")
         report.data.update(_section_versions(s_ver, ctx))
@@ -491,8 +492,12 @@ class EnvironmentCollector:
         report.data.update(_section_env_vars(s_env, ctx.unmask))
 
         s_traj = report.section("2.6 Trajectory 版本漂移 (14d)")
-        report.data.update(
-            _section_trajectory_versions(s_traj, ctx),
+        traj_data = _section_trajectory_versions(s_traj, ctx)
+        report.data.update(traj_data)
+        runs_scanned_14d = traj_data.get("runs_scanned_14d", 0)
+        report.add_scope(
+            "trajectory", window_token(14 * 86400 * 1000),
+            f"{runs_scanned_14d} runs",
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

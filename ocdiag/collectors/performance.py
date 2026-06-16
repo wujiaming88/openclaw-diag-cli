@@ -1218,18 +1218,28 @@ class PerformanceCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
-        report.add_scope("trajectory", "full")
-        report.add_scope("sessions", "7d")
         sessions_base = str(ctx.sessions_base)
 
         session_files = _collect_session_files(sessions_base, limit=20)
         report.data["session_files_analyzed"] = len(session_files)
+        # Two distinct session scans → two distinct scope items. The perf
+        # sample is the newest 20 session files by mtime; the daily trend
+        # is everything within a 7-day mtime window. Reporting them as one
+        # would mislabel either count.
+        report.add_scope(
+            "sessions", "latest-20",
+            f"{len(session_files)} files",
+        )
 
         # daily_trend uses an independent 7-day mtime window so days with
         # real activity that fall outside the latest-20 perf sample aren't
         # silently reported as 0 calls.
         trend_files = _collect_session_files_by_window(sessions_base, days=7)
         report.data["trend_files_analyzed"] = len(trend_files)
+        report.add_scope(
+            "sessions", "7d",
+            f"{len(trend_files)} files",
+        )
 
         if session_files:
             data = _analyze_sessions(session_files)
@@ -1272,6 +1282,23 @@ class PerformanceCollector:
 
         s_pb = report.section("7.9 Trajectory prompt budget")
         report.data.update(_section_prompt_budget(s_pb, ctx))
+
+        # Trajectory scope: emit the real run count from the (cached) full
+        # scan after the per-section calls have populated the ctx cache —
+        # both ``_section_trajectory_perf`` and ``_section_prompt_budget``
+        # share the same ``ctx.collect_runs()`` snapshot, so this is a
+        # cache hit.
+        try:
+            traj_runs_count = (
+                len(ctx.collect_runs())
+                if ctx.trajectory_files() else 0
+            )
+        except Exception:
+            traj_runs_count = 0
+        report.add_scope(
+            "trajectory", "full",
+            f"{traj_runs_count} runs",
+        )
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

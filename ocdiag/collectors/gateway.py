@@ -16,6 +16,7 @@ from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
 from ..jsonlog import get_log_subsystem, parse_log_msg
+from ..timeutil import window_token
 
 
 def _run(cmd, timeout: int = 8):
@@ -878,7 +879,7 @@ def _section_gateway_errors(s: Section, app_log: str) -> dict:
 
 
 def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
-    data: dict = {}
+    data: dict = {"runs_scanned_24h": 0}
     files = ctx.trajectory_files()
     if not files:
         s.ok(
@@ -896,6 +897,7 @@ def _section_run_frequency(s: Section, ctx: DiagContext) -> dict:
         since_ms=trajectory.ms_ago(24 * 3600 * 1000),
         mtime_prefilter=True,
     )
+    data["runs_scanned_24h"] = len(runs_24h)
     # Count and histogram both restrict to DATED runs. ``collect_runs`` keeps
     # undated (``started_ts_ms == 0``) runs in its result so other collectors
     # (cron_jobs / recent_errors / environment) can still see them, but for
@@ -953,7 +955,6 @@ class GatewayCollector:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
         report.add_scope("gateway_status", "current")
-        report.add_scope("trajectory", "24h")
 
         port = 18789
         port_source = "default"
@@ -984,7 +985,13 @@ class GatewayCollector:
         report.data.update(_section_gateway_errors(s_err, app_log or ""))
 
         s_freq = report.section("4.6 Trajectory 24h Run 频率")
-        report.data.update(_section_run_frequency(s_freq, ctx))
+        freq_data = _section_run_frequency(s_freq, ctx)
+        report.data.update(freq_data)
+        runs_scanned_24h = freq_data.get("runs_scanned_24h", 0)
+        report.add_scope(
+            "trajectory", window_token(24 * 3600 * 1000),
+            f"{runs_scanned_24h} runs",
+        )
 
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

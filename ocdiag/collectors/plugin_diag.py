@@ -721,15 +721,21 @@ def _section_trajectory(
             "未发现 trajectory 文件 — 跳过 trajectory 插件分析",
             data={"trajectory_plugins": {
                 "found": False, "trajectory_scan_scope": "none",
+                "trajectory_runs_scanned": 0, "samples": 0,
             }},
         )
         return {"trajectory_plugins": {
             "found": False, "trajectory_scan_scope": "none",
+            "trajectory_runs_scanned": 0, "samples": 0,
         }}
 
     # Layered scan: 7d → 30d → full. Stop at the first window that yields
-    # at least one run carrying plugin metadata.
+    # at least one run carrying plugin metadata. We capture the count of
+    # the WINNING window's full scan (not the top-30 sample) so the
+    # displayed scope detail can honestly state how many runs were read
+    # from disk to produce the sample.
     scan_scope = "full_fallback"
+    runs_scanned = 0
     recent: List = []
     for window_label, window_ms in (
         ("7d", 7 * 86400 * 1000),
@@ -744,11 +750,13 @@ def _section_trajectory(
         if candidate:
             scan_scope = window_label
             recent = candidate
+            runs_scanned = len(runs)
             break
     if not recent:
         runs = ctx.collect_runs()
         runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
         recent = [r for r in runs[:30] if r.plugin_entries]
+        runs_scanned = len(runs)
 
     if not recent:
         s.ok(
@@ -757,11 +765,13 @@ def _section_trajectory(
             data={"trajectory_plugins": {
                 "found": True, "samples": 0,
                 "trajectory_scan_scope": "full_fallback",
+                "trajectory_runs_scanned": runs_scanned,
             }},
         )
         return {"trajectory_plugins": {
             "found": True, "samples": 0,
             "trajectory_scan_scope": "full_fallback",
+            "trajectory_runs_scanned": runs_scanned,
         }}
 
     latest = recent[0]
@@ -842,6 +852,7 @@ def _section_trajectory(
     summary = {
         "found": True,
         "samples": len(recent),
+        "trajectory_runs_scanned": runs_scanned,
         "trajectory_scan_scope": scan_scope,
         "latest_run": {
             "sessionId": latest.session_id,
@@ -924,6 +935,8 @@ class PluginDiagCollector:
         configured, configured_status = _load_configured(str(ctx.config_path))
         extensions = _load_extensions(str(ctx.openclaw_home))
 
+        # Scopes recorded after the scans complete so detail counts match
+        # the actual data read.
         report.add_scope(
             "app_logs", "today", f"{len(today_logs)} files",
         )
@@ -956,9 +969,13 @@ class PluginDiagCollector:
         traj_summary = traj_payload.get("trajectory_plugins", {}) or {}
         scan_scope = traj_summary.get("trajectory_scan_scope", "none")
         traj_samples = traj_summary.get("samples", 0) or 0
+        traj_runs_scanned = traj_summary.get("trajectory_runs_scanned", 0) or 0
+        # Detail must reflect both numbers so the displayed scope cannot
+        # be misread as "scope = sample count". The window token is the
+        # winning window (or full_fallback / none) — the actual scan口径.
         report.add_scope(
             "trajectory", scan_scope,
-            f"{traj_samples} runs" if traj_samples else None,
+            f"{traj_runs_scanned} runs scanned, {traj_samples} sampled",
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

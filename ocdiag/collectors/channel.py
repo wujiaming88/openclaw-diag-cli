@@ -57,6 +57,13 @@ from ..channels import log_utils, signals
 from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section, Verdict
+from ..timeutil import window_token
+
+
+# Channel scan window — kept as a named constant so the same ms value is
+# used both as the mtime cutoff (`_resolve_log_files`) and as the source of
+# the displayed scope window token (`window_token` below).
+_CHANNEL_WINDOW_MS = 7 * 86400 * 1000
 
 
 # Display cap for matched signals. JSON consumers see the full total
@@ -110,7 +117,7 @@ def _resolve_log_files(ctx: DiagContext) -> List[str]:
     if not os.path.isdir(log_dir):
         return []
     pattern = os.path.join(log_dir, "openclaw-*.log")
-    cutoff = time.time() - 7 * 86400
+    cutoff = time.time() - (_CHANNEL_WINDOW_MS / 1000)
     matched: List[Tuple[float, str]] = []
     for path in glob.glob(pattern):
         try:
@@ -311,7 +318,6 @@ class ChannelCollector:
     def collect(self, ctx: DiagContext, **kwargs) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
-        report.add_scope("app_logs", "7d")
 
         # ``--account`` (substring filter on the message body). Both
         # the kwargs path (test direct calls) and ``ctx.account_id``
@@ -327,6 +333,10 @@ class ChannelCollector:
             os.path.basename(p) for p in log_files
         ]
         report.data["account_filter"] = account_filter
+        report.add_scope(
+            "app_logs", window_token(_CHANNEL_WINDOW_MS),
+            f"{len(log_files)} files",
+        )
 
         # Walk every candidate file. Errors per-file are already absorbed
         # inside ``_scan_log_file``; we only care about the merged stream.

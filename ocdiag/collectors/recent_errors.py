@@ -16,6 +16,7 @@ from .. import recent_logs, trajectory
 from ..core.context import DiagContext
 from ..core.registry import register
 from ..core.types import Report, Section
+from ..timeutil import window_token
 
 
 _ERR_RE = re.compile(r'"logLevelName"\s*:\s*"(ERROR|FATAL)"')
@@ -313,7 +314,7 @@ def _section_session_errors(s: Section, sessions_base: str) -> dict:
 
 
 def _section_trajectory_errors(s: Section, ctx: DiagContext) -> dict:
-    data: dict = {}
+    data: dict = {"runs_scanned_7d": 0}
     files = ctx.trajectory_files()
     if not files:
         s.ok(
@@ -326,6 +327,7 @@ def _section_trajectory_errors(s: Section, ctx: DiagContext) -> dict:
     runs = ctx.collect_runs(
         since_ms=trajectory.ms_ago(7 * 86400 * 1000),
     )
+    data["runs_scanned_7d"] = len(runs)
     if not runs:
         s.ok(
             "trajectory.errors",
@@ -529,11 +531,14 @@ class RecentErrorsCollector:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
         report.add_scope("journald", "today")
-        report.add_scope("app_logs", "today")
-        report.add_scope("trajectory", "7d")
 
         s_app = report.section("5.1 应用日志")
-        report.data.update(_section_app_logs(s_app, str(ctx.log_dir)))
+        app_data = _section_app_logs(s_app, str(ctx.log_dir))
+        report.data.update(app_data)
+        app_log_files = app_data.get("scanned_logs") or []
+        report.add_scope(
+            "app_logs", "today", f"{len(app_log_files)} files",
+        )
 
         s_journal = report.section("5.2 Journalctl")
         report.data.update(_section_journalctl(s_journal))
@@ -544,8 +549,12 @@ class RecentErrorsCollector:
         )
 
         s_traj = report.section("5.4 Trajectory 错误信号 (7d)")
-        report.data.update(
-            _section_trajectory_errors(s_traj, ctx),
+        traj_data = _section_trajectory_errors(s_traj, ctx)
+        report.data.update(traj_data)
+        runs_scanned_7d = traj_data.get("runs_scanned_7d", 0)
+        report.add_scope(
+            "trajectory", window_token(7 * 86400 * 1000),
+            f"{runs_scanned_7d} runs",
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

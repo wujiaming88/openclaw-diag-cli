@@ -53,7 +53,6 @@ class ShellHistoryCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
-        report.add_scope("shell_history", "full")
         unmask = ctx.unmask
 
         def maybe_sanitize(s: str) -> str:
@@ -68,6 +67,7 @@ class ShellHistoryCollector:
                 data={"history_files": []},
             )
             report.data["history_files"] = []
+            report.add_scope("shell_history", "full", "0 files")
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
@@ -173,5 +173,12 @@ class ShellHistoryCollector:
             })
 
         report.data["history_files"] = files_data
+        total_lines = sum(
+            (fd.get("total_lines") or 0) for fd in files_data
+        )
+        report.add_scope(
+            "shell_history", "full",
+            f"{len(files_data)} files, {total_lines} lines",
+        )
         report.elapsed_ms = (time.time() - t0) * 1000
         return report

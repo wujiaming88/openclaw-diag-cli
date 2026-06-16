@@ -235,7 +235,7 @@ class ConfigurationCollector:
             traj_runs_count = 0
         report.add_scope(
             "trajectory", "full",
-            f"{traj_runs_count} runs" if traj_runs_count else None,
+            f"{traj_runs_count} runs",
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

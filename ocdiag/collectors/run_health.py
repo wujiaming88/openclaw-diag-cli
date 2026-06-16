@@ -411,7 +411,6 @@ class RunHealthCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
-        report.add_scope("trajectory", "full", "windows 24h/7d/30d")
 
         sessions_base = str(ctx.sessions_base)
         files = ctx.trajectory_files()
@@ -422,12 +421,20 @@ class RunHealthCollector:
                 "未发现 trajectory 文件 — 跳过 run 健康度分析",
                 data={"found": False, "checked": sessions_base},
             )
+            report.add_scope(
+                "trajectory", "full",
+                "0 runs (analyzed in 24h/7d/30d windows)",
+            )
             report.elapsed_ms = (time.time() - t0) * 1000
             return report
 
         all_runs = ctx.collect_runs()
         report.data["trajectory_files"] = len(files)
         report.data["runs_total_all_time"] = len(all_runs)
+        report.add_scope(
+            "trajectory", "full",
+            f"{len(all_runs)} runs (analyzed in 24h/7d/30d windows)",
+        )
 
         s_disc = report.section("11.1 Trajectory 扫描")
         s_disc.ok(

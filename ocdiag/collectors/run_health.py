@@ -411,6 +411,7 @@ class RunHealthCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("trajectory", "full", "windows 24h/7d/30d")
 
         sessions_base = str(ctx.sessions_base)
         files = ctx.trajectory_files()

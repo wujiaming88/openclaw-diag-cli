@@ -1,5 +1,64 @@
 # Changelog
 
+## v1.10.0 — plugin_diag layered trajectory fallback + unified data_scope (2026-06-16)
+
+### plugin_diag — layered 7d → 30d → full trajectory scan
+
+`plugin_diag` previously did a full trajectory scan and selected the
+top-30 most-recent runs that carried plugin metadata. On hosts with
+months of accumulated trajectory files this scanned far more than
+necessary; on quiet hosts where the latest run had no plugin metadata,
+fallback was implicit and invisible. v1.10.0 makes the scan layered
+and tells you which window produced the data:
+
+1. Try the last 7 days (`mtime_prefilter=True`).
+2. If no top-30 run with plugin metadata, fall back to 30 days.
+3. If still empty, fall back to a full scan.
+4. Surface the chosen window as `trajectory_scan_scope` in the
+   `trajectory_plugins` payload — one of `7d`, `30d`,
+   `full_fallback`, or `none` (no trajectory files).
+
+The human evidence body now shows `trajectory 扫描口径: <scope>` on the
+first line so operators can see at a glance whether the report came
+from a fresh window or an old one.
+
+### Unified `data_scope` / 数据口径 across every collector and inspector
+
+Every diagnostic report now declares — in machine- and human-readable
+form — exactly which data window/source it scanned. This was previously
+buried per-section ("7d cron run", "today's app log") and missing
+entirely from many modules.
+
+- New core type: `core.types.ScopeItem` (`source`, `window`, `detail?`)
+  on `Report.data_scope`, populated via `report.add_scope(...)` inside
+  each collector's `collect()`.
+- JSON renderer: every success envelope now carries a top-level
+  `data.data_scope` array of `{source, window, detail?}` objects.
+- Human renderer: a `数据口径` line appears in the banner (after `Time`,
+  before the first bar) when scope is non-empty, joined by ` · ` —
+  e.g. `trajectory:7d(240 runs) · 应用日志:今日(3) · 配置:当前`.
+- NDJSON renderer: emits a leading `{"kind":"scope","data_scope":[...]}`
+  line before any section line, so streaming consumers see the data
+  window first.
+- Per-module mapping (verified against current source):
+  `configuration` → config:current + trajectory:full;
+  `cron_jobs` → cron_store:current + trajectory:7d;
+  `doctor` → doctor:current;
+  `environment` → system:current + trajectory:14d;
+  `gateway` → gateway_status:current + trajectory:24h;
+  `performance` → trajectory:full + sessions:7d;
+  `plugin_diag` → app_logs:today + config:current + extensions:current
+  + trajectory:`<scan_scope>`;
+  `recent_errors` → journald:today + app_logs:today + trajectory:7d;
+  `run_health` → trajectory:full (windows 24h/7d/30d);
+  `sessions_diag` → sessions:full + app_logs:full + trajectory:full;
+  `shell_history` → shell_history:full;
+  `sys_health` → system:current;
+  `task_health` → tasks:current (orphan cutoff 24h);
+  `channel` → app_logs:7d;
+  inspectors `extract` / `trace` → session:`<id8>`;
+  `panorama` → session:`<id8>` + app_logs:session_window.
+
 ## v1.9.0 — channel collector reduced to a pure log scanner (2026-06-12)
 
 ### Breaking — `channel` no longer interprets config or runs network probes

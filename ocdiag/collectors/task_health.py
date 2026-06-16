@@ -466,6 +466,7 @@ class TaskHealthCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("tasks", "current", "orphan cutoff 24h")
 
         db_path = os.path.join(str(ctx.openclaw_home), "tasks", "runs.sqlite")
         report.data["db_path"] = db_path

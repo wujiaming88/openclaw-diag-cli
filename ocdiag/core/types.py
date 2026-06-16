@@ -68,6 +68,14 @@ class Section:
 
 
 @dataclass
+class ScopeItem:
+    """One declared data-source/window the collector actually read."""
+    source: str
+    window: str
+    detail: Optional[str] = None
+
+
+@dataclass
 class Report:
     """Complete output of one collector."""
     module_id: str
@@ -77,6 +85,14 @@ class Report:
     error: Optional[str] = None
     diag_error: Optional["DiagError"] = None
     data: Dict[str, Any] = field(default_factory=dict)
+    data_scope: List[ScopeItem] = field(default_factory=list)
+
+    def add_scope(
+        self, source: str, window: str, detail: Optional[str] = None,
+    ) -> "ScopeItem":
+        item = ScopeItem(source=source, window=window, detail=detail)
+        self.data_scope.append(item)
+        return item
 
     @property
     def verdict(self) -> Verdict:

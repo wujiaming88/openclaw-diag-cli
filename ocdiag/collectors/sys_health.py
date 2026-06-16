@@ -548,6 +548,7 @@ class SysHealthCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("system", "current")
         targets = _dns_targets_from_config(ctx)
         if not targets:
             targets = ["dns.google"]

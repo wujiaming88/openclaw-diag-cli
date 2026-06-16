@@ -150,6 +150,7 @@ class DoctorCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("doctor", "current")
 
         s_node = report.section("Doctor · Node.js")
         _section_node(s_node)

@@ -1363,6 +1363,8 @@ class CronJobsCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("cron_store", "current")
+        report.add_scope("trajectory", "7d")
 
         # We pull the legacy paths from $OPENCLAW_HOME (so test harnesses
         # that override only HOME/OPENCLAW_HOME continue to work) and the

@@ -174,6 +174,10 @@ class ExtractInspector:
             os.path.basename(files[0][0]).split(".jsonl", 1)[0] or session_id
         )
         report.data["session_id"] = full_session_id
+        report.add_scope(
+            "session", f"session:{full_session_id[:8]}",
+            f"{len(files)} files",
+        )
 
         # Pick which files to walk.
         if list_only:

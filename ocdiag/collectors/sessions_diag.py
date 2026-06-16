@@ -674,6 +674,9 @@ class SessionsDiagCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("sessions", "full", "active threshold 7d")
+        report.add_scope("app_logs", "full")
+        report.add_scope("trajectory", "full")
 
         s_inv = report.section("8.1 Session 文件清单")
         inv_data = _section_inventory(s_inv, str(ctx.sessions_base))

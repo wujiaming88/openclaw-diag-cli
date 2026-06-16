@@ -719,20 +719,50 @@ def _section_trajectory(
         s.ok(
             "plugin.trajectory",
             "未发现 trajectory 文件 — 跳过 trajectory 插件分析",
-            data={"trajectory_plugins": {"found": False}},
+            data={"trajectory_plugins": {
+                "found": False, "trajectory_scan_scope": "none",
+            }},
         )
-        return {"trajectory_plugins": {"found": False}}
+        return {"trajectory_plugins": {
+            "found": False, "trajectory_scan_scope": "none",
+        }}
 
-    runs = ctx.collect_runs()
-    runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
-    recent = [r for r in runs[:30] if r.plugin_entries]
+    # Layered scan: 7d → 30d → full. Stop at the first window that yields
+    # at least one run carrying plugin metadata.
+    scan_scope = "full_fallback"
+    recent: List = []
+    for window_label, window_ms in (
+        ("7d", 7 * 86400 * 1000),
+        ("30d", 30 * 86400 * 1000),
+    ):
+        runs = ctx.collect_runs(
+            since_ms=trajectory.ms_ago(window_ms),
+            mtime_prefilter=True,
+        )
+        runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
+        candidate = [r for r in runs[:30] if r.plugin_entries]
+        if candidate:
+            scan_scope = window_label
+            recent = candidate
+            break
+    if not recent:
+        runs = ctx.collect_runs()
+        runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
+        recent = [r for r in runs[:30] if r.plugin_entries]
+
     if not recent:
         s.ok(
             "plugin.trajectory",
             "最近 trajectory 中无 plugin metadata",
-            data={"trajectory_plugins": {"found": True, "samples": 0}},
+            data={"trajectory_plugins": {
+                "found": True, "samples": 0,
+                "trajectory_scan_scope": "full_fallback",
+            }},
         )
-        return {"trajectory_plugins": {"found": True, "samples": 0}}
+        return {"trajectory_plugins": {
+            "found": True, "samples": 0,
+            "trajectory_scan_scope": "full_fallback",
+        }}
 
     latest = recent[0]
     last_plugins = latest.plugin_entries
@@ -746,6 +776,7 @@ def _section_trajectory(
     ]
 
     body_lines = [
+        f"trajectory 扫描口径: {scan_scope}",
         f"最新 run: {latest.session_id[:8]}#{latest.run_id[:8]} | "
         f"插件 entries={len(last_plugins)} | "
         f"importedRuntimePluginIds={len(latest.imported_runtime_plugin_ids)}",
@@ -811,6 +842,7 @@ def _section_trajectory(
     summary = {
         "found": True,
         "samples": len(recent),
+        "trajectory_scan_scope": scan_scope,
         "latest_run": {
             "sessionId": latest.session_id,
             "runId": latest.run_id,
@@ -892,6 +924,14 @@ class PluginDiagCollector:
         configured, configured_status = _load_configured(str(ctx.config_path))
         extensions = _load_extensions(str(ctx.openclaw_home))
 
+        report.add_scope(
+            "app_logs", "today", f"{len(today_logs)} files",
+        )
+        report.add_scope("config", "current")
+        report.add_scope(
+            "extensions", "current", f"{len(extensions)} entries",
+        )
+
         if not configured_status.get("found", True):
             report.data["configured_status"] = configured_status
 
@@ -911,8 +951,14 @@ class PluginDiagCollector:
         report.data.update(_section_deps(s_deps, str(ctx.config_path)))
 
         s_traj = report.section("9.6 Trajectory 插件快照 + 漂移")
-        report.data.update(
-            _section_trajectory(s_traj, ctx, configured),
+        traj_payload = _section_trajectory(s_traj, ctx, configured)
+        report.data.update(traj_payload)
+        traj_summary = traj_payload.get("trajectory_plugins", {}) or {}
+        scan_scope = traj_summary.get("trajectory_scan_scope", "none")
+        traj_samples = traj_summary.get("samples", 0) or 0
+        report.add_scope(
+            "trajectory", scan_scope,
+            f"{traj_samples} runs" if traj_samples else None,
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

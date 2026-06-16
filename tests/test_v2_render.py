@@ -148,6 +148,93 @@ def test_ndjson_renderer_one_line_per_section():
     _check("ndjson second line verdict=fail", objs[1]["verdict"] == "fail")
 
 
+def test_json_envelope_data_scope_present():
+    r = Report(module_id="demo", title="Demo")
+    r.add_scope("trajectory", "7d", "240 runs")
+    r.add_scope("config", "current")
+    r.section("s").ok("a", "ok")
+    env = to_envelope(r)
+    scope = env["data"]["data_scope"]
+    _check("envelope data_scope is list", isinstance(scope, list))
+    _check("envelope data_scope has 2 items", len(scope) == 2)
+    _check(
+        "first scope shape",
+        scope[0] == {
+            "source": "trajectory", "window": "7d", "detail": "240 runs",
+        },
+        repr(scope[0]),
+    )
+    _check(
+        "second scope no detail key",
+        scope[1] == {"source": "config", "window": "current"},
+        repr(scope[1]),
+    )
+
+
+def test_json_envelope_data_scope_empty_when_no_scope():
+    r = Report(module_id="m", title="t")
+    r.section("s").ok("a", "ok")
+    env = to_envelope(r)
+    _check(
+        "envelope data_scope present and empty",
+        env["data"]["data_scope"] == [],
+    )
+
+
+def test_human_renderer_data_scope_line():
+    r = Report(module_id="m", title="t")
+    r.add_scope("trajectory", "7d", "240 runs")
+    r.add_scope("app_logs", "today", "3")
+    r.add_scope("config", "current")
+    r.section("s").ok("a", "ok")
+    out = strip_ansi(HumanRenderer(no_color=True).render(r))
+    _check("human shows 数据口径 label", "数据口径" in out)
+    _check("human shows trajectory:7d(240 runs)", "trajectory:7d(240 runs)" in out)
+    _check("human shows 应用日志:今日(3)", "应用日志:今日(3)" in out)
+    _check("human shows 配置:当前", "配置:当前" in out)
+
+
+def test_human_renderer_data_scope_omitted_when_empty():
+    r = Report(module_id="m", title="t")
+    r.section("s").ok("a", "ok")
+    out = strip_ansi(HumanRenderer(no_color=True).render(r))
+    _check("human omits 数据口径 when empty", "数据口径" not in out)
+
+
+def test_ndjson_renderer_emits_leading_scope_line():
+    from ocdiag.render.ndjson import NdjsonRenderer
+    r = Report(module_id="demo", title="Demo")
+    r.add_scope("trajectory", "7d", "5 runs")
+    r.section("first").ok("a", "all good")
+    buf = io.StringIO()
+    NdjsonRenderer(stream=buf).write(r)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    _check("ndjson emits 2 lines (scope + section)", len(lines) == 2)
+    first = json.loads(lines[0])
+    _check("ndjson first kind=scope", first.get("kind") == "scope")
+    _check("ndjson first module=demo", first["module"] == "demo")
+    _check(
+        "ndjson scope payload",
+        first["data_scope"]
+        == [{"source": "trajectory", "window": "7d", "detail": "5 runs"}],
+        repr(first["data_scope"]),
+    )
+    second = json.loads(lines[1])
+    _check("ndjson second is section", second.get("section") == "first")
+
+
+def test_ndjson_renderer_omits_scope_when_empty():
+    from ocdiag.render.ndjson import NdjsonRenderer
+    r = Report(module_id="m", title="t")
+    r.section("first").ok("a", "ok")
+    buf = io.StringIO()
+    NdjsonRenderer(stream=buf).write(r)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+    _check("ndjson emits 1 line when no scope", len(lines) == 1)
+    obj = json.loads(lines[0])
+    _check("ndjson line is section, not scope", obj.get("section") == "first")
+
+
 def test_ndjson_error_emits_single_line():
     from ocdiag.core.errors import DiagError
     from ocdiag.render.ndjson import NdjsonRenderer
@@ -173,6 +260,12 @@ def main():
     test_json_error_envelope()
     test_json_error_envelope_unstructured_fallback()
     test_ndjson_renderer_one_line_per_section()
+    test_json_envelope_data_scope_present()
+    test_json_envelope_data_scope_empty_when_no_scope()
+    test_human_renderer_data_scope_line()
+    test_human_renderer_data_scope_omitted_when_empty()
+    test_ndjson_renderer_emits_leading_scope_line()
+    test_ndjson_renderer_omits_scope_when_empty()
     test_ndjson_error_emits_single_line()
     print()
     if _failures:

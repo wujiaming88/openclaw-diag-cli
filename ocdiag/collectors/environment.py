@@ -472,6 +472,8 @@ class EnvironmentCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("system", "current")
+        report.add_scope("trajectory", "14d")
 
         s_ver = report.section("2.1 OpenClaw 版本")
         report.data.update(_section_versions(s_ver, ctx))

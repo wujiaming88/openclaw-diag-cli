@@ -54,6 +54,40 @@ _GLYPH = {Verdict.OK: "✓", Verdict.WARN: "⚠", Verdict.FAIL: "✗"}
 _COLOR = {Verdict.OK: ansi.GREEN, Verdict.WARN: ansi.YELLOW, Verdict.FAIL: ansi.RED}
 
 
+_SOURCE_ZH = {
+    "app_logs": "应用日志",
+    "journald": "系统日志",
+    "trajectory": "trajectory",
+    "config": "配置",
+    "cron_store": "cron存储",
+    "sessions": "会话",
+    "shell_history": "shell历史",
+    "system": "系统",
+    "doctor": "doctor",
+    "gateway_status": "gateway状态",
+    "tasks": "任务",
+    "extensions": "扩展",
+    "session": "会话",
+}
+
+_WINDOW_ZH = {
+    "today": "今日",
+    "current": "当前",
+    "full": "全量",
+    "full_fallback": "全量(兜底)",
+    "none": "无",
+}
+
+
+def _format_scope_item(source: str, window: str, detail: Optional[str]) -> str:
+    src = _SOURCE_ZH.get(source, source)
+    win = _WINDOW_ZH.get(window, window)
+    out = f"{src}:{win}"
+    if detail:
+        out += f"({detail})"
+    return out
+
+
 class HumanRenderer:
     def __init__(
         self,
@@ -85,13 +119,21 @@ class HumanRenderer:
         mod_label = self._c("Module", ansi.DIM)
         time_label = self._c("Time", ansi.DIM)
         mod_id = self._c(report.module_id, ansi.BOLD_WHITE)
-        return [
+        lines = [
             self._bar(),
             f"  {logo}  ·  {ver}",
             f"  {mod_label}    {mod_id}  ·  {report.title}",
             f"  {time_label}      {_now_string()}",
-            self._bar(),
         ]
+        if report.data_scope:
+            scope_label = self._c("数据口径", ansi.DIM)
+            scope_text = " · ".join(
+                _format_scope_item(si.source, si.window, si.detail)
+                for si in report.data_scope
+            )
+            lines.append(f"  {scope_label}  {scope_text}")
+        lines.append(self._bar())
+        return lines
 
     # ── verdict line ──
     def _verdict_line(self, report: Report) -> str:

@@ -170,6 +170,7 @@ class ConfigurationCollector:
         report = Report(module_id=self.id, title=self.title)
         config_path = str(ctx.config_path)
         report.data["config_path"] = config_path
+        report.add_scope("config", "current")
 
         s_load = report.section("3.1 加载")
         if not os.path.isfile(config_path):
@@ -227,6 +228,14 @@ class ConfigurationCollector:
         s_traj = report.section("3.3 Trajectory 最新 runtime config")
         report.data.update(
             _section_trajectory_runtime_config(s_traj, ctx),
+        )
+        try:
+            traj_runs_count = len(ctx.collect_runs())
+        except Exception:
+            traj_runs_count = 0
+        report.add_scope(
+            "trajectory", "full",
+            f"{traj_runs_count} runs" if traj_runs_count else None,
         )
 
         report.elapsed_ms = (time.time() - t0) * 1000

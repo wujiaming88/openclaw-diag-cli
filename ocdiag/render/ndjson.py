@@ -50,6 +50,20 @@ class NdjsonRenderer:
             }
             return
 
+        if report.data_scope:
+            yield {
+                "module": report.module_id,
+                "kind": "scope",
+                "data_scope": [
+                    {
+                        "source": si.source,
+                        "window": si.window,
+                        **({"detail": si.detail} if si.detail else {}),
+                    }
+                    for si in report.data_scope
+                ],
+            }
+
         for section in report.sections:
             yield {
                 "module": report.module_id,

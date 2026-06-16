@@ -311,6 +311,7 @@ class ChannelCollector:
     def collect(self, ctx: DiagContext, **kwargs) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("app_logs", "7d")
 
         # ``--account`` (substring filter on the message body). Both
         # the kwargs path (test direct calls) and ``ctx.account_id``

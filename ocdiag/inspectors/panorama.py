@@ -2543,6 +2543,15 @@ class PanoramaInspector:
             str(ctx.log_dir), window_start, window_end,
         )
 
+        report.add_scope(
+            "session", f"session:{full_session_id[:8]}",
+        )
+        if log_files:
+            report.add_scope(
+                "app_logs", "session_window",
+                f"{len(log_files)} files",
+            )
+
         sources_present: Dict[str, bool] = {
             "session.jsonl": True,
             "trajectory.jsonl": bool(traj_path),

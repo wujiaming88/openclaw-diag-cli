@@ -53,6 +53,7 @@ class ShellHistoryCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("shell_history", "full")
         unmask = ctx.unmask
 
         def maybe_sanitize(s: str) -> str:

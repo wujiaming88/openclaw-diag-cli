@@ -440,6 +440,9 @@ class TraceInspector:
         full_session_id = os.path.basename(session_file).split(".jsonl", 1)[0]
         report.data["session_id"] = full_session_id
         report.data["session_file"] = session_file
+        report.add_scope(
+            "session", f"session:{full_session_id[:8]}",
+        )
 
         records = load_records(session_file)
         if not records:

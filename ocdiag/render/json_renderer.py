@@ -85,6 +85,14 @@ def to_envelope(report: Report) -> Dict[str, Any]:
         "verdict": verdict.value,
         "summary": report.summary,
         "elapsed_ms": int(report.elapsed_ms),
+        "data_scope": [
+            {
+                "source": si.source,
+                "window": si.window,
+                **({"detail": si.detail} if si.detail else {}),
+            }
+            for si in report.data_scope
+        ],
         "sections": [_section_to_dict(s) for s in report.sections],
         "data": report.data,
         "status": legacy_status,

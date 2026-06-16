@@ -1218,6 +1218,8 @@ class PerformanceCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("trajectory", "full")
+        report.add_scope("sessions", "7d")
         sessions_base = str(ctx.sessions_base)
 
         session_files = _collect_session_files(sessions_base, limit=20)

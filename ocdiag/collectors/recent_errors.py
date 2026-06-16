@@ -528,6 +528,9 @@ class RecentErrorsCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("journald", "today")
+        report.add_scope("app_logs", "today")
+        report.add_scope("trajectory", "7d")
 
         s_app = report.section("5.1 应用日志")
         report.data.update(_section_app_logs(s_app, str(ctx.log_dir)))

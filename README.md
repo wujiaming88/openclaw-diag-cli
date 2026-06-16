@@ -180,6 +180,10 @@ Success:
     "verdict": "warn",
     "summary": {"pass": 5, "warn": 1, "fail": 0, "total": 6},
     "elapsed_ms": 1234,
+    "data_scope": [
+      {"source": "gateway_status", "window": "current"},
+      {"source": "trajectory", "window": "24h"}
+    ],
     "sections": [...],
     "data": {...},
     "status": "ok"
@@ -187,6 +191,15 @@ Success:
   "error": null
 }
 ```
+
+Every successful report carries a `data.data_scope` array describing the
+data window it actually scanned (e.g. `trajectory:7d`, `app_logs:today`,
+`session:<uuid8>`). Pretty output mirrors this with a `数据口径` line in
+the banner; NDJSON output emits a leading `{"kind":"scope", ...}` line
+before the section stream. `plugin_diag` additionally surfaces
+`data.trajectory_plugins.trajectory_scan_scope` (`7d` | `30d` |
+`full_fallback` | `none`) so callers can see which layered fallback
+window produced the result.
 
 Error:
 ```json

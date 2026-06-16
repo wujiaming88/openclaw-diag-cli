@@ -952,6 +952,8 @@ class GatewayCollector:
     def collect(self, ctx: DiagContext, **_) -> Report:
         t0 = time.time()
         report = Report(module_id=self.id, title=self.title)
+        report.add_scope("gateway_status", "current")
+        report.add_scope("trajectory", "24h")
 
         port = 18789
         port_source = "default"

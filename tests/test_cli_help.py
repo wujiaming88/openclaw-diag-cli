@@ -97,6 +97,47 @@ def test_trace_help_documents_all_messages():
     assert "OPENCLAW-DIAG" not in out
 
 
+def test_trace_argparse_rejects_all_messages_with_msg_index(capsys):
+    """v1.11.0: the argparse layer of cmd_inspector rejects
+    --all-messages combined with --msg-index/--msg-id/--msg-match BEFORE
+    the inspector ever runs. parser.error() emits to stderr and SystemExit(2).
+
+    The inspector layer also enforces the same mutex (see test_trace.py)
+    but a CLI user hits the argparse path first. Pin both layers.
+    """
+    with pytest.raises(SystemExit) as exc:
+        ocdiag_main.main([
+            "trace", "1234567890abcdef",
+            "--all-messages", "--msg-index", "0",
+        ])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--all-messages" in err
+    assert "--msg-index" in err
+
+
+def test_trace_argparse_rejects_all_messages_with_msg_id(capsys):
+    with pytest.raises(SystemExit) as exc:
+        ocdiag_main.main([
+            "trace", "1234567890abcdef",
+            "--all-messages", "--msg-id", "user-1",
+        ])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--all-messages" in err
+
+
+def test_trace_argparse_rejects_all_messages_with_msg_match(capsys):
+    with pytest.raises(SystemExit) as exc:
+        ocdiag_main.main([
+            "trace", "1234567890abcdef",
+            "--all-messages", "--msg-match", "hi",
+        ])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "--all-messages" in err
+
+
 def test_gateway_without_help_runs_without_attribute_error():
     """Regression guard for the v1.8.3 split.
 

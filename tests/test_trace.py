@@ -373,6 +373,503 @@ def test_session_level_enrichment_emitted_once(tmp_path: Path):
     assert sum(t == "Session · Gateway 计时" for t in titles) <= 1
 
 
+# ── richer-fixture coverage: tool execs / cache tokens / snippets / enrichment ─
+
+
+def _tool_call_assistant_msg(
+    aid: str, ts: int, record_ts: int, *,
+    tool_call_id: str, tool_name: str = "Bash",
+    in_tok: int = 10, out_tok: int = 5,
+    cache_read: int = 0, cache_write: int = 0,
+) -> Dict[str, Any]:
+    """Assistant message that emits a toolCall (stopReason=toolUse).
+
+    Used to seed analyze_phases with a real model_call → tool_exec batch
+    so the per-turn tool-breakdown section is rendered.
+    """
+    return {
+        "type": "message",
+        "id": aid,
+        "timestamp": _ms_to_iso(record_ts),
+        "message": {
+            "role": "assistant",
+            "timestamp": ts,
+            "model": "test-model",
+            "provider": "test",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": in_tok, "output": out_tok,
+                "cacheRead": cache_read, "cacheWrite": cache_write,
+            },
+            "content": [
+                {"type": "toolCall", "id": tool_call_id,
+                 "name": tool_name, "input": {"cmd": "ls"}},
+            ],
+        },
+    }
+
+
+def _tool_result_msg(rid: str, ts: int, *, tool_call_id: str,
+                     tool_name: str = "Bash",
+                     is_error: bool = False) -> Dict[str, Any]:
+    return {
+        "type": "message",
+        "id": rid,
+        "timestamp": _ms_to_iso(ts),
+        "message": {
+            "role": "toolResult",
+            "timestamp": ts,
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "isError": is_error,
+            "content": "stdout output",
+        },
+    }
+
+
+def _final_assistant_msg(
+    aid: str, ts: int, record_ts: int, *,
+    in_tok: int = 5, out_tok: int = 3,
+    cache_read: int = 0, cache_write: int = 0,
+) -> Dict[str, Any]:
+    """Assistant turn that closes the loop with stopReason=stop."""
+    msg = _assistant_msg(
+        aid, ts, record_ts, in_tok=in_tok, out_tok=out_tok,
+    )
+    msg["message"]["usage"]["cacheRead"] = cache_read
+    msg["message"]["usage"]["cacheWrite"] = cache_write
+    return msg
+
+
+def _build_rich_session_records(
+    *, num_turns: int, with_tools: bool = True,
+    cache_read: int = 0, cache_write: int = 0,
+) -> List[Dict[str, Any]]:
+    """Turns with: long user text + (optional) toolCall→toolResult batch +
+    a final assistant. Cache tokens propagate to summary aggregates so the
+    aggregate cache_read/cache_write lines fire.
+    """
+    records: List[Dict[str, Any]] = [
+        {"type": "session", "version": 3, "id": SESSION_ID,
+         "timestamp": _ms_to_iso(T0)},
+    ]
+    long_text = (
+        "this is a deliberately long user message "
+        + "x" * 200  # > 80 chars triggers the snippet truncation branch
+    )
+    for i in range(num_turns):
+        u_ts = T0 + i * 10_000
+        records.append(_user_msg(f"user-{i}", u_ts, long_text))
+        if with_tools:
+            tcall_id = f"tcall-{i}"
+            a1_ts = u_ts + 500
+            a1_rec_ts = u_ts + 1_000
+            records.append(_tool_call_assistant_msg(
+                f"asst-{i}-a", a1_ts, a1_rec_ts,
+                tool_call_id=tcall_id,
+                cache_read=cache_read, cache_write=cache_write,
+            ))
+            tr_ts = u_ts + 2_000
+            records.append(_tool_result_msg(
+                f"tr-{i}", tr_ts, tool_call_id=tcall_id,
+            ))
+            a2_ts = u_ts + 2_500
+            a2_rec_ts = u_ts + 3_000
+            records.append(_final_assistant_msg(
+                f"asst-{i}-b", a2_ts, a2_rec_ts,
+                cache_read=cache_read, cache_write=cache_write,
+            ))
+        else:
+            a_ts = u_ts + 1_000
+            a_rec_ts = u_ts + 2_000
+            records.append(_final_assistant_msg(
+                f"asst-{i}", a_ts, a_rec_ts,
+                cache_read=cache_read, cache_write=cache_write,
+            ))
+    return records
+
+
+def _build_rich_fixture(
+    tmp: Path, *, num_turns: int = 2, with_tools: bool = True,
+    cache_read: int = 0, cache_write: int = 0,
+) -> DiagContext:
+    home = tmp / "ocdiag-trace-rich"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    session_file = main_sd / f"{SESSION_ID}.jsonl"
+    _write_jsonl(
+        session_file,
+        _build_rich_session_records(
+            num_turns=num_turns, with_tools=with_tools,
+            cache_read=cache_read, cache_write=cache_write,
+        ),
+    )
+
+    cfg = home / "openclaw.json"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    return ctx
+
+
+def test_user_snippet_truncates_long_text(tmp_path: Path):
+    """A user message longer than the snippet max_chars (80) is truncated
+    with an ellipsis. Locks _user_text_snippet's truncation branch.
+    """
+    ctx = _build_rich_fixture(tmp_path, num_turns=1, with_tools=False)
+    report = _run_trace(ctx, session_id=SESSION_ID, all_messages=True)
+    assert report.error is None
+    snip = report.data["all_messages"][0]["user_message_snippet"]
+    # 80-char default → truncated to 79 chars + "…"
+    assert snip.endswith("…")
+    assert len(snip) == 80
+
+
+def test_per_turn_tool_breakdown_section_emitted(tmp_path: Path):
+    """Each --all-messages turn whose analysis carries tool_execs renders
+    its own ``Trace · 工具拆解`` section under the turn label.
+    """
+    ctx = _build_rich_fixture(tmp_path, num_turns=2, with_tools=True)
+    report = _run_trace(ctx, session_id=SESSION_ID, all_messages=True)
+    assert report.error is None
+    titles = [s.title for s in report.sections]
+    # Each of the 2 turns gets its own per-turn tool-breakdown section.
+    tool_sections = [t for t in titles if "Trace · 工具拆解" in t]
+    assert len(tool_sections) == 2, titles
+    # And both are turn-labelled (not the legacy single-turn title).
+    assert all(t.startswith("Turn #") for t in tool_sections)
+    # Per-turn payload also surfaces the tool exec for downstream consumers.
+    for t in report.data["all_messages"]:
+        assert t["tool_execs"], "expected tool_execs in turn payload"
+
+
+def test_aggregate_cache_token_lines_emitted(tmp_path: Path):
+    """Aggregate prints cache_read=/cache_write= only when any turn carries
+    cache tokens. Pin those two branches.
+    """
+    ctx = _build_rich_fixture(
+        tmp_path, num_turns=2, with_tools=False,
+        cache_read=42, cache_write=7,
+    )
+    report = _run_trace(ctx, session_id=SESSION_ID, all_messages=True)
+    assert report.error is None
+    assert report.data["aggregate"]["total_cache_read"] == 84
+    assert report.data["aggregate"]["total_cache_write"] == 14
+    agg_section = next(
+        s for s in report.sections if s.title == "Trace · 跨消息汇总"
+    )
+    tok_check = next(c for c in agg_section.checks if c.name == "agg.tokens")
+    assert "cache_read=84" in tok_check.message
+    assert "cache_write=14" in tok_check.message
+
+
+# ── enrichment branches: trajectory + system_prompt + gateway + slow E2E ───
+
+
+def _build_traj_records(sid: str, started_ms: int, ended_ms: int) -> List[Dict[str, Any]]:
+    base = {
+        "schemaVersion": 1, "traceSchema": "openclaw-trajectory",
+        "runId": "run-aaaa", "sessionId": sid,
+    }
+    return [
+        {**base, "type": "session.started",
+         "ts": _ms_to_iso(started_ms),
+         "data": {"trigger": "user", "toolCount": 5}},
+        {**base, "type": "trace.metadata",
+         "ts": _ms_to_iso(started_ms + 1),
+         "data": {
+            "model": {"provider": "test", "name": "test-model"},
+            "plugins": {"entries": []},
+         }},
+        {**base, "type": "model.completed",
+         "ts": _ms_to_iso(ended_ms - 200),
+         "data": {"compactionCount": 0,
+                  "promptCache": {"observation": {
+                      "broke": False, "cacheRead": 50}}}},
+        {**base, "type": "trace.artifacts",
+         "ts": _ms_to_iso(ended_ms - 100),
+         "data": {
+            "finalStatus": "ok",
+            "aborted": False, "externalAbort": False,
+            "timedOut": False, "idleTimedOut": False,
+            "timedOutDuringCompaction": False,
+            "timedOutDuringToolExecution": False,
+            "promptErrorSource": None,
+            "usage": {"input": 100, "output": 200,
+                      "cacheRead": 50, "cacheWrite": 30, "total": 380},
+            "itemLifecycle": {"startedCount": 1,
+                              "completedCount": 1, "activeCount": 0},
+            "didSendViaMessagingTool": False,
+            "messagingToolSentTargets": [],
+            "messagingToolSentTexts": [],
+            "successfulCronAdds": 0,
+            "toolMetas": [],
+         }},
+        {**base, "type": "session.ended",
+         "ts": _ms_to_iso(ended_ms),
+         "data": {"status": "ok"}},
+    ]
+
+
+def _build_enriched_fixture(
+    tmp: Path, *, slow: bool = False, with_traj: bool = True,
+    with_sp: bool = True, with_gw: bool = True,
+) -> DiagContext:
+    """Lay down session.jsonl + trajectory + sessions.json + a same-day
+    gateway log so trace's enrichment helpers (load_trajectory_info /
+    sessions.lookup_system_prompt_report / load_gateway_timing) all fire.
+
+    ``slow=True`` widens one turn's record_ts gap above SLOW_THRESHOLD_MS so
+    the slow-E2E WARN branch is exercised.
+    """
+    home = tmp / "ocdiag-trace-enriched"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    main_sd.mkdir(parents=True, exist_ok=True)
+    sid = SESSION_ID
+
+    # session.jsonl — 2 turns, second turn made slow when slow=True.
+    records: List[Dict[str, Any]] = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+    ]
+    # turn 0: ordinary
+    records.append(_user_msg("user-0", T0, "first"))
+    records.append(_assistant_msg("asst-0", T0 + 1000, T0 + 2000))
+    # turn 1: optionally slow
+    u1_ts = T0 + 100_000
+    records.append(_user_msg("user-1", u1_ts, "second"))
+    a1_msg_ts = u1_ts + 1_000
+    a1_rec_ts = u1_ts + (35_000 if slow else 2_000)
+    records.append(_assistant_msg("asst-1", a1_msg_ts, a1_rec_ts))
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+
+    # ② trajectory.jsonl — same dir, <uuid>.trajectory.jsonl
+    if with_traj:
+        traj_path = main_sd / f"{sid}.trajectory.jsonl"
+        _write_jsonl(traj_path, _build_traj_records(
+            sid, started_ms=T0, ended_ms=T0 + 5_000,
+        ))
+
+    # ③ sessions.json — sibling system-prompt store
+    if with_sp:
+        store = {
+            "agent:main:test:user:U-1": {
+                "sessionId": sid,
+                "systemPromptReport": {
+                    "systemPrompt": {
+                        "chars": 4321,
+                        "projectContextChars": 1000,
+                        "nonProjectContextChars": 3321,
+                    },
+                    "tools": {"entries": [], "schemaChars": 200},
+                    "skills": {"entries": []},
+                    "source": "test",
+                },
+            }
+        }
+        with open(main_sd / "sessions.json", "w", encoding="utf-8") as f:
+            json.dump(store, f)
+
+    # ④ openclaw-<base-date>.log — gateway timing
+    # base_date is derived via local epoch_ms_to_iso(base_epoch_ms)[:10],
+    # which means we have to write a log that the helper will accept. The
+    # safest deterministic path is to monkeypatch the log discovery in the
+    # test that needs it — see test_single_turn_enrichment_runs.
+    # We still write a file so find_gateway_logs has something to match.
+    if with_gw:
+        # Use the actual local-tz date prefix the loader will compute.
+        from ocdiag.tracing import epoch_ms_to_iso
+        base_date = epoch_ms_to_iso(T0)[:10]
+        gw_path = log_dir / f"openclaw-{base_date}.log"
+        # Build records the loader recognises.
+        run_start_iso = datetime.fromtimestamp(
+            T0 / 1000, tz=timezone.utc,
+        ).isoformat()
+        prompt_start_iso = datetime.fromtimestamp(
+            (T0 + 500) / 1000, tz=timezone.utc,
+        ).isoformat()
+        prompt_end_iso = datetime.fromtimestamp(
+            (T0 + 4000) / 1000, tz=timezone.utc,
+        ).isoformat()
+        with open(gw_path, "w", encoding="utf-8") as f:
+            for ts_iso, msg in [
+                (run_start_iso,
+                 f"agent/embedded embedded run start: sessionId={sid}"),
+                (prompt_start_iso,
+                 f"agent/embedded embedded run prompt start: sessionId={sid}"),
+                (prompt_end_iso,
+                 f"agent/embedded embedded run prompt end: "
+                 f"sessionId={sid} durationMs=3500"),
+            ]:
+                f.write(json.dumps({"time": ts_iso, "1": msg}) + "\n")
+
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    return ctx
+
+
+def test_single_turn_tool_breakdown_section_emitted(tmp_path: Path):
+    """Single-turn path with tool_execs renders ``Trace · 工具拆解``.
+
+    The legacy single-turn path is byte-identical to pre-1.11.0 output,
+    so this also pins the section title (no Turn # prefix) and the
+    presence of the per-tool aggregate line.
+    """
+    ctx = _build_rich_fixture(tmp_path, num_turns=1, with_tools=True)
+    report = _run_trace(ctx, session_id=SESSION_ID)
+    assert report.error is None
+    titles = [s.title for s in report.sections]
+    assert "Trace · 工具拆解" in titles
+    tools_section = next(
+        s for s in report.sections if s.title == "Trace · 工具拆解"
+    )
+    # The synthetic batch only ever uses Bash → exactly one aggregate line.
+    assert any(c.name == "tool.Bash" for c in tools_section.checks), [
+        c.name for c in tools_section.checks
+    ]
+
+
+def test_single_turn_enrichment_renders_all_three_sections(tmp_path: Path):
+    """Single-turn path with trajectory + system-prompt + gateway fixtures
+    on disk renders Trace · Trajectory / Trace · System Prompt /
+    Trace · Gateway 计时 sections, AND attaches firstCallInputTokens to the
+    system-prompt info (covers the firstCallInputTokens branch).
+
+    We pick ``msg_index=0`` so the first turn's base_epoch_ms (T0) is the
+    anchor — matching the trajectory's session.started ts. (The default
+    last-user-msg pick would anchor at T0+100s and load_trajectory_info
+    drops candidates whose session.started is more than 60s away.)
+    """
+    ctx = _build_enriched_fixture(tmp_path)
+    report = _run_trace(ctx, session_id=SESSION_ID, msg_index=0)
+    assert report.error is None
+    titles = [s.title for s in report.sections]
+    assert "Trace · Trajectory" in titles
+    assert "Trace · System Prompt" in titles
+    assert "Trace · Gateway 计时" in titles
+    # firstCallInputTokens: derived from the first model call's tokens_in
+    # + cache_read + cache_write — for our fixture that's 10 + 0 + 0 = 10.
+    sp = report.data["systemPrompt"]
+    assert sp["firstCallInputTokens"] == 10
+    # trajectory + gateway data are wired in too.
+    assert report.data["trajectory"]["runId"] == "run-aaaa"
+    assert "prompt_duration_ms" in report.data["gateway"]
+
+
+def test_single_turn_slow_e2e_emits_warn(tmp_path: Path):
+    """Single-turn path with E2E > 30s appends a slow-E2E WARN to the
+    summary section. Locks the warn branch at the bottom of the
+    single-turn render path.
+    """
+    home = tmp_path / "slow-single"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    main_sd.mkdir(parents=True, exist_ok=True)
+    sid = "55555555-1111-2222-3333-444444444444"
+
+    SLOW_GAP = 35_000
+    records: List[Dict[str, Any]] = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        _user_msg("user-0", T0, "slow turn"),
+        _assistant_msg("asst-0", T0 + 1000, T0 + SLOW_GAP),
+    ]
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+
+    report = _run_trace(ctx, session_id=sid)
+    assert report.error is None
+    summary = next(s for s in report.sections if s.title == "Trace · 汇总")
+    warns = [c for c in summary.checks if c.verdict == Verdict.WARN]
+    assert any(c.name == "trace.slow" for c in warns), [
+        c.name for c in summary.checks
+    ]
+
+
+def test_all_messages_session_level_enrichment_sections(tmp_path: Path):
+    """--all-messages + on-disk trajectory/sp/gateway → ONE Session · *
+    block at the top-level (covers the 887-894 enrichment branch).
+    """
+    ctx = _build_enriched_fixture(tmp_path)
+    report = _run_trace(ctx, session_id=SESSION_ID, all_messages=True)
+    assert report.error is None, f"unexpected error: {report.error}"
+    titles = [s.title for s in report.sections]
+    assert titles.count("Session · Trajectory") == 1
+    assert titles.count("Session · System Prompt") == 1
+    assert titles.count("Session · Gateway 计时") == 1
+    # And NOT the single-turn "Trace · " versions (those are single-turn-only).
+    assert "Trace · Trajectory" not in titles
+    assert "Trace · System Prompt" not in titles
+    assert "Trace · Gateway 计时" not in titles
+
+
+def test_turn_index_falls_back_to_ordinal_when_lookup_fails(
+    tmp_path: Path, monkeypatch,
+):
+    """Covers the StopIteration fallback in TraceInspector.collect.
+
+    select_user_message normally returns a (rec_idx, rec) pair pointing
+    into the user_msgs list; the inspector then re-derives ``turn_index``
+    from that ordinal. Pre-1.11.0 it was guaranteed to find a match, but
+    a hypothetical caller (extension, future SDK) could synthesise a
+    selector that produces a rec_idx absent from user_msgs. We pin the
+    fallback so the inspector still names the turn deterministically
+    instead of crashing.
+
+    To force the rare branch without altering production code we
+    monkeypatch find_user_messages so its (rec_idx, _) ordinals don't
+    contain the rec_idx that select_user_message returned. The actual
+    record at that rec_idx is still a real user message, so
+    extract_trace_records / analyze_phases run normally.
+    """
+    ctx = _build_fixture(tmp_path, num_turns=2)
+    from ocdiag.inspectors import trace as trace_mod
+
+    real_find = trace_mod.find_user_messages
+
+    def _shifted_find(records):
+        # Return a list whose rec_idx values are deliberately wrong so
+        # the lookup ``ri == rec_idx`` never matches.
+        msgs = real_find(records)
+        return [(ri + 100, r) for (ri, r) in msgs]
+
+    monkeypatch.setattr(trace_mod, "find_user_messages", _shifted_find)
+    # Default (msg_index=None) → select_user_message picks the LAST user
+    # msg from its OWN call to find_user_messages; inside ocdiag.tracing
+    # that import is unaffected by our patch, so it returns the real
+    # rec_idx. The inspector then walks our shifted list and the lookup
+    # falls into the StopIteration branch (turn_index = ordinal = 0).
+    report = _run_trace(ctx, session_id=SESSION_ID)
+    assert report.error is None
+    assert report.data["user_message_index"] == 0
+
+
 # ── pytest entry ──
 
 

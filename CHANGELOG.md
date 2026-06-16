@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.10.3 — regression test: full-cache reuse conclusion-equivalence (2026-06-16)
+
+Test-only release. No runtime change — the shipped package is byte-identical
+to v1.10.2 (the `files` whitelist excludes `tests/`). Tagged to mark the
+correctness verification of the v1.10.2 prefilter cache-reuse path.
+
+### Tests
+- `tests/test_cache_prefilter_reuse.py`: added
+  `test_top30_selection_identical_across_modes_when_enough_dated`. Stages 35
+  dated runs inside the 7d window plus 5 undated runs in an old-mtime file
+  (which the prefilter disk scan drops but the full-cache superset keeps), then
+  proves the top-30 selection (sorted by `started_ts_ms` desc) is IDENTICAL
+  between the full-cache-superset and prefilter-disk modes — so `plugin_diag`'s
+  `latest`/`recent` conclusions are mode-invariant and the only delta is
+  undated runs that never reach the top-30. Confirms full-cache reuse causes
+  no data inaccuracy. Suite: 199 passed, 1 skipped.
+
+
 ## v1.10.2 — prefilter requests reuse an existing full-scan cache (2026-06-16)
 
 Performance + docs fix for the `all` command. No behavior change to output

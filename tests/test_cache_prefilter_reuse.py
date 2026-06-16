@@ -209,3 +209,87 @@ def test_top30_selection_identical_across_modes_when_enough_dated():
         )
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── regression: old undated plugin run must never be labeled 7d/30d ──
+
+def _write_undated_plugin_run(path: Path, rid: str, mtime_epoch: float):
+    """Write ONE undated run (ts empty → started_ts_ms 0) that carries
+    plugin metadata via a trace.metadata event, in an old-mtime file."""
+    import os
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sid = f"sess-{rid}"
+    base = {
+        "traceSchema": "openclaw-trajectory", "schemaVersion": 1,
+        "traceId": sid, "source": "runtime", "sessionId": sid,
+        "sessionKey": f"agent:test:cli:direct:{rid}", "runId": rid,
+        "workspaceDir": "/tmp/ws", "provider": "p",
+        "modelId": "m", "modelApi": "a", "ts": "",
+    }
+    lines = [
+        {**base, "type": "session.started", "seq": 1, "sourceSeq": 1,
+         "data": {"trigger": "user"}},
+        {**base, "type": "trace.metadata", "seq": 2, "sourceSeq": 2,
+         "data": {"plugins": {"entries": [
+             {"id": "ghost-plugin", "name": "ghost", "version": "9.9.9",
+              "enabled": True, "activated": True, "status": "active"},
+         ]}}},
+        {**base, "type": "trace.artifacts", "seq": 3, "sourceSeq": 3,
+         "data": {"finalStatus": "success"}},
+    ]
+    with open(path, "w", encoding="utf-8") as f:
+        for ev in lines:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+    os.utime(path, (mtime_epoch, mtime_epoch))
+
+
+def _scan_scope_for(sessions_base: Path, prime_full_cache: bool) -> str:
+    from ocdiag.core import registry
+    registry.discover()
+    ctx = _ctx(sessions_base)
+    if prime_full_cache:
+        ctx.collect_runs()  # simulate the ``all`` path (configuration ran first)
+    report = registry.get("plugin_diag").collect(ctx)
+    return (report.data.get("trajectory_plugins") or {}).get(
+        "trajectory_scan_scope"
+    )
+
+
+def test_old_undated_plugin_run_not_labeled_window_hit():
+    """Fewer than 30 dated runs in 7d (none with plugin metadata) plus ONE
+    old-mtime UNDATED run that DOES carry plugin metadata. The windowed scan
+    must NOT label that stale undated run as a 7d/30d hit — in EITHER the
+    standalone (prefilter disk) mode or the ``all`` (full-cache superset)
+    mode. It may only surface via full_fallback.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ocdiag-ghost-"))
+    try:
+        sb = tmp / "agents"
+        target = sb / "main" / "sessions"
+        now = time.time()
+        # 3 DATED runs in 7d, NO plugin metadata, recent file mtime.
+        dated = [(f"dated-{i}", _iso_utc(now - (i + 1) * 3600)) for i in range(3)]
+        _write_runs(target / "dated.trajectory.jsonl", dated, now - 1800)
+        # 1 UNDATED run WITH plugin metadata, file mtime 60d ago.
+        _write_undated_plugin_run(
+            target / "ghost.trajectory.jsonl", "ghost-run", now - 60 * 86400,
+        )
+
+        standalone = _scan_scope_for(sb, prime_full_cache=False)
+        all_mode = _scan_scope_for(sb, prime_full_cache=True)
+
+        # The stale undated run must never be mistaken for a windowed hit.
+        assert standalone != "7d" and standalone != "30d", (
+            f"standalone mislabeled stale undated run: scope={standalone!r}"
+        )
+        assert all_mode != "7d" and all_mode != "30d", (
+            f"all/full-cache mislabeled stale undated run: scope={all_mode!r}"
+        )
+        # Both modes agree, and the only place the ghost surfaces is the
+        # unfiltered full fallback.
+        assert standalone == all_mode == "full_fallback", (
+            f"expected both modes == full_fallback; "
+            f"standalone={standalone!r} all={all_mode!r}"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

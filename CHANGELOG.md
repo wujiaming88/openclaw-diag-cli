@@ -1,5 +1,38 @@
 # Changelog
 
+## v1.10.4 — plugin_diag windowed scan filters to dated-in-window (2026-06-16)
+
+Minimal correctness hardening of the v1.10.2 full-cache reuse. The 7d/30d
+windowed trajectory scan now filters its `collect_runs` result to
+`r.started_ts_ms and r.started_ts_ms >= since` BEFORE sorting / top-30 /
+plugin_entries sampling.
+
+### Why
+`collect_runs` keeps undated runs (`started_ts_ms == 0`), and when served from
+a full-scan cache (the `all` path, after `configuration` ran) it also carries
+undated runs from old-mtime files that the standalone prefilter disk scan
+drops. In the edge case of FEWER than 30 dated runs in the window plus an old
+undated run that happens to carry plugin metadata, the full-cache path could
+let that stale run into the top-30 and mislabel it as a `7d`/`30d` hit — while
+standalone would not. Filtering to dated-in-window at the scan site:
+
+- makes the windowed sample (and `trajectory_runs_scanned`) byte-identical
+  across standalone and `all`/full-cache modes — measured 108 == 108;
+- prevents a stale undated plugin run from being mislabeled as a window hit;
+- keeps the full performance win (plugin_diag in `all` ~128ms vs ~540ms).
+
+The full fallback intentionally keeps the unfiltered view so sparse/old
+history (including undated runs) is still inspectable.
+
+### Tests
+- `tests/test_cache_prefilter_reuse.py`:
+  `test_old_undated_plugin_run_not_labeled_window_hit` — stages <30 dated runs
+  (no plugin metadata) plus one old-mtime undated run WITH plugin metadata;
+  asserts neither standalone nor `all`/full-cache labels it `7d`/`30d` (both
+  resolve to `full_fallback`). Verified to FAIL against pre-fix code (full-cache
+  mode returned `7d`) and PASS after. Suite: 200 passed, 1 skipped.
+
+
 ## v1.10.3 — regression test: full-cache reuse conclusion-equivalence (2026-06-16)
 
 Test-only release. No runtime change — the shipped package is byte-identical

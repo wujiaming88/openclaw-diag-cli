@@ -741,10 +741,21 @@ def _section_trajectory(
         ("7d", 7 * 86400 * 1000),
         ("30d", 30 * 86400 * 1000),
     ):
-        runs = ctx.collect_runs(
-            since_ms=trajectory.ms_ago(window_ms),
-            mtime_prefilter=True,
-        )
+        since = trajectory.ms_ago(window_ms)
+        runs = ctx.collect_runs(since_ms=since, mtime_prefilter=True)
+        # Restrict to DATED runs strictly inside the window BEFORE sampling.
+        # ``collect_runs`` keeps undated runs (started_ts_ms == 0), and when
+        # served from a full-scan cache (the ``all`` path) may additionally
+        # carry undated runs from old-mtime files that the standalone
+        # prefilter disk scan drops. Filtering here makes the windowed sample
+        # byte-identical across both modes and prevents an old undated run
+        # that happens to carry plugin metadata from being mislabeled as a
+        # "7d"/"30d" hit. (The full fallback below intentionally keeps the
+        # unfiltered view so sparse/old history is still inspectable.)
+        runs = [
+            r for r in runs
+            if r.started_ts_ms and r.started_ts_ms >= since
+        ]
         runs.sort(key=lambda r: r.started_ts_ms or 0, reverse=True)
         candidate = [r for r in runs[:30] if r.plugin_entries]
         if candidate:

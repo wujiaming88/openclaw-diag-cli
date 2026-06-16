@@ -123,3 +123,89 @@ def test_prefilter_disk_scans_when_no_full_cache():
         assert len(ks) >= 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── conclusion equivalence: top-30 selection is mode-invariant ──
+
+def _write_runs(path: Path, runs, mtime_epoch: float):
+    """Write a trajectory file holding many runs. ``runs`` is a list of
+    ``(run_id, ts_iso_or_empty)``; empty ts → undated run (started_ts_ms 0)."""
+    import os
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for rid, ts in runs:
+            sid = f"sess-{rid}"
+            base = {
+                "traceSchema": "openclaw-trajectory", "schemaVersion": 1,
+                "traceId": sid, "source": "runtime", "sessionId": sid,
+                "sessionKey": f"agent:test:cli:direct:{rid}", "runId": rid,
+                "workspaceDir": "/tmp/ws", "provider": "p",
+                "modelId": "m", "modelApi": "a", "ts": ts,
+            }
+            f.write(json.dumps({**base, "type": "session.started", "seq": 1,
+                                "sourceSeq": 1, "data": {"trigger": "user"}}) + "\n")
+            f.write(json.dumps({**base, "type": "trace.artifacts", "seq": 2,
+                                "sourceSeq": 2,
+                                "data": {"finalStatus": "success"}}) + "\n")
+    os.utime(path, (mtime_epoch, mtime_epoch))
+
+
+def _select_top30(runs):
+    runs = sorted(runs, key=lambda r: r.started_ts_ms or 0, reverse=True)
+    top30 = runs[:30]
+    return [r.run_id for r in top30]
+
+
+def test_top30_selection_identical_across_modes_when_enough_dated():
+    """When a window has >=30 dated runs, the undated runs that the superset
+    keeps (but the prefilter disk scan drops) must NEVER enter the top-30 —
+    so plugin_diag's latest/recent selection is byte-identical in both modes.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="ocdiag-concl-"))
+    try:
+        sb = tmp / "agents"
+        target = sb / "main" / "sessions"
+        now = time.time()
+        # 35 DATED runs within 7d (1..35 hours ago), recent file mtime.
+        dated = [
+            (f"dated-{i:02d}", _iso_utc(now - (i + 1) * 3600))
+            for i in range(35)
+        ]
+        _write_runs(target / "dated.trajectory.jsonl", dated, now - 1800)
+        # 5 UNDATED runs in an OLD-mtime file (60d ago) → prefilter drops it,
+        # superset (full scan) keeps it.
+        undated = [(f"undated-{i}", "") for i in range(5)]
+        _write_runs(target / "undated.trajectory.jsonl", undated, now - 60 * 86400)
+
+        since = traj.now_ms() - 7 * 86400 * 1000
+
+        ctxA = _ctx(sb)
+        disk = ctxA.collect_runs(since_ms=since, mtime_prefilter=True)
+        ctxB = _ctx(sb)
+        ctxB.collect_runs()  # prime full cache
+        sup = ctxB.collect_runs(since_ms=since, mtime_prefilter=True)
+
+        # The superset must carry the undated runs; the disk prefilter must not.
+        sup_undated = [r for r in sup if not r.started_ts_ms]
+        disk_undated = [r for r in disk if not r.started_ts_ms]
+        assert len(sup_undated) == 5, f"superset should keep 5 undated, got {len(sup_undated)}"
+        assert len(disk_undated) == 0, f"prefilter should drop old-file undated, got {len(disk_undated)}"
+
+        # Dated-in-window sets identical.
+        dated_disk = sorted(r.run_id for r in disk if r.started_ts_ms)
+        dated_sup = sorted(r.run_id for r in sup if r.started_ts_ms)
+        assert dated_disk == dated_sup, "dated-in-window sets must be identical"
+
+        # THE KEY ASSERTION: top-30 selection identical → latest/recent invariant.
+        top_disk = _select_top30(disk)
+        top_sup = _select_top30(sup)
+        assert top_disk == top_sup, (
+            f"top-30 selection diverged between modes:\n"
+            f"  disk={top_disk}\n  sup ={top_sup}"
+        )
+        # And no undated run reached the top-30 in either mode.
+        assert all(rid.startswith("dated-") for rid in top_sup), (
+            f"undated run leaked into top-30: {top_sup}"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)

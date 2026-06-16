@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.10.2 — prefilter requests reuse an existing full-scan cache (2026-06-16)
+
+Performance + docs fix for the `all` command. No behavior change to output
+contents; pure cache-reuse optimization plus a stale-comment correction.
+
+### `collect_runs` prefilter reuse
+
+Before: in `openclaw-diag all`, `configuration` (and `performance`) populate
+the full-scan trajectory cache early, yet `plugin_diag`'s 7d `mtime_prefilter`
+request still hit disk for a fresh windowed scan (~540ms observed) because the
+superset-reuse path explicitly excluded `mtime_prefilter=True` requests.
+
+Now: any windowed request (`since_ms` set, no per-file limit) — INCLUDING
+`mtime_prefilter=True` — is served IN MEMORY from an EXISTING full-scan cache
+when one is present. A prefilter request only falls through to the real
+prefilter DISK scan when NO full cache exists (the standalone fast path). When
+served from the full cache the result is the superset of a prefilter disk scan
+(undated runs in old-mtime files are kept); all current windowed consumers
+tolerate that (gateway counts dated runs only; plugin_diag takes the top-30
+dated runs).
+
+Measured: `plugin_diag` inside `all` dropped from ~540ms to ~100ms. Standalone
+`plugin_diag` is unchanged (still does its 7d/30d prefilter disk scan).
+
+Zero-deviation note: the displayed scope count still equals exactly what was
+consumed in each run. The count may legitimately differ between modes
+(`all` reuses the full-cache superset; standalone uses the prefilter subset),
+but the `7d` window token is identical and each displayed count matches its
+own scan.
+
+### Fixes
+- `ocdiag/core/context.py`: corrected the `collect_runs` docstring — `plugin_diag`
+  is no longer listed as a no-window caller (it has been a windowed 7d→30d
+  prefilter caller since v1.10.0); documented the new prefilter-reuse path and
+  the superset semantics.
+
+### Tests
+- New `tests/test_cache_prefilter_reuse.py` (pytest): proves a prefilter request
+  reuses an existing full cache (same Run objects, no disk re-scan) and that a
+  prefilter request with no full cache does a real disk scan without fabricating
+  a full-scan cache entry. Suite: 198 passed, 1 skipped.
+
+
 ## v1.10.1 — data_scope zero-drift: derive window/counts from actual scan (2026-06-16)
 
 A correctness fix on top of v1.10.0. The owner's hard requirement: the

@@ -92,31 +92,36 @@ class DiagContext:
     ) -> List[Any]:
         """Memoized ``trajectory.collect_runs`` keyed on its arg tuple.
 
-        The five no-window callers (performance.py x2, configuration,
-        plugin_diag, run_health) all share key
+        The no-window callers (performance.py x2, configuration,
+        run_health) all share key
         ``(None, None, False, False)`` — the first call populates the cache,
         the rest are hits. Windowed callers (gateway 24h,
-        cron_jobs/recent_errors 7d, environment 14d) each have a distinct
-        ``since_ms``; in the ``all`` command they reuse the cached full scan
-        via the superset path below (zero disk I/O). ``populate_raw`` MUST be
+        cron_jobs/recent_errors 7d, environment 14d, plugin_diag 7d→30d via
+        ``mtime_prefilter``) each have a distinct ``since_ms``; in the ``all``
+        command they reuse the cached full scan via the superset path below
+        (zero disk I/O), prefilter requests included. ``populate_raw`` MUST be
         in the key — a raw-less cached entry would silently miss raw fields
-        for a raw caller. ``mtime_prefilter`` is keyed too because a
-        prefiltered result is a SUBSET (drops undated runs in old files) and
-        must not pollute the complete-set keys.
+        for a raw caller. ``mtime_prefilter`` is keyed too: a fresh prefilter
+        DISK scan is a SUBSET (drops undated runs in old files) and must not
+        pollute the complete-set keys; a prefilter request served from the
+        full cache instead yields the superset (keeps undated runs).
 
         Two reuse paths, in order:
 
         1) Exact key hit → return shallow copy.
-        2) Superset reuse: a windowed (``since_ms`` is not None,
-           ``limit_per_file is None``, ``mtime_prefilter=False``) request,
+        2) Superset reuse: any windowed request (``since_ms`` is not None,
+           ``limit_per_file is None``), REGARDLESS of ``mtime_prefilter``,
            when a full-scan entry under
            ``(None, None, populate_raw, False)`` already exists, is served
            by filtering that cached list IN MEMORY using the EXACT predicate
            from ``trajectory.collect_runs``: keep iff
-           ``(not r.started_ts_ms) or (r.started_ts_ms >= since_ms)``. The
-           filtered subset is identical (same Run objects, set-equal) to a
-           fresh ``trajectory.collect_runs(files, since_ms=...)``. We cache
-           it under the exact requested key to dedup repeat lookups.
+           ``(not r.started_ts_ms) or (r.started_ts_ms >= since_ms)``. For a
+           non-prefilter request the filtered list is set-equal to a fresh
+           ``trajectory.collect_runs(files, since_ms=...)``; for a prefilter
+           request it is a SUPERSET of the prefilter disk scan (keeps undated
+           runs the mtime floor would have skipped). We cache it under the
+           exact requested key to dedup repeat lookups. A prefilter request
+           only reaches Path 3 when NO full scan is cached (standalone path).
         3) Disk scan fall-through. When ``mtime_prefilter=True`` and
            ``since_ms`` is not None, only files whose mtime is at or after
            ``since_ms - _MTIME_PREFILTER_GRACE_MS`` are scanned (the grace
@@ -139,14 +144,20 @@ class DiagContext:
         if cached is not None:
             return list(cached)
 
-        # Path 2: superset reuse — a windowed query (no per-file limit, no
-        # prefilter) can be served from a cached full scan with the same
-        # ``populate_raw``. Predicate mirrors trajectory.collect_runs exactly,
-        # INCLUDING keeping undated runs (started_ts_ms == 0).
+        # Path 2: superset reuse — any windowed query (no per-file limit) can
+        # be served from a cached full scan with the same ``populate_raw``,
+        # INCLUDING prefilter requests. We only reuse an EXISTING full cache;
+        # a prefilter request with no full cache falls through to the Path 3
+        # fast disk scan (the standalone path). When a prefilter request is
+        # served here it yields the SUPERSET of a prefilter disk scan (keeps
+        # undated runs the mtime floor would skip) — all current windowed
+        # consumers tolerate that (gateway counts dated runs only; plugin_diag
+        # takes the top-30 dated runs). Predicate mirrors
+        # trajectory.collect_runs exactly, INCLUDING keeping undated runs
+        # (started_ts_ms == 0).
         if (
             since_ms is not None
             and limit_per_file is None
-            and not mtime_prefilter
         ):
             full_key = (None, None, populate_raw, False)
             full_cached = self._trajectory_cache.get(full_key)

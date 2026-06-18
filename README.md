@@ -126,6 +126,7 @@ openclaw-diag trace <uuid>                    # Last user message
 openclaw-diag trace <uuid> --msg-index 0      # First message
 openclaw-diag trace <uuid> --msg-match "deploy"  # Match by content
 openclaw-diag trace <uuid> --all-messages     # Every user turn, one block each
+openclaw-diag trace <uuid> -A --format json   # Same (-A = --all-messages), JSON output
 openclaw-diag trace <uuid> --no-trajectory    # Skip trajectory enrichment
 
 # Extract: dump session content
@@ -289,6 +290,10 @@ openclaw-diag performance --format json | jq '.data.data.model_p95_max'
 
 # Trace a slow message
 openclaw-diag trace abc12345 --msg-index 0
+
+# Trace EVERY user turn in one run (one block each) — handy for whole-session review
+openclaw-diag trace abc12345 --all-messages
+openclaw-diag trace abc12345 -A --format json
 
 # Export session and pipe to file
 openclaw-diag extract abc12345 > session-dump.txt

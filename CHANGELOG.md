@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.12.2 — Node launcher help/banner switched to English (2026-06-18)
+
+`v1.12.1` translated the Python (`ocdiag.main`) help, but the npm entry point
+is the Node launcher (`bin/openclaw-diag.js`), which intercepts `--help` and a
+few other paths with its own static text — those were still Chinese. This patch
+fixes the user-facing npm entry so it is fully English.
+
+### Changes
+
+Only `bin/openclaw-diag.js` is touched.
+
+1. `openclaw-diag --help` / `-h` no longer prints a divergent Node-side help.
+   It now delegates to the Python dispatcher's rich English `--help`
+   (single source of truth = `ocdiag/main.py`, axiom #3). The duplicated
+   `printHelp()` and now-unused `fetchModules()` helpers were removed.
+2. No-argument entry banner + `Common commands:` block translated to English.
+3. `skill-install --help` static help translated to English.
+4. Python-not-found error message translated to English.
+
+No Python/test changes; `pytest tests/` remains green (237 passed, 1 skipped).
+
 ## v1.12.1 — --help / list / examples output switched to English (2026-06-18)
 
 `v1.12.0` made the help comprehensive but in Chinese. This patch translates

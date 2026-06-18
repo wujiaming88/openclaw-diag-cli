@@ -45,54 +45,16 @@ function findPython() {
 }
 
 function pythonNotFound() {
-  console.error('Error: 需要 Python 3.8+ 但未找到。');
+  console.error('Error: Python 3.8+ is required but was not found.');
   console.error('  Linux:   sudo apt install python3   /   sudo yum install python3');
-  console.error('  macOS:   brew install python3       /   或从 https://www.python.org/downloads/ 安装');
-  console.error('  Windows: https://www.python.org/downloads/  （记得勾上 "Add to PATH"）');
-  console.error('  装完后再次运行 openclaw-diag 即可。');
+  console.error('  macOS:   brew install python3       /   or install from https://www.python.org/downloads/');
+  console.error('  Windows: https://www.python.org/downloads/  (be sure to check "Add to PATH")');
+  console.error('  Re-run openclaw-diag once Python is installed.');
   process.exit(127);
-}
-
-function fetchModules(pyCmd) {
-  const r = spawnSync(pyCmd, [DISPATCHER, 'list', '--json'], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (r.status !== 0) return null;
-  try {
-    return JSON.parse((r.stdout || '').toString());
-  } catch (_) {
-    return null;
-  }
 }
 
 function printVersion() {
   console.log(PKG.version);
-}
-
-function printHelp(modules) {
-  const state = modules ? modules.state_collectors.map((m) => m.id) : [];
-  const obj = modules ? modules.object_inspectors.map((m) => m.id) : [];
-  const lines = [
-    'openclaw-diag — OpenClaw 诊断工具箱',
-    '',
-    '用法：',
-    '  openclaw-diag                          打印 banner + 诊断目录',
-    '  openclaw-diag <id> [args...]           跑单个诊断',
-    '  openclaw-diag all [--skip a,b]         跑全部 state collectors',
-    '  openclaw-diag list                     列出所有诊断',
-    '  openclaw-diag doctor                   检查 Node / Python / 环境',
-    '  openclaw-diag --version                打印版本号',
-    '  openclaw-diag --help                   本帮助',
-    '',
-    '扫描类（无需参数）：',
-    '  ' + (state.length ? state.join('  ') : '（无法连接到 Python）'),
-    '',
-    '对象类（需要 session uuid）：',
-    '  ' + (obj.length ? obj.join('  ') : '（无法连接到 Python）'),
-    '',
-    '常用 flag：--json（结构化输出）  --no-color（关掉颜色）  --unmask（不脱敏）',
-  ];
-  console.log(lines.join('\n'));
 }
 
 function spawnDispatcher(pyCmd, args) {
@@ -134,16 +96,16 @@ function main() {
 
   if (argv.length === 0) {
     if (!py) pythonNotFound();
-    console.log(`openclaw-diag v${PKG.version} — OpenClaw 诊断工具箱`);
+    console.log(`openclaw-diag v${PKG.version} — OpenClaw operations diagnostics CLI`);
     console.log('');
     spawnSync(py.cmd, [DISPATCHER, 'list'], { stdio: 'inherit' });
     console.log('');
-    console.log('常用命令：');
-    console.log('  openclaw-diag gateway           跑单个 state collector');
-    console.log('  openclaw-diag all               全部 state collectors');
-    console.log('  openclaw-diag trace <uuid>      追踪一条用户消息');
-    console.log('  openclaw-diag doctor            检查环境');
-    console.log('  openclaw-diag --help            完整帮助');
+    console.log('Common commands:');
+    console.log('  openclaw-diag gateway           Run a single state collector');
+    console.log('  openclaw-diag all               Run all state collectors');
+    console.log('  openclaw-diag trace <uuid>      Trace one user message');
+    console.log('  openclaw-diag doctor            Check the environment');
+    console.log('  openclaw-diag --help            Full help');
     process.exit(0);
   }
 
@@ -155,8 +117,10 @@ function main() {
   }
   if (head === '--help' || head === '-h') {
     if (!py) pythonNotFound();
-    printHelp(fetchModules(py.cmd));
-    process.exit(0);
+    // Single source of truth for help is ocdiag/main.py (axiom #3): delegate
+    // to the Python dispatcher's rich --help instead of duplicating it here.
+    const r = spawnSync(py.cmd, [DISPATCHER, '--help'], { stdio: 'inherit' });
+    process.exit(r.status == null ? 1 : r.status);
   }
 
   if (!py) pythonNotFound();
@@ -173,14 +137,14 @@ function main() {
     // actually run the install — we print our own help here and exit.
     if (skillArgs.includes('--help') || skillArgs.includes('-h')) {
       const help = [
-        'openclaw-diag skill-install — 把 openclaw-diag 技能安装到支持的 agent 框架',
+        'openclaw-diag skill-install — install the openclaw-diag skill into supported agent frameworks',
         '',
-        '用法：',
-        '  openclaw-diag skill-install              安装到所有已检测到的框架',
-        '  openclaw-diag skill-install --dry-run    只打印将写入的目标路径，不写文件',
-        '  openclaw-diag skill-install --help       本帮助',
+        'Usage:',
+        '  openclaw-diag skill-install              Install into every detected framework',
+        '  openclaw-diag skill-install --dry-run    Print target paths only; write nothing',
+        '  openclaw-diag skill-install --help       This help',
         '',
-        '安装目标（仅当对应目录存在时写入）：',
+        'Install targets (written only when the directory exists):',
         '  OpenClaw:    ~/.openclaw/skills/openclaw-diag/SKILL.md',
         '  Claude Code: ~/.claude/commands/openclaw-diag.md',
         '  Codex:       ~/.codex/instructions/openclaw-diag.md',

@@ -1,5 +1,46 @@
 # Changelog
 
+## v1.12.1 — --help / list / examples output switched to English (2026-06-18)
+
+`v1.12.0` made the help comprehensive but in Chinese. This patch translates
+every custom help string surfaced by `--help` (top-level + each subcommand +
+each collector/inspector), `openclaw-diag list`, and `openclaw-diag examples`
+to clear English. argparse framework strings (`usage:`, `options:`, `-h, --help`)
+were already English and are unchanged.
+
+### Changes
+
+Only `ocdiag/main.py` + `tests/test_cli_help.py` are touched. Collectors /
+inspectors business logic, collector `title` attributes, and report rendering
+are untouched.
+
+1. `_COMMAND_DESC` values translated to English; `_desc()` unchanged.
+2. `_common_arguments` group renamed to `"global options"`; every flag
+   (`--config` / `--log-dir` / `--sessions-base` / `--openclaw-home` /
+   `--format` / `--json` / `--no-color` / `--unmask`) carries an English help
+   string. The `channel options` group + `--account` help are also English.
+3. `trace` / `extract` / `panorama` parsers: per-command group headers
+   (`trace options`, `extract options`, `panorama options`), every flag's
+   help text, and the `Examples:` epilog blocks are all English. Description
+   line uses the English `_desc()` only — the Chinese collector `title` no
+   longer leaks into help.
+4. `_print_help()` rewritten in English (intro / Usage / Health checks / Scan
+   diagnostics / Object diagnostics / Helper commands / Global options /
+   Exit codes / More).
+5. `cmd_list` pretty + json outputs are fully English. The json `label` field
+   now mirrors the English description (no Chinese title leak).
+6. `cmd_examples()` translated; example commands themselves are unchanged.
+7. Per-collector `<id> --help` description switched from
+   `f"{coll.title} ({coll.id}) — {desc}"` to `f"{desc} ({coll.id})"` so the
+   Chinese title is never printed.
+8. Error messages: `"Error: 未知 ..."` -> `"Error: unknown ..."` and the
+   "run `openclaw-diag list`..." hint translated.
+
+### Tests
+
+`tests/test_cli_help.py`: every assertion that pinned a Chinese substring is
+swapped to its English equivalent. Test intent is preserved 1:1.
+
 ## v1.12.0 — --help 全面改造：命令/参数清晰说明 + 分组 + 退出码 (2026-06-18)
 
 让 `--help`（顶层 + 每个子命令 + 每个 collector/inspector）对**用户和 agent 都

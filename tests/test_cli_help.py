@@ -150,124 +150,140 @@ def _capture_stdout(argv):
 
 
 # -----------------------------------------------------------------------------
-# v1.12.0 — --help 全面改造
+# v1.12.1 — top-level / per-command --help is fully English
 # -----------------------------------------------------------------------------
 
 def test_top_level_help_has_key_sections():
-    """顶层 help 必须包含工具简介、体检命令、扫描类、对象诊断、辅助命令、
-    全局选项、退出码这些 section 标题；这是 agent / 用户能否快速定位的命脉。"""
+    """The top-level help must include the intro, health checks, scan
+    diagnostics, object diagnostics, helper commands, global options, and
+    exit codes section headers — these are the agent's / user's anchor points."""
     _, out = _capture_stdout(["--help"])
-    assert "OpenClaw 运维诊断 CLI" in out
-    assert "用法:" in out
-    assert "体检命令:" in out
-    assert "扫描类诊断" in out
-    assert "对象诊断" in out
-    assert "辅助命令:" in out
-    assert "全局选项" in out
-    assert "退出码:" in out
-    # 退出码四档全部要列出来
+    assert "OpenClaw operations diagnostics CLI" in out
+    assert "Usage:" in out
+    assert "Health checks:" in out
+    assert "Scan diagnostics" in out
+    assert "Object diagnostics" in out
+    assert "Helper commands:" in out
+    assert "Global options" in out
+    assert "Exit codes:" in out
+    # All four exit codes must be listed.
     for code in ("0", "1", "2", "3"):
         assert code in out
 
 
 def test_top_level_help_lists_every_state_collector_id():
-    """顶层 help 用 registry 动态渲染扫描类列表，必须覆盖每一个已注册的
-    state collector id —— 防止未来新增 collector 漏排。"""
+    """The top-level help renders the scan list dynamically from the registry
+    and must cover every registered state collector id — guards against a
+    newly added collector being silently dropped from --help."""
     ocdiag_registry.discover()
     _, out = _capture_stdout(["--help"])
     state_ids = [c.id for c in ocdiag_registry.all_state()]
-    # 至少应有 14 个 state collector，避免 registry 空导致断言假阳性通过。
+    # At least 10 state collectors expected, so an empty registry can't pass.
     assert len(state_ids) >= 10, f"unexpectedly few state collectors: {state_ids}"
     for sid in state_ids:
         assert sid in out, f"collector id {sid!r} missing from top-level --help"
 
 
 def test_top_level_help_lists_inspectors():
-    """对象诊断段必须列出 trace/extract/panorama 三个 inspector。"""
+    """Object diagnostics section must list the trace/extract/panorama trio."""
     _, out = _capture_stdout(["--help"])
     for iid in ("trace", "extract", "panorama"):
         assert iid in out, f"inspector {iid!r} missing from top-level --help"
 
 
 def test_trace_help_documents_previously_bare_flags():
-    """v1.12.0 给 trace 的 5 个 flag 补了 help —— 不能再是裸 flag。
-    断言对应中文 help 片段出现，而不只是 flag 名（flag 名在 usage 行也会出现）。"""
+    """trace's previously-bare flags must each carry an English help string;
+    the per-command group header and the description one-liner must show too."""
     out = _capture_help(["trace", "--help"])
-    # 命令专属分组标题
-    assert "trace 选项" in out
-    # 5 个之前没有 help 的 flag，每个都要带可读说明
-    assert "不读取 trajectory.jsonl" in out          # --no-trajectory
-    assert "不关联 openclaw 应用日志" in out         # --no-log
-    assert "完整 meta 信息" in out                    # --show-tool-metas
-    assert "插件快照" in out                          # --show-plugin-snapshot
-    assert "强制脱敏" in out                          # --mask
-    # description 一句话简介必须出现
-    assert "追踪一条用户消息的完整生命周期" in out
+    # Per-command group header
+    assert "trace options" in out
+    # The 5 flags that previously had no help text — assert each English snippet
+    assert "Do not read trajectory.jsonl" in out          # --no-trajectory
+    assert "Do not correlate openclaw application logs" in out  # --no-log
+    assert "Show full meta for each toolCall" in out      # --show-tool-metas
+    assert "Show plugin snapshot" in out                  # --show-plugin-snapshot
+    assert "Force masking" in out                         # --mask
+    # description one-liner must appear
+    assert "Trace one user message's full lifecycle" in out
 
 
 def test_collector_help_shows_global_options_with_descriptions():
-    """collector 的 --help 应能看到「全局选项」分组，且 --config / --unmask
-    等 flag 不再光秃秃，每个都带中文 help 文本。"""
+    """A collector's --help must show the "global options" group, and every
+    flag (--config / --unmask / ...) must carry an English help line."""
     out = _capture_help(["gateway", "--help"])
-    assert "全局选项" in out
-    assert "openclaw.json 配置文件路径" in out      # --config
-    assert "不脱敏" in out                           # --unmask
-    assert "关闭 ANSI 颜色" in out                  # --no-color
-    assert "OpenClaw 日志目录" in out                # --log-dir
-    assert "sessions 根目录" in out                  # --sessions-base
-    assert "OpenClaw 主目录" in out                  # --openclaw-home
+    assert "global options" in out
+    assert "Path to openclaw.json" in out                 # --config
+    assert "Do not mask" in out                           # --unmask
+    assert "Disable ANSI color" in out                    # --no-color
+    assert "OpenClaw log directory" in out                # --log-dir
+    assert "Sessions root directory" in out               # --sessions-base
+    assert "OpenClaw home directory" in out               # --openclaw-home
 
 
 def test_collector_help_description_includes_one_liner():
-    """gateway --help 顶部 description 要把 _COMMAND_DESC 里的一句话拼上，
-    用户/agent 不必再去 list 查 collector 是干嘛的。"""
+    """gateway --help description must surface the one-liner from
+    _COMMAND_DESC, no Chinese title leaked through."""
     out = _capture_help(["gateway", "--help"])
-    # description 行通常长这样: "Gateway 状态 (gateway) — 分析 Gateway 进程..."
+    # description line looks like: "Analyze Gateway process lifecycle ... (gateway)"
     assert "(gateway)" in out
-    assert "Gateway 进程生命周期" in out
+    assert "Gateway process lifecycle" in out
 
 
 def test_list_pretty_includes_command_descriptions():
-    """`openclaw-diag list` 的 pretty 输出要在每个 id 后面带描述片段。"""
+    """`openclaw-diag list` pretty output must include the description text
+    after each id (one scan + one inspector sample)."""
     rc, out = _capture_stdout(["list"])
     assert rc == 0
-    # 取一条扫描类 + 一条对象类各验一句话片段
-    assert "Gateway 进程生命周期" in out                 # gateway
-    assert "追踪一条用户消息的完整生命周期" in out       # trace
+    assert "Gateway process lifecycle" in out                            # gateway
+    assert "Trace one user message's full lifecycle" in out              # trace
 
 
 def test_extract_help_documents_options_and_groups():
-    """extract --help 应有 description / 命令分组 / 每个 flag 的中文 help。"""
+    """extract --help must carry description / per-command group / English
+    help line for every flag."""
     out = _capture_help(["extract", "--help"])
     assert "usage: openclaw-diag extract" in out
-    assert "extract 选项" in out
-    assert "可读格式" in out  # description 一句话片段
-    # 各 flag 的 help 文案
-    assert "只打印每文件的记录条数统计" in out          # --summary
-    assert "导出全部版本" in out                        # --all
-    assert "只列出匹配到的文件" in out                  # --list
-    assert "按记录类型过滤" in out                      # --types
-    # 全局选项分组与 --config help 都得在
-    assert "全局选项" in out
-    assert "openclaw.json 配置文件路径" in out
+    assert "extract options" in out
+    assert "readable form" in out                                    # description fragment
+    # Each flag's help text
+    assert "Per-file record-count summary" in out                    # --summary
+    assert "Export all versions" in out                              # --all
+    assert "List matching files only" in out                         # --list
+    assert "Filter by record type" in out                            # --types
+    # global options group + --config help must be present
+    assert "global options" in out
+    assert "Path to openclaw.json" in out
 
 
 def test_panorama_help_documents_options_and_groups():
-    """panorama --help 同样要有完整说明。"""
+    """panorama --help must carry the same level of detail as extract."""
     out = _capture_help(["panorama", "--help"])
     assert "usage: openclaw-diag panorama" in out
-    assert "panorama 选项" in out
-    assert "全景诊断" in out  # description 片段
-    assert "脱敏 tool 参数" in out                       # --mask
-    assert "选择第 N 个 run" in out                      # --run-index
-    assert "包含 session 内全部 run" in out              # --all-runs
-    assert "只用 sessionId / runIds 关联" in out         # --strict-correlation
-    assert "全局选项" in out
+    assert "panorama options" in out
+    assert "360° diagnosis" in out                                       # description fragment
+    assert "Sanitize tool args" in out                                   # --mask
+    assert "Pick the Nth run" in out                                     # --run-index
+    assert "Include every run in the session" in out                     # --all-runs
+    assert "Match only on sessionId / runIds" in out                     # --strict-correlation
+    assert "global options" in out
+
+
+def test_examples_output_is_english():
+    """`openclaw-diag examples` is fully English in v1.12.1; the header and
+    every comment line is translated. Example commands themselves stay
+    unchanged because we only flipped human-facing text."""
+    rc, out = _capture_stdout(["examples"])
+    assert rc == 0
+    assert "openclaw-diag — common scenarios" in out
+    # A few representative comment translations
+    assert "# Full health check" in out
+    assert "# Trace one message's full lifecycle" in out
+    assert "# Quick verdict via jq" in out
 
 
 def test_list_json_each_entry_has_description_field():
-    """`openclaw-diag list --format json` 每项必须含 description 字段，
-    便于 agent / 脚本不必硬编码描述表也能渲染目录。"""
+    """`openclaw-diag list --format json` must include a description on every
+    entry so agents/scripts can render the catalog without hardcoding names."""
     rc, out = _capture_stdout(["list", "--format", "json"])
     assert rc == 0
     payload = json.loads(out)
@@ -275,7 +291,7 @@ def test_list_json_each_entry_has_description_field():
     assert "object_inspectors" in payload
     for entry in payload["state_collectors"]:
         assert "description" in entry
-        # 至少 doctor / gateway 这种已登记的 id 必须有非空描述
+        # Well-known ids must carry a non-empty description.
         if entry["id"] in ("doctor", "gateway", "channel", "trace"):
             assert entry["description"], (
                 f"description must not be empty for known id {entry['id']!r}"

@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.12.4 — README: drop removed `channel --sender` / `--probe` docs (2026-06-18)
+
+Docs-only correctness fix. The `channel` collector's `--sender` and `--probe`
+flags were removed in v1.9.0 (collector dropped config interpretation and the
+active probe path; `channel` is now a passive log-signal scan with `--account`
+scoping only), but the README still advertised them. Because the collector
+parser silently ignores unknown flags, `channel --sender ...` / `channel
+--probe` returned rc=0 while doing nothing — misleading users into thinking an
+active sender-allowlist prediction or outbound credential probe ran.
+
+- Removed `--sender` / `--probe` from the Channel command examples.
+- Removed the `channel --probe` outbound token-validation bullet from Security
+  and the opt-in-exception note from About & Scope.
+- Channel capability description changed to "passive log-signal scan + account
+  scoping" (no credential probe, no allowlist gate-check).
+
+No runtime/code change; matches the v1.9.0 parser + the test lock in
+`tests/test_cli_help.py` that pins `--sender` / `--probe` absence.
+
 ## v1.12.3 — README: trace --all-messages examples + Node-launcher tests (2026-06-18)
 
 Docs/tests follow-up to the English-help work. No runtime behavior change.

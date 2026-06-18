@@ -36,6 +36,36 @@ from .render.ndjson import NdjsonRenderer
 _FORMAT_CHOICES = ("pretty", "json", "ndjson")
 
 
+# 集中式命令描述表（id → 一句话中文说明），供 list / <id> --help / 顶层 help 复用。
+# 新增 collector / inspector 时，请同步在此添加一行；缺失时 _desc() 回退空串，不报错。
+_COMMAND_DESC = {
+    # 扫描类 collectors（state）
+    "channel":        "扫描渠道（飞书/Telegram 等）连接与消息收发日志，识别断连、过期丢弃、鉴权失败信号",
+    "configuration":  "解析 openclaw.json 关键配置（agents/models/plugins/channels），标记缺失或风险项",
+    "cron_jobs":      "列出全部 cron job 完整配置（调度/payload/sessionTarget/delivery/enabled），检测不 fire/投递失败",
+    "doctor":         "检查 Node / Python / openclaw-diag / OpenClaw 安装与版本是否就绪",
+    "environment":    "采集主机环境、Gateway 进程、OpenClaw 版本等基础信息",
+    "gateway":        "分析 Gateway 进程生命周期（启动/重启/WS 连接/崩溃）日志",
+    "performance":    "统计模型调用延迟（E2E/TTFT）、工具耗时与可用性",
+    "plugin_diag":    "检查插件加载状态、hook 订阅、trust gate 与插件错误",
+    "recent_errors":  "从日志中提取近期 error/异常并归类",
+    "run_health":     "评估 agent run 完成率、卡死与中断情况",
+    "sessions_diag":  "扫描 session.jsonl，统计 toolCall/toolResult 配对、孤儿与异常",
+    "shell_history":  "汇总 agent 执行过的 shell 命令历史",
+    "sys_health":     "检查 CPU/内存/磁盘/OOM/进程等系统级健康",
+    "task_health":    "评估后台 task（openclaw tasks）状态与健康度",
+    # 对象类 inspectors
+    "extract":        "把指定 session 文件导出为可读格式（含 active/reset/deleted/backup 版本）",
+    "panorama":       "360° 全景诊断：关联 trajectory + 应用日志 + 子任务 + cron",
+    "trace":          "追踪一条用户消息的完整生命周期（prompt→toolCall→toolResult→reply）",
+}
+
+
+def _desc(mid: str) -> str:
+    """返回命令 id 的一句话中文描述；未登记的命令回退空串，不报错。"""
+    return _COMMAND_DESC.get(mid, "")
+
+
 def _paged_print(text: str) -> None:
     """Print text through a pager when stdout is a TTY and output is long.
 
@@ -99,28 +129,54 @@ def _build_context(args) -> DiagContext:
 
 
 def _common_arguments(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--config", default=paths.CONFIG)
-    p.add_argument("--log-dir", default=paths.LOG_DIR)
-    p.add_argument("--sessions-base", default=paths.SESSIONS_BASE)
-    p.add_argument("--openclaw-home", default=paths.OPENCLAW_HOME)
-    p.add_argument(
+    """注册所有子命令通用的全局选项；放进 argument group 让 --help 输出更整齐。
+
+    注意：default 值保持 paths.* 不变，本次只补 help 文本和分组。
+    """
+    g = p.add_argument_group("全局选项 (global options)")
+    g.add_argument(
+        "--config", metavar="PATH", default=paths.CONFIG,
+        help="openclaw.json 配置文件路径（默认 ~/.openclaw/openclaw.json）",
+    )
+    g.add_argument(
+        "--log-dir", metavar="PATH", default=paths.LOG_DIR,
+        help="OpenClaw 日志目录（默认 /tmp/openclaw）",
+    )
+    g.add_argument(
+        "--sessions-base", metavar="PATH", default=paths.SESSIONS_BASE,
+        help="sessions 根目录（默认 ~/.openclaw/agents）",
+    )
+    g.add_argument(
+        "--openclaw-home", metavar="PATH", default=paths.OPENCLAW_HOME,
+        help="OpenClaw 主目录（默认 ~/.openclaw）",
+    )
+    g.add_argument(
         "--format",
         choices=list(_FORMAT_CHOICES),
         default=None,
-        help="Output format (pretty|json|ndjson). Default: pretty.",
+        help="输出格式 pretty|json|ndjson（默认 pretty；json/ndjson 适合 agent/脚本消费）",
     )
-    p.add_argument("--json", action="store_true", help="Alias for --format json.")
-    p.add_argument("--no-color", action="store_true")
-    p.add_argument("--unmask", action="store_true")
+    g.add_argument(
+        "--json", action="store_true",
+        help="等价于 --format json",
+    )
+    g.add_argument(
+        "--no-color", action="store_true",
+        help="关闭 ANSI 颜色（输出到文件或管道时使用）",
+    )
+    g.add_argument(
+        "--unmask", action="store_true",
+        help="不脱敏，显示原始敏感内容（token/消息正文等）；默认会脱敏",
+    )
 
 
 def _channel_arguments(p: argparse.ArgumentParser) -> None:
-    p.add_argument(
+    g = p.add_argument_group("channel 选项")
+    g.add_argument(
         "--account", default=None,
-        help="Filter channel signals by account substring "
-             "(matched against the channel-prefix portion of the message body, "
-             "e.g. ``--account default`` to keep only ``feishu[default]:`` lines). "
-             "Default: no filter.",
+        help="按 account 子串过滤 channel 日志信号"
+             "（匹配消息正文里的渠道前缀，例如 ``--account default`` "
+             "只保留 ``feishu[default]:`` 行）；默认不过滤",
     )
 
 
@@ -159,10 +215,12 @@ def cmd_list(args) -> int:
     if fmt != "pretty":
         payload = {
             "state_collectors": [
-                {"id": c.id, "label": c.title} for c in state
+                {"id": c.id, "label": c.title, "description": _desc(c.id)}
+                for c in state
             ],
             "object_inspectors": [
-                {"id": c.id, "label": c.title} for c in inspectors
+                {"id": c.id, "label": c.title, "description": _desc(c.id)}
+                for c in inspectors
             ],
         }
         print(json.dumps(payload, ensure_ascii=False))
@@ -171,12 +229,16 @@ def cmd_list(args) -> int:
     print()
     print("  扫描类（无需参数）：")
     for c in state:
-        print(f"    {c.id:<16s} {c.title}")
+        d = _desc(c.id)
+        suffix = f" — {d}" if d else ""
+        print(f"    {c.id:<16s} {c.title}{suffix}")
     print()
     if inspectors:
         print("  对象类（需要 session uuid）：")
         for c in inspectors:
-            print(f"    {c.id:<16s} {c.title}")
+            d = _desc(c.id)
+            suffix = f" — {d}" if d else ""
+            print(f"    {c.id:<16s} {c.title}{suffix}")
         print()
     print("  其它命令：")
     print("    all              一次跑完所有扫描类")
@@ -346,26 +408,57 @@ _PANORAMA_EPILOG = """示例:
 def _build_trace_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openclaw-diag trace",
+        description=f"Session Trace (trace) — {_desc('trace')}",
         add_help=True,
         epilog=_TRACE_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
-    p.add_argument("--msg-index", type=int, default=None,
-                   help="Nth user message (0-based)")
-    p.add_argument("--msg-id", default=None, help="Message by id field")
-    p.add_argument("--msg-match", default=None,
-                   help="First user message containing TEXT")
-    p.add_argument("-A", "--all-messages", action="store_true",
-                   dest="all_messages",
-                   help="Trace every user message in the session "
-                        "(mutually exclusive with --msg-index/--msg-id/--msg-match)")
-    p.add_argument("--no-trajectory", action="store_true")
-    p.add_argument("--no-log", action="store_true")
-    p.add_argument("--show-tool-metas", action="store_true")
-    p.add_argument("--show-plugin-snapshot", action="store_true")
-    p.add_argument("--mask", action="store_true")
-    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    g = p.add_argument_group("trace 选项")
+    g.add_argument(
+        "session_id",
+        help="目标 session 的 UUID（完整或 8+ 字符前缀均可）",
+    )
+    g.add_argument(
+        "--msg-index", type=int, default=None,
+        help="按序号选择第 N 条用户消息（0-based；默认：最后一条）",
+    )
+    g.add_argument(
+        "--msg-id", default=None,
+        help="按消息 id 字段选择具体一条用户消息",
+    )
+    g.add_argument(
+        "--msg-match", default=None,
+        help="按内容子串匹配，选第一条包含 TEXT 的用户消息",
+    )
+    g.add_argument(
+        "-A", "--all-messages", action="store_true", dest="all_messages",
+        help="一次追踪 session 内全部用户消息（每轮一段；"
+             "与 --msg-index/--msg-id/--msg-match 互斥）",
+    )
+    g.add_argument(
+        "--no-trajectory", action="store_true",
+        help="不读取 trajectory.jsonl，仅基于 session.jsonl 分析",
+    )
+    g.add_argument(
+        "--no-log", action="store_true",
+        help="不关联 openclaw 应用日志（只看 session/trajectory）",
+    )
+    g.add_argument(
+        "--show-tool-metas", action="store_true",
+        help="显示每个 toolCall 的完整 meta 信息（默认折叠）",
+    )
+    g.add_argument(
+        "--show-plugin-snapshot", action="store_true",
+        help="显示插件快照（hook/状态），用于排查插件介入",
+    )
+    g.add_argument(
+        "--mask", action="store_true",
+        help="强制脱敏（trace 默认不脱敏；与全局 --unmask 相反）",
+    )
+    g.add_argument(
+        "--agent", default=None,
+        help="只在指定 agent 名下查找 session（多 agent 共用 uuid 时用）",
+    )
     _common_arguments(p)
     return p
 
@@ -373,20 +466,36 @@ def _build_trace_parser() -> argparse.ArgumentParser:
 def _build_extract_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openclaw-diag extract",
+        description=f"Session Extract (extract) — {_desc('extract')}",
         add_help=True,
         epilog=_EXTRACT_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
-    p.add_argument("--summary", action="store_true",
-                   help="Per-file record-count summary, no record dump")
-    p.add_argument("-a", "--all", action="store_true", dest="all_versions",
-                   help="Extract all versions (active + reset + deleted + backup)")
-    p.add_argument("--list", action="store_true", dest="list_only",
-                   help="List matching files; do not extract")
-    p.add_argument("--types", default=None,
-                   help="Filter by record type (comma-separated)")
-    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    g = p.add_argument_group("extract 选项")
+    g.add_argument(
+        "session_id",
+        help="目标 session 的 UUID（完整或 8+ 字符前缀均可）",
+    )
+    g.add_argument(
+        "--summary", action="store_true",
+        help="只打印每文件的记录条数统计，不 dump 记录正文",
+    )
+    g.add_argument(
+        "-a", "--all", action="store_true", dest="all_versions",
+        help="导出全部版本（active + reset + deleted + backup）",
+    )
+    g.add_argument(
+        "--list", action="store_true", dest="list_only",
+        help="只列出匹配到的文件，不实际导出内容",
+    )
+    g.add_argument(
+        "--types", default=None,
+        help="按记录类型过滤（逗号分隔，例如 user,assistant,toolCall）",
+    )
+    g.add_argument(
+        "--agent", default=None,
+        help="只在指定 agent 名下查找 session",
+    )
     _common_arguments(p)
     return p
 
@@ -394,21 +503,36 @@ def _build_extract_parser() -> argparse.ArgumentParser:
 def _build_panorama_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="openclaw-diag panorama",
+        description=f"Session Panorama (panorama) — {_desc('panorama')}",
         add_help=True,
         epilog=_PANORAMA_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("session_id", help="Session UUID (full or 8+ char prefix)")
-    p.add_argument("--mask", action="store_true",
-                   help="Sanitize tool args / message content / api keys")
-    p.add_argument("--run-index", type=int, default=None,
-                   help="Pick the Nth run (default: -1 = latest)")
-    p.add_argument("--all-runs", action="store_true",
-                   help="Include every run in the session")
-    p.add_argument("--strict-correlation", action="store_true",
-                   help="Match only on sessionId / runIds (drops sessionKey "
-                        "and toolCallId hits)")
-    p.add_argument("--agent", default=None, help="Limit to specific agent")
+    g = p.add_argument_group("panorama 选项")
+    g.add_argument(
+        "session_id",
+        help="目标 session 的 UUID（完整或 8+ 字符前缀均可）",
+    )
+    g.add_argument(
+        "--mask", action="store_true",
+        help="脱敏 tool 参数 / 消息正文 / api key 等敏感字段",
+    )
+    g.add_argument(
+        "--run-index", type=int, default=None,
+        help="选择第 N 个 run（默认 -1 = 最新一次）",
+    )
+    g.add_argument(
+        "--all-runs", action="store_true",
+        help="包含 session 内全部 run（默认只看最新一次）",
+    )
+    g.add_argument(
+        "--strict-correlation", action="store_true",
+        help="只用 sessionId / runIds 关联，丢弃 sessionKey 与 toolCallId 命中（更严格）",
+    )
+    g.add_argument(
+        "--agent", default=None,
+        help="只在指定 agent 名下查找 session",
+    )
     _common_arguments(p)
     return p
 
@@ -545,19 +669,59 @@ def _split_skip(rest: List[str]):
 
 
 def _print_help() -> None:
-    print(f"openclaw-diag v{__version__} (v2)")
-    print()
-    print("用法：")
-    print("  openclaw-diag <id> [args...]      跑单个诊断")
-    print("  openclaw-diag all [--skip a,b]    跑全部 state collectors")
-    print("  openclaw-diag list [--format X]   列出所有诊断")
-    print("  openclaw-diag doctor              检查环境")
-    print("  openclaw-diag trace <uuid>        追踪一条用户消息")
-    print("  openclaw-diag extract <uuid>      导出 session 为可读格式")
-    print("  openclaw-diag panorama <uuid>     360° session 全景诊断")
-    print("  openclaw-diag examples            打印常用示例")
-    print()
-    print("通用 flag：--format pretty|json|ndjson  --json (alias)  --no-color  --unmask  --version")
+    """渲染顶层 --help。
+
+    structure：工具简介 → 用法 → 体检命令 → 扫描类（动态从 registry） →
+    对象类 → 辅助命令 → 全局选项 → 退出码 → 更多。
+    扫描类列表的 id/描述从 registry + _COMMAND_DESC 动态拼接，
+    保证未来新增 collector 不会漏排或漏描述。
+    """
+    state_ids = [c.id for c in registry.all_state()]
+    width = 16
+    lines: List[str] = []
+    lines.append(f"openclaw-diag v{__version__} — OpenClaw 运维诊断 CLI")
+    lines.append("")
+    lines.append("一句话：扫描配置/日志/session，定位 OpenClaw 部署中的连接、性能、cron、插件、run 等问题。")
+    lines.append("")
+    lines.append("用法:")
+    lines.append("  openclaw-diag <命令> [参数...]")
+    lines.append("  openclaw-diag <命令> --help        查看某命令的详细参数")
+    lines.append("")
+    lines.append("体检命令:")
+    lines.append(f"  {'all':<{width}s}一次跑完全部扫描类诊断（推荐首选）")
+    lines.append(f"  {'doctor':<{width}s}{_desc('doctor')}")
+    lines.append("")
+    lines.append("扫描类诊断（无需参数）:")
+    for sid in state_ids:
+        if sid == "doctor":
+            # doctor 已在「体检命令」展示，避免重复
+            continue
+        lines.append(f"  {sid:<{width}s}{_desc(sid)}")
+    lines.append("")
+    lines.append("对象诊断（需要 session uuid）:")
+    lines.append(f"  {'trace <uuid>':<{width}s}{_desc('trace')}")
+    lines.append(f"  {'extract <uuid>':<{width}s}{_desc('extract')}")
+    lines.append(f"  {'panorama <uuid>':<{width}s}{_desc('panorama')}")
+    lines.append("")
+    lines.append("辅助命令:")
+    lines.append(f"  {'list':<{width}s}列出全部可用诊断（支持 --format json）")
+    lines.append(f"  {'examples':<{width}s}打印常用使用场景示例")
+    lines.append("")
+    lines.append("全局选项（所有命令通用）:")
+    lines.append("  --format pretty|json|ndjson   输出格式（默认 pretty）")
+    lines.append("  --json                        等价 --format json")
+    lines.append("  --no-color                    关闭颜色")
+    lines.append("  --unmask                      不脱敏显示原始内容")
+    lines.append("  --config / --log-dir / --sessions-base / --openclaw-home  覆盖默认路径")
+    lines.append("")
+    lines.append("退出码:")
+    lines.append("  0  正常（无 warn/fail）")
+    lines.append("  1  有 warn 或 fail")
+    lines.append("  2  输入错误（参数/uuid 不对）")
+    lines.append("  3  运行时错误")
+    lines.append("")
+    lines.append("更多: `openclaw-diag list` 看全部诊断，`openclaw-diag <命令> --help` 看单条详情。")
+    print("\n".join(lines))
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -618,9 +782,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         # parse_known_args (which would otherwise execute the diagnostic).
         # parse_known_args is preserved to keep the existing lenient handling
         # of unrecognized flags from external callers.
+        d = _desc(coll.id)
+        desc = f"{coll.title} ({coll.id})" + (f" — {d}" if d else "")
         cparser = argparse.ArgumentParser(
             prog=f"openclaw-diag {head}",
-            description=f"{coll.title} ({coll.id})",
+            description=desc,
             add_help=True,
         )
         _common_arguments(cparser)

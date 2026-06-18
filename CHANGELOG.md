@@ -1,5 +1,59 @@
 # Changelog
 
+## v1.12.0 — --help 全面改造：命令/参数清晰说明 + 分组 + 退出码 (2026-06-18)
+
+让 `--help`（顶层 + 每个子命令 + 每个 collector/inspector）对**用户和 agent 都
+清晰、明确、直接**。每个命令、每个参数都有一句话说明，零猜测。
+
+### 改动
+
+唯一业务改动文件：`ocdiag/main.py`（外加 `tests/test_cli_help.py` 新增测试）。
+不动 collectors/inspectors 业务逻辑、不动默认路径/参数 default 值。
+
+1. 新增集中式命令描述表 `_COMMAND_DESC`（id → 一句话中文）+ helper `_desc(mid)`，
+   供 `list`、`<id> --help` 的 description、顶层 help 复用，未来新增 collector
+   缺失时回退空串、不报错。
+2. `_common_arguments` 内全局参数放进 `argument group "全局选项 (global options)"`，
+   每个 flag 都补了清晰中文 help（`--config` / `--log-dir` / `--sessions-base` /
+   `--openclaw-home` / `--format` / `--json` / `--no-color` / `--unmask`），路径
+   类参数加 `metavar=PATH` 让 usage 行更整齐。`--account` 同样进 `"channel 选项"`
+   group。
+3. `trace --help` 之前 `--no-trajectory` / `--no-log` / `--show-tool-metas` /
+   `--show-plugin-snapshot` / `--mask` 都是裸 flag，本次补齐每个的中文说明，
+   并把 trace/extract/panorama 的命令专属参数各自放进 `"trace/extract/panorama 选项"`
+   group。
+4. 顶层 `_print_help()` 重写：工具简介 → 用法 → 体检命令 → 扫描类（动态从
+   registry 渲染，对齐排版）→ 对象诊断 → 辅助命令 → 全局选项 → 退出码
+   (0/1/2/3) → 更多。
+5. `cmd_list` pretty 输出每项追加 `— 描述`；`list --format json` 在每项里加
+   `description` 字段，便于 agent / 脚本消费。
+6. 各 collector parser 的 `description` 从 `f"{title} ({id})"` 改为
+   `f"{title} ({id}) — {_desc(id)}"`，`<id> --help` 顶部就能看到一句话简介。
+
+### Tests
+
+`tests/test_cli_help.py` 追加 8 个用例：
+- 顶层 help 含工具简介 / 体检命令 / 扫描类 / 对象诊断 / 辅助命令 / 全局选项 /
+  退出码（含 0/1/2/3）等关键 section 标题。
+- 顶层 help 遍历 registry 断言每个 state collector id 出现，未来新增不漏排。
+- 顶层 help 含 trace/extract/panorama 三个 inspector。
+- `trace --help` 五个之前的裸 flag 都带中文 help 片段，且分组标题 `trace 选项`
+  + description 一句话简介都在。
+- `gateway --help` 含 `全局选项` 分组，`--config` / `--unmask` / `--no-color` /
+  `--log-dir` / `--sessions-base` / `--openclaw-home` 都带中文说明。
+- `gateway --help` description 拼上 `_COMMAND_DESC['gateway']` 一句话片段。
+- `list` pretty 含已知 collector 的描述片段；`list --format json` 每项含
+  `description` key（已登记 id 描述非空）。
+
+`pytest tests/ -q` → 234 passed, 1 skipped。
+
+### 行为不变
+
+- 默认参数值（paths.\*）、各 collector/inspector 业务逻辑、退出码定义、
+  argv 解析顺序、扫描结果与 v1.11.x 完全一致。
+- 之前 215+ 用例全绿；本次只增不改测试。
+
+
 ## v1.10.4 — plugin_diag windowed scan filters to dated-in-window (2026-06-16)
 
 Minimal correctness hardening of the v1.10.2 full-cache reuse. The 7d/30d

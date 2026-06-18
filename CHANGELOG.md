@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.12.3 — README: trace --all-messages examples + Node-launcher tests (2026-06-18)
+
+Docs/tests follow-up to the English-help work. No runtime behavior change.
+
+- README: added `trace --all-messages` / `-A --format json` examples (v1.11+ feature).
+- Tests: added `tests/test_node_launcher.py` pinning the real npm entry point
+  (`node bin/openclaw-diag.js`) `--help` / no-args / `skill-install --help` as
+  English, with a CJK guard against future regressions (this is the blind spot
+  that let the Chinese launcher help slip through earlier).
+
 ## v1.12.2 — Node launcher help/banner switched to English (2026-06-18)
 
 `v1.12.1` translated the Python (`ocdiag.main`) help, but the npm entry point

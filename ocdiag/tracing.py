@@ -17,8 +17,13 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+
+_BUILTIN_TOOLS_WITH_CONTEXT = {"read", "write", "edit", "exec", "bash"}
+_INLINE_LIMIT = 160
+_PATH_LIMIT = 180
 
 
 def iso_to_epoch_ms(iso: str) -> int:
@@ -34,6 +39,15 @@ def epoch_ms_to_iso(ms: int) -> str:
     """Format epoch-ms as local time."""
     dt = datetime.fromtimestamp(ms / 1000)
     return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def epoch_ms_to_utc8(ms: int) -> str:
+    """Format epoch-ms in UTC+8 for stable human trace output."""
+    if not ms:
+        return "?"
+    tz = timezone(timedelta(hours=8))
+    dt = datetime.fromtimestamp(ms / 1000, tz=tz)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC+8")
 
 
 def fmt_duration(ms: float) -> str:
@@ -59,6 +73,256 @@ def extract_text(content: Any) -> str:
                     parts.append(f"[toolCall:{c.get('name','')}]")
         return " ".join(parts)
     return str(content)
+
+
+def _shorten(value: Any, limit: int = _INLINE_LIMIT) -> str:
+    text = str(value) if value is not None else ""
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)] + "..."
+
+
+def _char_count(label: str, value: Any) -> str:
+    return f"{label}={len(str(value))} chars"
+
+
+def _tool_call_args(call: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(call, dict):
+        return {}
+    for key in ("arguments", "input", "args"):
+        value = call.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return {"raw": value}
+            if isinstance(parsed, dict):
+                return parsed
+            return {"raw": value}
+    partial = call.get("partialArgs")
+    if isinstance(partial, dict):
+        return partial
+    if isinstance(partial, str):
+        try:
+            parsed = json.loads(partial)
+        except ValueError:
+            return {"raw": partial}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"raw": partial}
+    return {}
+
+
+def _path_arg(args: Dict[str, Any]) -> str:
+    for key in ("path", "file", "filePath", "filepath"):
+        value = args.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _skill_name_from_path(path: str) -> Optional[str]:
+    if not path:
+        return None
+    parts = [p for p in path.replace("\\", "/").split("/") if p]
+    if len(parts) < 2:
+        return None
+    if parts[-1].lower() != "skill.md":
+        return None
+    return parts[-2] or None
+
+
+def _format_builtin_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Return compact timeline data and optional deferred detail.
+
+    Non-file write/exec/edit payloads are never printed into the human trace.
+    They are represented by stable refs such as ``write 1`` / ``exec 1``.
+    """
+    lower = name.lower()
+    formatted: Dict[str, Any] = {
+        "timeline_label": name,
+        "timeline_detail_lines": [],
+        "breakdown_label": name,
+        "breakdown_detail_lines": [],
+        "needs_breakdown_detail": False,
+        "render_breakdown_detail": True,
+        "timeline_ref_suffix": "",
+        "detail_kind": lower,
+        "builtin_context": False,
+    }
+    if lower not in _BUILTIN_TOOLS_WITH_CONTEXT:
+        return formatted
+
+    if lower == "read":
+        path = _path_arg(args)
+        skill_name = _skill_name_from_path(path)
+        if skill_name:
+            label = f"load {skill_name}"
+            formatted.update({
+                "timeline_label": label,
+                "breakdown_label": skill_name,
+                "builtin_context": True,
+                "is_skill_load": True,
+                "skill_name": skill_name,
+                "skill_path": path,
+            })
+            return formatted
+        if path:
+            label = f"read {_shorten(path, _PATH_LIMIT)}"
+            formatted.update({
+                "timeline_label": label,
+                "breakdown_label": label,
+                "builtin_context": True,
+            })
+            return formatted
+        formatted.update({"timeline_label": "read", "builtin_context": True})
+        return formatted
+
+    if lower == "write":
+        path = _path_arg(args)
+        content = args.get("content")
+        content_summary = ""
+        if content is not None:
+            formatted["needs_breakdown_detail"] = True
+            content_summary = _char_count("content", content)
+        label = "write"
+        path_label = ""
+        if path:
+            path_label = _shorten(path, _PATH_LIMIT)
+            label += f" {path_label}"
+        breakdown_label = path_label or "write"
+        if content_summary:
+            breakdown_label = f"{breakdown_label} {content_summary}"
+        formatted.update({
+            "timeline_label": label,
+            "breakdown_label": breakdown_label,
+            "timeline_ref_suffix": path_label,
+            "detail_kind": "write",
+            "builtin_context": True,
+        })
+        return formatted
+
+    if lower == "edit":
+        path = _path_arg(args)
+        old = args.get("oldString") or args.get("old")
+        new = args.get("newString") or args.get("new")
+        details = []
+        if old is not None:
+            details.append(_char_count("old", old))
+        if new is not None:
+            details.append(_char_count("new", new))
+        label = "edit"
+        path_label = ""
+        if path:
+            path_label = _shorten(path, _PATH_LIMIT)
+            label += f" {path_label}"
+        if details:
+            formatted["needs_breakdown_detail"] = True
+        breakdown_label = path_label or "edit"
+        if details:
+            breakdown_label = f"{breakdown_label} {', '.join(details)}"
+        formatted.update({
+            "timeline_label": label,
+            "breakdown_label": breakdown_label,
+            "timeline_ref_suffix": path_label,
+            "detail_kind": "edit",
+            "builtin_context": True,
+        })
+        return formatted
+
+    if lower in ("exec", "bash"):
+        command = (
+            args.get("command")
+            or args.get("cmd")
+            or args.get("script")
+            or args.get("raw")
+        )
+        path = _path_arg(args)
+        label = "exec"
+        if command is not None:
+            formatted["needs_breakdown_detail"] = True
+            formatted["render_breakdown_detail"] = False
+        elif path:
+            path_label = _shorten(path, _PATH_LIMIT)
+            label += f" {path_label}"
+        formatted.update({
+            "timeline_label": label,
+            "breakdown_label": "exec",
+            "detail_kind": "exec",
+            "builtin_context": True,
+        })
+        return formatted
+
+    return formatted
+
+
+def _apply_detail_ref(
+    item: Dict[str, Any], detail_counters: Dict[str, int],
+) -> None:
+    if not item.get("needs_breakdown_detail"):
+        return
+    kind = item.get("detail_kind") or item["name"]
+    detail_counters[kind] = detail_counters.get(kind, 0) + 1
+    ref = f"{kind} {detail_counters[kind]}"
+    item["detail_ref"] = ref
+    item["timeline_label"] = ref
+    breakdown_label = item.get("breakdown_label") or kind
+    suffix = item.get("timeline_ref_suffix") or ""
+    if suffix:
+        item["timeline_label"] = f"{ref} {suffix}"
+    if kind == "exec":
+        item["timeline_label"] = ref
+    item["breakdown_title"] = f"{ref}: {breakdown_label}"
+
+
+def _format_tool_result(
+    result: Dict[str, Any],
+    call: Optional[Dict[str, Any]],
+    batch_start_epoch: int,
+    detail_counters: Dict[str, int],
+) -> Dict[str, Any]:
+    msg = result.get("message", {})
+    name = msg.get("toolName") or (call or {}).get("name") or "?"
+    call_id = msg.get("toolCallId") or (call or {}).get("id")
+    ts = msg.get("timestamp", 0)
+    duration_ms = max(0, ts - batch_start_epoch) if ts and batch_start_epoch else 0
+    is_error = bool(msg.get("isError", False))
+    status = "fail" if is_error else "success"
+
+    args = _tool_call_args(call)
+    formatted = _format_builtin_tool(name, args)
+    if not formatted.get("builtin_context"):
+        formatted.update({
+            "timeline_label": name,
+            "timeline_detail_lines": [],
+            "breakdown_detail_lines": [],
+            "needs_breakdown_detail": False,
+        })
+    item = {
+        "name": name,
+        "duration_ms": duration_ms,
+        "is_error": is_error,
+        "tool_call_id": call_id,
+        "started_epoch_ms": batch_start_epoch,
+        "completed_epoch_ms": ts,
+        "status": status,
+        **formatted,
+    }
+    _apply_detail_ref(item, detail_counters)
+    summary = (
+        f"{item['timeline_label']} -> {status} "
+        f"({fmt_duration(duration_ms)})"
+    )
+    item["summary"] = summary
+    if item.get("needs_breakdown_detail"):
+        item["breakdown_summary"] = (
+            f"{item.get('breakdown_title', item['timeline_label'])} -> "
+            f"{status} ({fmt_duration(duration_ms)})"
+        )
+    return item
 
 
 def find_trajectory_file(session_file: str) -> Optional[str]:
@@ -170,42 +434,95 @@ def _tool_batch_duration(results, prev_epoch):
     return max(0, max_ts - prev_epoch)
 
 
-def _flush_tool_batch(events, tool_execs, results, base_ms, prev_epoch):
+def _flush_tool_batch(
+    events,
+    tool_execs,
+    results,
+    base_ms,
+    prev_epoch,
+    tool_calls=None,
+    detail_counters=None,
+):
     if not results:
         return
+    tool_calls = tool_calls or {}
+    if detail_counters is None:
+        detail_counters = {}
     batch_start_epoch = prev_epoch or base_ms
     batch_end_epoch = max(r.get("message", {}).get("timestamp", 0) for r in results)
     batch_dur = max(0, batch_end_epoch - batch_start_epoch)
     by_name: Dict[str, int] = {}
     errors = 0
+    formatted_execs: List[Dict[str, Any]] = []
     for r in results:
         msg = r.get("message", {})
         name = msg.get("toolName", "?")
         by_name[name] = by_name.get(name, 0) + 1
         if msg.get("isError"):
             errors += 1
+        call_id = msg.get("toolCallId")
+        formatted_execs.append(
+            _format_tool_result(
+                r,
+                tool_calls.get(call_id),
+                batch_start_epoch,
+                detail_counters,
+            ),
+        )
     parts = [
         (f"{n}" + (f" ×{cnt}" if cnt > 1 else ""))
         for n, cnt in by_name.items()
     ]
     tools_str = " + ".join(parts)
-    status = "ok" if errors == 0 else f"{errors} error(s)"
+    status = "success" if errors == 0 else f"{errors} fail(s)"
+    detail_lines: List[str] = []
+    if len(formatted_execs) == 1:
+        tools_str = formatted_execs[0]["summary"]
+        detail_lines.extend(formatted_execs[0].get("timeline_detail_lines") or [])
+    else:
+        for item in formatted_execs:
+            detail_lines.append(f"- {item['summary']}")
+            detail_lines.extend(
+                f"  {ln}" for ln in item.get("timeline_detail_lines") or []
+            )
     events.append({
         "offset_ms": max(0, (batch_start_epoch - base_ms)),
-        "type": "tool_batch",
-        "detail": f"{tools_str} → {status} ({fmt_duration(batch_dur)})",
+        "type": (
+            "skill_load"
+            if (
+                len(formatted_execs) == 1
+                and formatted_execs[0].get("is_skill_load")
+            )
+            else "tool_batch"
+        ),
+        "detail": (
+            tools_str if len(formatted_execs) == 1
+            else f"{tools_str} -> {status} ({fmt_duration(batch_dur)})"
+        ),
+        "detail_lines": detail_lines,
         "count": len(results),
         "duration_ms": batch_dur,
     })
-    for r in results:
-        msg = r.get("message", {})
-        name = msg.get("toolName", "?")
-        ts = msg.get("timestamp", 0)
-        dur = max(0, ts - batch_start_epoch) if ts and batch_start_epoch else 0
+    for item in formatted_execs:
         tool_execs.append({
-            "name": name,
-            "duration_ms": dur,
-            "is_error": msg.get("isError", False),
+            "name": item["name"],
+            "duration_ms": item["duration_ms"],
+            "is_error": item["is_error"],
+            "tool_call_id": item["tool_call_id"],
+            "started_epoch_ms": item.get("started_epoch_ms"),
+            "completed_epoch_ms": item.get("completed_epoch_ms"),
+            "summary": item["summary"],
+            "detail_lines": item.get("breakdown_detail_lines") or [],
+            "timeline_detail_lines": item.get("timeline_detail_lines") or [],
+            "needs_breakdown_detail": bool(item.get("needs_breakdown_detail")),
+            "render_breakdown_detail": item.get("render_breakdown_detail", True),
+            "detail_ref": item.get("detail_ref"),
+            "breakdown_title": item.get("breakdown_title"),
+            "breakdown_summary": item.get("breakdown_summary"),
+            "builtin_context": item["builtin_context"],
+            "is_skill_load": bool(item.get("is_skill_load")),
+            "skill_name": item.get("skill_name"),
+            "skill_path": item.get("skill_path"),
         })
 
 
@@ -226,6 +543,8 @@ def analyze_phases(trace):
     tool_num = 0
     prev_assistant_record_epoch: Optional[int] = None
     pending_tool_results: List[Dict] = []
+    tool_calls_by_id: Dict[str, Dict[str, Any]] = {}
+    tool_detail_counters: Dict[str, int] = {}
     total_model_ms = 0
     total_tool_ms = 0
     total_input_tokens = 0
@@ -241,7 +560,9 @@ def analyze_phases(trace):
             if role == "assistant":
                 if pending_tool_results:
                     _flush_tool_batch(events, tool_execs, pending_tool_results,
-                                      base_ms, prev_assistant_record_epoch)
+                                      base_ms, prev_assistant_record_epoch,
+                                      tool_calls_by_id,
+                                      tool_detail_counters)
                     batch_dur = _tool_batch_duration(
                         pending_tool_results, prev_assistant_record_epoch,
                     )
@@ -262,6 +583,11 @@ def analyze_phases(trace):
                 stop = msg.get("stopReason", "")
                 provider = msg.get("provider", "")
                 model = msg.get("model", "")
+                response_id = (
+                    msg.get("responseId")
+                    or msg.get("response_id")
+                    or msg.get("providerResponseId")
+                )
                 rate = (
                     out_tok / (duration_ms / 1000) if duration_ms > 0 else 0
                 )
@@ -285,6 +611,7 @@ def analyze_phases(trace):
                     "duration_ms": duration_ms, "tokens_in": in_tok,
                     "tokens_out": out_tok, "cache_read": cache_r,
                     "cache_write": cache_w, "rate": round(rate, 1),
+                    "response_id": response_id,
                 })
                 tool_names = []
                 content = msg.get("content", [])
@@ -292,13 +619,16 @@ def analyze_phases(trace):
                     for c in content:
                         if isinstance(c, dict) and c.get("type") == "toolCall":
                             tool_names.append(c.get("name", "?"))
+                            call_id = c.get("id")
+                            if call_id:
+                                tool_calls_by_id[call_id] = c
                 model_calls.append({
                     "num": model_num, "duration_ms": duration_ms,
                     "tokens_out": out_tok, "tokens_in": in_tok,
                     "cache_read": cache_r, "cache_write": cache_w,
                     "stop_reason": stop, "tool_names": tool_names,
                     "provider": provider, "model": model,
-                    "rate": round(rate, 1),
+                    "rate": round(rate, 1), "response_id": response_id,
                 })
                 total_model_ms += duration_ms
                 total_input_tokens += in_tok
@@ -331,7 +661,9 @@ def analyze_phases(trace):
 
     if pending_tool_results:
         _flush_tool_batch(events, tool_execs, pending_tool_results,
-                          base_ms, prev_assistant_record_epoch)
+                          base_ms, prev_assistant_record_epoch,
+                          tool_calls_by_id,
+                          tool_detail_counters)
         batch_dur = _tool_batch_duration(
             pending_tool_results, prev_assistant_record_epoch,
         )

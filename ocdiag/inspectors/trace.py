@@ -31,6 +31,7 @@ from ..tracing import (
     find_first_message,
     find_gateway_logs,
     find_trajectory_file,
+    epoch_ms_to_utc8,
     find_user_messages,
     fmt_duration,
     load_gateway_timing,
@@ -83,6 +84,8 @@ def _format_event(ev: Dict[str, Any]) -> str:
         return f"T+{off:<8} [model #{ev['num']}] {detail}"
     if etype == "tool_batch":
         return f"T+{off:<8} [tool]      {detail}"
+    if etype == "skill_load":
+        return f"T+{off:<8} [skills]    {detail}"
     if etype == "tool_not_dispatched":
         return f"T+{off:<8} [tool]      {detail}"
     if etype == "error":
@@ -99,7 +102,9 @@ def _section_timeline(s: Section, analysis: Dict[str, Any]) -> None:
             verdict = Verdict.WARN
         else:
             verdict = Verdict.OK
-        s.add(f"timeline.{ev['type']}", verdict, msg)
+        detail_lines = ev.get("detail_lines") or []
+        detail = "\n".join(detail_lines) if detail_lines else None
+        s.add(f"timeline.{ev['type']}", verdict, msg, detail=detail)
 
 
 def _section_summary(s: Section, analysis: Dict[str, Any]) -> None:
@@ -166,8 +171,11 @@ def _section_model_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
             tag = f" ({mc['stop_reason']})"
         msg = (
             f"#{mc['num']:<2} {fmt_duration(mc['duration_ms']):>8} "
-            f"out={mc['tokens_out']}{tag}"
+            f"out={mc['tokens_out']}"
         )
+        if mc.get("response_id"):
+            msg += f" responseId={mc['response_id']}"
+        msg += tag
         s.ok(f"model.call.{mc['num']}", msg, data=mc)
 
 
@@ -192,6 +200,25 @@ def _section_tool_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
         )
         verdict = Verdict.WARN if info["errors"] else Verdict.OK
         s.add(f"tool.{name}", verdict, msg, data={"name": name, **info})
+    skill_loads = [
+        te for te in analysis["tool_execs"] if te.get("is_skill_load")
+    ]
+    for idx, te in enumerate(skill_loads, start=1):
+        name = te.get("skill_name") or "?"
+        loaded_at = epoch_ms_to_utc8(te.get("completed_epoch_ms") or 0)
+        msg = f"skill{idx}: {name} loaded at {loaded_at}"
+        s.ok(f"skill.load.{idx}", msg, data=te)
+    for te in analysis["tool_execs"]:
+        if not te.get("needs_breakdown_detail"):
+            continue
+        if not te.get("render_breakdown_detail", True):
+            continue
+        detail_lines = te.get("detail_lines") or []
+        detail = "\n".join(detail_lines) if detail_lines else None
+        ref = te.get("detail_ref") or te.get("tool_call_id") or te["name"]
+        verdict = Verdict.WARN if te.get("is_error") else Verdict.OK
+        msg = te.get("breakdown_summary") or te.get("summary") or te["name"]
+        s.add(f"tool.detail.{ref}", verdict, msg, detail=detail, data=te)
 
 
 def _section_trajectory(s: Section, info: Dict[str, Any]) -> Verdict:

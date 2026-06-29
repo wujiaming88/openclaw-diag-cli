@@ -84,8 +84,6 @@ def _format_event(ev: Dict[str, Any]) -> str:
         return f"T+{off:<8} [model #{ev['num']}] {detail}"
     if etype == "tool_batch":
         return f"T+{off:<8} [tool]      {detail}"
-    if etype == "skill_load":
-        return f"T+{off:<8} [skills]    {detail}"
     if etype == "tool_not_dispatched":
         return f"T+{off:<8} [tool]      {detail}"
     if etype == "error":

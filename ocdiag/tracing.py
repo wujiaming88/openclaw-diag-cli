@@ -160,7 +160,7 @@ def _format_builtin_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         path = _path_arg(args)
         skill_name = _skill_name_from_path(path)
         if skill_name:
-            label = f"load {skill_name}"
+            label = f"read {_shorten(path, _PATH_LIMIT)}"
             formatted.update({
                 "timeline_label": label,
                 "breakdown_label": skill_name,
@@ -487,14 +487,7 @@ def _flush_tool_batch(
             )
     events.append({
         "offset_ms": max(0, (batch_start_epoch - base_ms)),
-        "type": (
-            "skill_load"
-            if (
-                len(formatted_execs) == 1
-                and formatted_execs[0].get("is_skill_load")
-            )
-            else "tool_batch"
-        ),
+        "type": "tool_batch",
         "detail": (
             tools_str if len(formatted_execs) == 1
             else f"{tools_str} -> {status} ({fmt_duration(batch_dur)})"

@@ -198,14 +198,6 @@ def _section_tool_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
         )
         verdict = Verdict.WARN if info["errors"] else Verdict.OK
         s.add(f"tool.{name}", verdict, msg, data={"name": name, **info})
-    skill_loads = [
-        te for te in analysis["tool_execs"] if te.get("is_skill_load")
-    ]
-    for idx, te in enumerate(skill_loads, start=1):
-        name = te.get("skill_name") or "?"
-        loaded_at = epoch_ms_to_utc8(te.get("completed_epoch_ms") or 0)
-        msg = f"skill{idx}: {name} loaded at {loaded_at}"
-        s.ok(f"skill.load.{idx}", msg, data=te)
     for te in analysis["tool_execs"]:
         if not te.get("needs_breakdown_detail"):
             continue
@@ -217,6 +209,20 @@ def _section_tool_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
         verdict = Verdict.WARN if te.get("is_error") else Verdict.OK
         msg = te.get("breakdown_summary") or te.get("summary") or te["name"]
         s.add(f"tool.detail.{ref}", verdict, msg, detail=detail, data=te)
+
+
+def _section_skill_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
+    skill_loads = [
+        te for te in analysis["tool_execs"] if te.get("is_skill_load")
+    ]
+    if not skill_loads:
+        s.ok("skill.none", "no skill was loaded", data={"count": 0})
+        return
+    for idx, te in enumerate(skill_loads, start=1):
+        name = te.get("skill_name") or "?"
+        loaded_at = epoch_ms_to_utc8(te.get("completed_epoch_ms") or 0)
+        msg = f"skill{idx}: {name} loaded at {loaded_at}"
+        s.ok(f"skill.load.{idx}", msg, data=te)
 
 
 def _section_trajectory(s: Section, info: Dict[str, Any]) -> Verdict:
@@ -457,6 +463,9 @@ def _build_turn_sections(
     if analysis["tool_execs"]:
         s_tools = report.section(f"{turn_label}Trace · 工具拆解")
         _section_tool_breakdown(s_tools, analysis)
+
+    s_skills = report.section(f"{turn_label}Trace · Skill")
+    _section_skill_breakdown(s_skills, analysis)
 
     # Slow E2E → WARN. Attach to this turn's summary section so the verdict
     # surfaces without inventing a new section.
@@ -854,6 +863,8 @@ class TraceInspector:
             if single["analysis"]["tool_execs"]:
                 s_tools = report.section("Trace · 工具拆解")
                 _section_tool_breakdown(s_tools, single["analysis"])
+            s_skills = report.section("Trace · Skill")
+            _section_skill_breakdown(s_skills, single["analysis"])
 
             if traj_info:
                 s_traj = report.section("Trace · Trajectory")

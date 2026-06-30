@@ -870,6 +870,250 @@ def test_turn_index_falls_back_to_ordinal_when_lookup_fails(
     assert report.data["user_message_index"] == 0
 
 
+# ── skill-load detection + privacy-preserving rendering ──────────────────
+
+
+def _assistant_with_toolcalls(
+    aid: str, ts: int, record_ts: int, *,
+    tool_calls: List[Dict[str, Any]],
+    in_tok: int = 10, out_tok: int = 5,
+) -> Dict[str, Any]:
+    """Assistant message that emits one or more toolCalls (stopReason=toolUse).
+
+    ``tool_calls`` is a list of dicts with keys: ``id``, ``name``,
+    ``arguments`` (the dict the inspector reads via _tool_call_args).
+    """
+    content = []
+    for tc in tool_calls:
+        content.append({
+            "type": "toolCall",
+            "id": tc["id"],
+            "name": tc["name"],
+            "arguments": tc.get("arguments", {}),
+        })
+    return {
+        "type": "message",
+        "id": aid,
+        "timestamp": _ms_to_iso(record_ts),
+        "message": {
+            "role": "assistant",
+            "timestamp": ts,
+            "model": "test-model",
+            "provider": "test",
+            "stopReason": "toolUse",
+            "usage": {
+                "input": in_tok, "output": out_tok,
+                "cacheRead": 0, "cacheWrite": 0,
+            },
+            "content": content,
+        },
+    }
+
+
+def _tool_result(
+    rid: str, ts: int, *, tool_call_id: str, tool_name: str,
+    is_error: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "type": "message",
+        "id": rid,
+        "timestamp": _ms_to_iso(ts),
+        "message": {
+            "role": "toolResult",
+            "timestamp": ts,
+            "toolCallId": tool_call_id,
+            "toolName": tool_name,
+            "isError": is_error,
+            "content": "ok",
+        },
+    }
+
+
+def _build_one_turn_fixture(
+    tmp: Path, *, tool_calls_in_assistant: List[Dict[str, Any]],
+) -> DiagContext:
+    """One user turn + assistant(toolCalls) + matching toolResults + final
+    assistant. Each entry in ``tool_calls_in_assistant`` carries the toolCall
+    content dict (id/name/arguments)."""
+    home = tmp / "ocdiag-trace-skill"
+    agents = home / "agents"
+    main_sd = agents / "main" / "sessions"
+    log_dir = tmp / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    main_sd.mkdir(parents=True, exist_ok=True)
+    sid = SESSION_ID
+
+    u_ts = T0
+    a1_ts = u_ts + 500
+    a1_rec_ts = u_ts + 1_000
+    tr_ts = u_ts + 2_000
+    a2_ts = u_ts + 2_500
+    a2_rec_ts = u_ts + 3_000
+
+    records: List[Dict[str, Any]] = [
+        {"type": "session", "version": 3, "id": sid,
+         "timestamp": _ms_to_iso(T0)},
+        _user_msg("user-0", u_ts, "do the thing"),
+        _assistant_with_toolcalls(
+            "asst-0a", a1_ts, a1_rec_ts,
+            tool_calls=tool_calls_in_assistant,
+        ),
+    ]
+    for tc in tool_calls_in_assistant:
+        records.append(_tool_result(
+            f"tr-{tc['id']}", tr_ts,
+            tool_call_id=tc["id"], tool_name=tc["name"],
+        ))
+    records.append(_final_assistant_msg("asst-0b", a2_ts, a2_rec_ts))
+
+    _write_jsonl(main_sd / f"{sid}.jsonl", records)
+    cfg = home / "openclaw.json"
+    cfg.write_text("{}")
+    ctx = DiagContext(
+        openclaw_home=home, config_path=cfg,
+        log_dir=log_dir, sessions_base=agents,
+    )
+    import ocdiag.paths as paths_mod
+    paths_mod.OPENCLAW_HOME = str(home)
+    return ctx
+
+
+def _section_text(report) -> str:
+    """Flatten every section title + check message + detail into one string,
+    for substring assertions (privacy / leak checks)."""
+    parts: List[str] = []
+    for s in report.sections:
+        parts.append(s.title)
+        for c in s.checks:
+            parts.append(c.message)
+            if c.detail:
+                parts.append(c.detail)
+            if c.evidence:
+                parts.append(c.evidence)
+    return "\n".join(parts)
+
+
+def test_skill_name_from_path_unit():
+    """Direct unit asserts on _skill_name_from_path."""
+    from ocdiag.tracing import _skill_name_from_path
+    assert _skill_name_from_path(
+        "/home/u/.claude/skills/web-search-plus/SKILL.md",
+    ) == "web-search-plus"
+    # case-insensitive on the SKILL.md basename
+    assert _skill_name_from_path("/x/skill.md") == "x"
+    # non-SKILL.md basename → not a skill load
+    assert _skill_name_from_path("/x/bar.py") is None
+    # bare SKILL.md with no parent directory → no skill name resolvable
+    assert _skill_name_from_path("SKILL.md") is None
+    # empty path
+    assert _skill_name_from_path("") is None
+
+
+def test_skill_load_detected_from_skill_md_read(tmp_path: Path):
+    """A read of .../web-search-plus/SKILL.md is flagged as a skill load,
+    surfaces in analysis["tool_execs"], and renders in the Trace · Skill
+    section with 'web-search-plus' + 'loaded at'."""
+    skill_path = "/home/u/.claude/skills/web-search-plus/SKILL.md"
+    ctx = _build_one_turn_fixture(
+        tmp_path,
+        tool_calls_in_assistant=[
+            {"id": "tcall-skill", "name": "read",
+             "arguments": {"path": skill_path}},
+        ],
+    )
+    report = _run_trace(ctx, session_id=SESSION_ID)
+    assert report.error is None, f"unexpected error: {report.error}"
+
+    # 1) analysis output carries the skill-load flags
+    execs = report.data["tool_execs"]
+    assert len(execs) == 1
+    te = execs[0]
+    assert te["is_skill_load"] is True
+    assert te["skill_name"] == "web-search-plus"
+    assert te["skill_path"] == skill_path
+    assert te.get("completed_epoch_ms")  # populated, non-zero
+
+    # 2) the Trace · Skill section renders the skill load
+    titles = [s.title for s in report.sections]
+    assert any("Trace · Skill" in t for t in titles), titles
+    skill_section = next(
+        s for s in report.sections if "Trace · Skill" in s.title
+    )
+    msgs = [c.message for c in skill_section.checks]
+    assert any(
+        "web-search-plus" in m and "loaded at" in m for m in msgs
+    ), msgs
+
+
+def test_non_skill_read_is_not_skill_load(tmp_path: Path):
+    """A read of a normal file path is NOT flagged is_skill_load and the
+    Skill section reports 'no skill was loaded'."""
+    ctx = _build_one_turn_fixture(
+        tmp_path,
+        tool_calls_in_assistant=[
+            {"id": "tcall-read", "name": "read",
+             "arguments": {"path": "/tmp/foo.py"}},
+        ],
+    )
+    report = _run_trace(ctx, session_id=SESSION_ID)
+    assert report.error is None, f"unexpected error: {report.error}"
+
+    execs = report.data["tool_execs"]
+    assert len(execs) == 1
+    assert not execs[0].get("is_skill_load")
+    assert execs[0].get("skill_name") in (None, "")
+
+    skill_section = next(
+        s for s in report.sections if "Trace · Skill" in s.title
+    )
+    msgs = [c.message for c in skill_section.checks]
+    assert any("no skill was loaded" in m for m in msgs), msgs
+
+
+def test_exec_command_not_leaked_in_trace(tmp_path: Path):
+    """An exec toolCall's command string and a write toolCall's content
+    payload must NEVER appear in the rendered trace output. Privacy contract:
+    only counts/char-lengths are surfaced for these tools."""
+    secret_cmd = "echo SUPERSECRET_TOKEN_12345"
+    secret_content = "PASSWORD_NEVER_PRINTED_67890"
+    ctx = _build_one_turn_fixture(
+        tmp_path,
+        tool_calls_in_assistant=[
+            {"id": "tcall-exec", "name": "exec",
+             "arguments": {"command": secret_cmd}},
+            {"id": "tcall-write", "name": "write",
+             "arguments": {"path": "/tmp/out.txt",
+                           "content": secret_content}},
+        ],
+    )
+    report = _run_trace(ctx, session_id=SESSION_ID)
+    assert report.error is None, f"unexpected error: {report.error}"
+
+    # exec is still counted as a tool exec
+    execs = report.data["tool_execs"]
+    names = [e["name"] for e in execs]
+    assert "exec" in names, names
+    assert "write" in names, names
+
+    # Neither the exec command nor the write content may appear anywhere
+    # in the rendered section text.
+    rendered = _section_text(report)
+    assert "SUPERSECRET_TOKEN_12345" not in rendered, (
+        "exec command leaked into trace output"
+    )
+    assert secret_cmd not in rendered
+    assert "PASSWORD_NEVER_PRINTED_67890" not in rendered, (
+        "write content leaked into trace output"
+    )
+    assert secret_content not in rendered
+
+    # And not via the JSON envelope either — covers any downstream JSON
+    # consumer that might serialize a hidden field.
+    env_str = json.dumps(to_envelope(report), ensure_ascii=False)
+    assert "SUPERSECRET_TOKEN_12345" not in env_str
+    assert "PASSWORD_NEVER_PRINTED_67890" not in env_str
+
+
 # ── pytest entry ──
 
 

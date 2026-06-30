@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openclaw-diag-cli"
-version = "1.12.4"
+version = "1.13.0"
 description = "OpenClaw observer-only diagnostic CLI — built for humans and AI Agents"
 readme = "README.md"
 license = {text = "MIT"}

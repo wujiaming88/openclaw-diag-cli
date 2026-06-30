@@ -1,5 +1,37 @@
 # Changelog
 
+## v1.13.0 — trace: skill-load detection + built-in-tool context formatting (2026-06-30)
+
+`trace` now recognises when an assistant turn loads a skill (a `read` toolCall
+whose path ends in `SKILL.md`, case-insensitive) and surfaces it as a dedicated
+`Trace · Skill` section listing each skill name + UTC+8 load time. The
+analysis payload (`tool_execs`) carries `is_skill_load`, `skill_name`,
+`skill_path`, and `completed_epoch_ms` alongside the existing fields, so JSON
+consumers see the new signal too. When no skill loaded the section reads
+"no skill was loaded".
+
+Built-in tool context (`read` / `write` / `edit` / `exec` / `bash`) is now
+formatted privacy-preservingly in both the timeline and the tool breakdown:
+- `read` shows the file path (and the skill name when applicable).
+- `write` shows the path plus `content=<N> chars` — the file content itself
+  is NEVER printed.
+- `edit` shows the path plus `old=<N> chars, new=<M> chars` — the strings
+  themselves are NEVER printed.
+- `exec` / `bash` are listed as `exec` only; the command string is NEVER
+  printed (`render_breakdown_detail=False`).
+
+The model breakdown line now also includes `responseId=<id>` when the
+provider returned one, which makes correlating a single model call against
+upstream provider logs straightforward.
+
+Tests added (tests/test_trace.py):
+- `test_skill_name_from_path_unit` — direct unit coverage of the helper.
+- `test_skill_load_detected_from_skill_md_read` — end-to-end through the
+  inspector: analysis flags + Skill section render.
+- `test_non_skill_read_is_not_skill_load` — normal-file read is NOT flagged.
+- `test_exec_command_not_leaked_in_trace` — exec command + write content
+  never appear in section render or JSON envelope.
+
 ## v1.12.4 — README: drop removed `channel --sender` / `--probe` docs (2026-06-18)
 
 Docs-only correctness fix. The `channel` collector's `--sender` and `--probe`

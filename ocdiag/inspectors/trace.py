@@ -31,6 +31,7 @@ from ..tracing import (
     find_first_message,
     find_gateway_logs,
     find_trajectory_file,
+    epoch_ms_to_utc8,
     find_user_messages,
     fmt_duration,
     load_gateway_timing,
@@ -99,7 +100,9 @@ def _section_timeline(s: Section, analysis: Dict[str, Any]) -> None:
             verdict = Verdict.WARN
         else:
             verdict = Verdict.OK
-        s.add(f"timeline.{ev['type']}", verdict, msg)
+        detail_lines = ev.get("detail_lines") or []
+        detail = "\n".join(detail_lines) if detail_lines else None
+        s.add(f"timeline.{ev['type']}", verdict, msg, detail=detail)
 
 
 def _section_summary(s: Section, analysis: Dict[str, Any]) -> None:
@@ -166,8 +169,11 @@ def _section_model_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
             tag = f" ({mc['stop_reason']})"
         msg = (
             f"#{mc['num']:<2} {fmt_duration(mc['duration_ms']):>8} "
-            f"out={mc['tokens_out']}{tag}"
+            f"out={mc['tokens_out']}"
         )
+        if mc.get("response_id"):
+            msg += f" responseId={mc['response_id']}"
+        msg += tag
         s.ok(f"model.call.{mc['num']}", msg, data=mc)
 
 
@@ -192,6 +198,31 @@ def _section_tool_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
         )
         verdict = Verdict.WARN if info["errors"] else Verdict.OK
         s.add(f"tool.{name}", verdict, msg, data={"name": name, **info})
+    for te in analysis["tool_execs"]:
+        if not te.get("needs_breakdown_detail"):
+            continue
+        if not te.get("render_breakdown_detail", True):
+            continue
+        detail_lines = te.get("detail_lines") or []
+        detail = "\n".join(detail_lines) if detail_lines else None
+        ref = te.get("detail_ref") or te.get("tool_call_id") or te["name"]
+        verdict = Verdict.WARN if te.get("is_error") else Verdict.OK
+        msg = te.get("breakdown_summary") or te.get("summary") or te["name"]
+        s.add(f"tool.detail.{ref}", verdict, msg, detail=detail, data=te)
+
+
+def _section_skill_breakdown(s: Section, analysis: Dict[str, Any]) -> None:
+    skill_loads = [
+        te for te in analysis["tool_execs"] if te.get("is_skill_load")
+    ]
+    if not skill_loads:
+        s.ok("skill.none", "no skill was loaded", data={"count": 0})
+        return
+    for idx, te in enumerate(skill_loads, start=1):
+        name = te.get("skill_name") or "?"
+        loaded_at = epoch_ms_to_utc8(te.get("completed_epoch_ms") or 0)
+        msg = f"skill{idx}: {name} loaded at {loaded_at}"
+        s.ok(f"skill.load.{idx}", msg, data=te)
 
 
 def _section_trajectory(s: Section, info: Dict[str, Any]) -> Verdict:
@@ -432,6 +463,9 @@ def _build_turn_sections(
     if analysis["tool_execs"]:
         s_tools = report.section(f"{turn_label}Trace · 工具拆解")
         _section_tool_breakdown(s_tools, analysis)
+
+    s_skills = report.section(f"{turn_label}Trace · Skill")
+    _section_skill_breakdown(s_skills, analysis)
 
     # Slow E2E → WARN. Attach to this turn's summary section so the verdict
     # surfaces without inventing a new section.
@@ -829,6 +863,8 @@ class TraceInspector:
             if single["analysis"]["tool_execs"]:
                 s_tools = report.section("Trace · 工具拆解")
                 _section_tool_breakdown(s_tools, single["analysis"])
+            s_skills = report.section("Trace · Skill")
+            _section_skill_breakdown(s_skills, single["analysis"])
 
             if traj_info:
                 s_traj = report.section("Trace · Trajectory")
